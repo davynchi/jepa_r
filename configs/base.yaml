@@ -1,0 +1,50 @@
+data:
+  system_kind: linear
+  num_samples: 4096
+  validation_samples: 1024
+  test_samples: 1024
+  sequence_length: 64
+  window_size: 16
+  burn_in_steps: 64
+  latent_state_dim: 4
+  observation_dim: 4
+  process_noise: 0.01
+  observation_noise: 0.01
+  transition_norm: 0.9
+  system_seed: 123
+  train_sample_seed: 1000
+  validation_sample_seed: 2000
+  test_sample_seed: 3000
+
+model:
+  architecture: linear
+  latent_dim: 16
+  hidden_dim: 64
+  hidden_layers: 1
+
+training:
+  seed: 0
+  learning_rate: 0.001
+  betas: [0.9, 0.999]
+  epsilon: 1.0e-8
+  amsgrad: false
+  batch_size: 128
+  epochs: 100
+  shuffle: true
+  device: auto
+  evaluation_every_epochs: 1
+  checkpoint_every_epochs: 10
+  stop_gradient: true
+  ema:
+    enabled: true
+    decay: 0.99
+
+evaluation:
+  covariance_epsilon: 1.0e-8
+  collapse_std_threshold: 0.001
+  collapse_rank_threshold: 0.1
+  probe_ridge: 0.000001
+
+output:
+  root: outputs
+  overwrite: false

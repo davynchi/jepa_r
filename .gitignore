@@ -1,2 +1,9 @@
 .*.swp
 *.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.gstack/
+build/
+dist/
+outputs/

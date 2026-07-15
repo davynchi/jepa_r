@@ -1,0 +1,31 @@
+data:
+  system_kind: linear
+  num_samples: 8
+  validation_samples: 4
+  test_samples: 4
+  sequence_length: 6
+  window_size: 2
+  burn_in_steps: 2
+  latent_state_dim: 2
+  observation_dim: 2
+  process_noise: 0.05
+  observation_noise: 0.05
+  transition_norm: 0.8
+
+model:
+  latent_dim: 3
+  hidden_dim: 4
+  hidden_layers: 1
+
+training:
+  learning_rate: 0.005
+  batch_size: 4
+  epochs: 1
+  device: cpu
+  evaluation_every_epochs: 1
+  checkpoint_every_epochs: 1
+  ema:
+    decay: 0.9
+
+evaluation:
+  probe_ridge: 0.0001

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.25"
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --locked
+      - run: uv run ruff check src tests scripts
+      - run: uv run mypy
+      - run: uv run pytest
+      - run: uv build
+
+  smoke:
+    name: Tiny 16-cell sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.25"
+          enable-cache: true
+          python-version: "3.11"
+      - run: uv sync --locked
+      - run: >-
+          uv run jepa sweep
+          --config configs/smoke.yaml
+          --system-kind all
+          --seeds 0
+          --output-root smoke-outputs
+      - run: uv run python scripts/verify_smoke.py smoke-outputs
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: smoke-sweep-report
+          path: smoke-outputs/**/summary.*
