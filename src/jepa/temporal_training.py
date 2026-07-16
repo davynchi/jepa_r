@@ -302,9 +302,11 @@ def _hierarchical_epoch_loss(
 
 
 @torch.no_grad()
+@torch.no_grad()
 def encode_split_standard(core: JEPACore, dataset: EntityContextTrajectoryDataset) -> torch.Tensor:
     core.context_encoder.eval()
-    flat = dataset.observations.reshape(-1, dataset.config.observation_dim)
+    device = next(core.context_encoder.parameters()).device
+    flat = dataset.observations.reshape(-1, dataset.config.observation_dim).to(device)
     latents = core.context_encoder(flat)
     return latents.reshape(*dataset.observations.shape[:-1], -1)
 
@@ -314,7 +316,8 @@ def encode_split_hierarchical(
     core: HierarchicalCore, dataset: EntityContextTrajectoryDataset
 ) -> torch.Tensor:
     core.online.eval()
-    flat = dataset.observations.reshape(-1, dataset.config.observation_dim)
+    device = next(core.online.parameters()).device
+    flat = dataset.observations.reshape(-1, dataset.config.observation_dim).to(device)
     latents = core.online.encode(flat)
     return latents.reshape(*dataset.observations.shape[:-1], -1)
 
