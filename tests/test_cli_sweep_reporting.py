@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import xml.etree.ElementTree as ET
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,9 @@ from jepa.config import (
     EMAConfig,
     EvaluationConfig,
     ExperimentConfig,
+    MaskedPatchesConfig,
     ModelConfig,
+    ObjectiveConfig,
     OutputConfig,
     TrainingConfig,
 )
@@ -57,19 +60,29 @@ def _read_csv(path: Path) -> tuple[tuple[str, ...], list[dict[str, str]]]:
 
 
 def test_one_dynamics_sweep_produces_eight_cells_and_reports(tmp_path: Path) -> None:
-    result = run_sweep(_config(tmp_path), seeds=[7], system_kind="linear")
+    progress: list[dict[str, Any]] = []
+    result = run_sweep(
+        _config(tmp_path),
+        seeds=[7],
+        system_kind="linear",
+        progress=progress.append,
+    )
 
     assert result.completed_count == 8
     assert result.failed_count == 0
     assert len(result.rows) == 8
     assert len({row["run_id"] for row in result.rows}) == 8
     assert len(result.aggregates) == 8
+    assert sum(event["event"] == "cell_start" for event in progress) == 8
+    assert sum(event["event"] == "epoch_complete" for event in progress) == 8
+    assert sum(event["event"] == "cell_complete" for event in progress) == 8
     assert {path.name for path in result.sweep_dir.iterdir()} == {
         "runs",
         "status.json",
         "summary.csv",
         "summary_by_variant.csv",
         "summary.svg",
+        "learning_curves.svg",
     }
     fields, rows = _read_csv(result.sweep_dir / "summary.csv")
     assert fields == SUMMARY_COLUMNS
@@ -79,6 +92,14 @@ def test_one_dynamics_sweep_produces_eight_cells_and_reports(tmp_path: Path) -> 
     assert len(aggregates) == 8
     assert all(row["completed_count"] == "1" for row in aggregates)
     ET.parse(result.sweep_dir / "summary.svg")
+    ET.parse(result.sweep_dir / "learning_curves.svg")
+    learning_curves = (result.sweep_dir / "learning_curves.svg").read_text()
+    assert "Validation MSE — future_window (log scale)" in learning_curves
+    assert "SG on" in learning_curves
+    assert re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_MSK(?:_\d{2})?",
+        result.sweep_dir.name,
+    )
     svg = (result.sweep_dir / "summary.svg").read_text()
     assert "Validation MSE" in svg
     assert "Context normalized effective rank" in svg
@@ -89,6 +110,7 @@ def test_one_dynamics_sweep_produces_eight_cells_and_reports(tmp_path: Path) -> 
     for row in result.rows:
         run_dir = Path(row["run_dir"])
         assert json.loads((run_dir / "status.json").read_text())["state"] == "complete"
+        ET.parse(run_dir / "history.svg")
         artifact = yaml.safe_load((run_dir / "config.yaml").read_text())
         seeds = artifact["derived_seeds"]
         paired_seed_sets.add(
@@ -140,18 +162,30 @@ def test_failed_cell_is_isolated_and_marked_in_every_summary(
     status = json.loads((Path(failed["run_dir"]) / "status.json").read_text())
     assert status["state"] == "failed"
     sweep_status = json.loads((result.sweep_dir / "status.json").read_text())
-    assert sweep_status == {
-        "schema_version": 1,
-        "state": "partial_failure",
-        "completed_count": 7,
-        "failed_count": 1,
-        "cell_count": 8,
-    }
+    assert sweep_status["schema_version"] == 2
+    assert sweep_status["state"] == "partial_failure"
+    assert sweep_status["completed_count"] == 7
+    assert sweep_status["failed_count"] == 1
+    assert sweep_status["cell_count"] == 8
+    assert sweep_status["objectives"] == ["future_window"]
     failed_aggregate = next(row for row in result.aggregates if row["variant"] == failed["variant"])
     assert failed_aggregate["completed_count"] == 0
     assert failed_aggregate["failed_count"] == 1
     assert failed_aggregate["validation_mse_mean"] is None
     assert "FAILED" in (result.sweep_dir / "summary.svg").read_text()
+
+    monkeypatch.setattr(reporting_module, "train_experiment", original)
+    retry_progress: list[dict[str, Any]] = []
+    retried = run_sweep(
+        _config(tmp_path),
+        seeds=[5],
+        system_kind="linear",
+        progress=retry_progress.append,
+    )
+    assert retried.completed_count == 8
+    assert retried.failed_count == 0
+    assert sum(event["event"] == "cell_reused" for event in retry_progress) == 7
+    assert sum(event["event"] == "cell_complete" for event in retry_progress) == 1
 
 
 def test_multiple_replicates_are_aggregated_by_variant(tmp_path: Path) -> None:
@@ -163,14 +197,49 @@ def test_multiple_replicates_are_aggregated_by_variant(tmp_path: Path) -> None:
     assert all(row["failed_count"] == 0 for row in result.aggregates)
 
 
-def test_sweep_refuses_existing_directory_without_overwrite(tmp_path: Path) -> None:
+def test_sweep_reuses_completed_runs_and_overwrite_replaces_them(tmp_path: Path) -> None:
     config = _config(tmp_path)
     first = run_sweep(config, seeds=[1])
-    with pytest.raises(FileExistsError):
-        run_sweep(config, seeds=[1])
+    reused = run_sweep(config, seeds=[1])
+    assert reused.sweep_dir == first.sweep_dir
+    assert reused.completed_count == 8
 
     overwritten = run_sweep(_config(tmp_path, overwrite=True), seeds=[1])
-    assert overwritten.sweep_dir == first.sweep_dir
+    assert overwritten.sweep_dir != first.sweep_dir
+
+
+def test_all_objectives_create_sixteen_objective_aware_cells(tmp_path: Path) -> None:
+    base = _config(tmp_path)
+    config = replace(
+        base,
+        objective=ObjectiveConfig(
+            kind="future_window",
+            masked_patches=MaskedPatchesConfig(
+                patch_size=1,
+                mask_ratio=0.5,
+                position_dim=4,
+            ),
+        ),
+    )
+    result = run_sweep(config, seeds=[0], system_kind="linear", objectives="all")
+
+    assert result.completed_count == 16
+    assert len(result.rows) == 16
+    assert len(result.aggregates) == 16
+    assert {row["objective"] for row in result.rows} == {
+        "future_window",
+        "masked_patches",
+    }
+    assert len({row["run_id"] for row in result.rows}) == 16
+    assert len({row["dataset_fingerprint"] for row in result.rows}) == 1
+    assert all(row["wall_clock_seconds"] < 1800 for row in result.rows)
+    replicate_seeds = {
+        yaml.safe_load((Path(row["run_dir"]) / "config.yaml").read_text())["identity"][
+            "replicate_seed"
+        ]
+        for row in result.rows
+    }
+    assert replicate_seeds == {0}
 
 
 def test_cli_train_applies_flags_and_prints_machine_readable_result(
@@ -199,8 +268,14 @@ def test_cli_train_applies_flags_and_prints_machine_readable_result(
     )
 
     assert exit_code == 0
-    output = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
     assert output["state"] == "complete"
+    assert "Run | future_window | nonlinear | SG off | EMA on" in captured.err
+    assert "Epoch 1/1" in captured.err
+    assert "train MSE" in captured.err
+    assert "ETA" in captured.err
+    assert "Complete | elapsed" in captured.err
     metrics = json.loads((Path(output["run_dir"]) / "metrics.json").read_text())
     assert metrics["policy"]["stop_gradient"] is False
     assert metrics["policy"]["ema_enabled"] is True

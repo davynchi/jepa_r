@@ -142,6 +142,16 @@ def test_global_gradient_norm_reports_non_finite_gradients() -> None:
     assert global_gradient_norm([parameter]) == MetricValue(None, "non_finite")
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is unavailable")
+def test_global_gradient_norm_moves_mps_gradient_before_float64_cast() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([3.0, 4.0], device="mps"))
+    parameter.grad = torch.tensor([3.0, 4.0], device="mps")
+
+    metric = global_gradient_norm([parameter])
+
+    assert metric.value == pytest.approx(5.0)
+
+
 def test_ridge_probe_recovers_offset_multi_output_mapping() -> None:
     features = torch.tensor([[-2.0, 1.0], [-1.0, 0.0], [0.0, 2.0], [1.0, -1.0], [2.0, 3.0]])
     true_weights = torch.tensor([[2.0, -1.0], [0.5, 3.0]])

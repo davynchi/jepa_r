@@ -1,7 +1,11 @@
 """Compact JEPA research primitives for time-series experiments."""
 
 from jepa.config import (
+    BinanceDataConfig,
     ExperimentConfig,
+    MaskedPatchesConfig,
+    ObjectiveConfig,
+    ObjectiveKind,
     PairedReplicateSeeds,
     apply_paired_replicate,
     config_from_dict,
@@ -9,7 +13,14 @@ from jepa.config import (
     derive_paired_replicate,
     load_config,
 )
-from jepa.data import LatentDynamicsDataset, build_dataset_splits, generate_system
+from jepa.data import (
+    DatasetBundle,
+    LatentDynamicsDataset,
+    WindowDataset,
+    build_dataset_bundle,
+    build_dataset_splits,
+    generate_system,
+)
 from jepa.metrics import (
     MetricValue,
     RepresentationMetrics,
@@ -23,8 +34,10 @@ from jepa.metrics import (
 from jepa.models import (
     LinearEncoder,
     LinearPredictor,
+    MaskedPatchPredictor,
     TanhEncoder,
     TanhPredictor,
+    build_masked_model_pair,
     build_model_pair,
 )
 from jepa.reporting import SweepResult, aggregate_rows, run_sweep, variant_label
@@ -33,8 +46,11 @@ from jepa.training import (
     OptimizationPolicy,
     TrainResult,
     build_jepa_core,
+    build_masked_jepa_core,
     build_run_id,
     compute_loss,
+    compute_masked_loss,
+    masked_patch_indices,
     optimizer_parameters,
     resolve_policy,
     train_experiment,
@@ -43,12 +59,18 @@ from jepa.training import (
 
 __all__ = [
     "ExperimentConfig",
+    "BinanceDataConfig",
+    "DatasetBundle",
     "JEPACore",
     "LatentDynamicsDataset",
+    "MaskedPatchPredictor",
+    "MaskedPatchesConfig",
     "LinearEncoder",
     "LinearPredictor",
     "MetricValue",
     "OptimizationPolicy",
+    "ObjectiveConfig",
+    "ObjectiveKind",
     "PairedReplicateSeeds",
     "RepresentationMetrics",
     "RidgeProbe",
@@ -57,13 +79,18 @@ __all__ = [
     "TrainResult",
     "SweepResult",
     "WeightedMean",
+    "WindowDataset",
     "apply_paired_replicate",
     "aggregate_rows",
+    "build_dataset_bundle",
     "build_dataset_splits",
     "build_jepa_core",
+    "build_masked_jepa_core",
+    "build_masked_model_pair",
     "build_model_pair",
     "build_run_id",
     "compute_loss",
+    "compute_masked_loss",
     "compute_representation_metrics",
     "config_from_dict",
     "config_identity_hash",
@@ -71,6 +98,7 @@ __all__ = [
     "generate_system",
     "global_gradient_norm",
     "load_config",
+    "masked_patch_indices",
     "fit_ridge_probe",
     "optimizer_parameters",
     "resolve_policy",

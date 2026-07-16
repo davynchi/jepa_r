@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import re
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -95,10 +97,19 @@ def test_training_writes_atomic_complete_artifacts_and_final_rows(tmp_path: Path
         "checkpoint.pt",
         "config.yaml",
         "history.csv",
+        "history.svg",
         "metrics.json",
         "status.json",
     }
     assert not any(path.name.startswith(".") for path in result.run_dir.iterdir())
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_MSK(?:_\d{2})?", result.run_dir.name)
+    ET.parse(result.run_dir / "history.svg")
+    history_svg = (result.run_dir / "history.svg").read_text()
+    assert "Objective MSE (log scale)" in history_svg
+    assert "Context normalized effective rank" in history_svg
+    assert "Training gradient norms (log scale)" in history_svg
+    assert "epoch 2:" in history_svg
+    assert "epoch 3:" in history_svg
     status = json.loads((result.run_dir / "status.json").read_text())
     assert status["state"] == "complete"
     assert status["completed_epoch"] == 3
@@ -226,7 +237,7 @@ def test_resume_can_extend_epochs_without_changing_run_identity(
     with pytest.raises(RuntimeError, match="finalization failure"):
         train_experiment(short_config)
     run_dir = next((tmp_path / "extended").iterdir())
-    original_run_id = run_dir.name
+    original_run_id = _load_checkpoint(run_dir / "checkpoint.pt")["run_id"]
     assert _load_checkpoint(run_dir / "checkpoint.pt")["epoch"] == 2
 
     monkeypatch.setattr(training_module, "_final_metrics", original_final_metrics)
@@ -284,12 +295,40 @@ def test_resume_rejects_duplicate_history_rows(tmp_path: Path) -> None:
         train_experiment(config, resume_from=result.run_dir / "checkpoint.pt")
 
 
-def test_fresh_run_requires_explicit_overwrite(tmp_path: Path) -> None:
+def test_fresh_runs_get_unique_timestamp_directories(tmp_path: Path) -> None:
     config = _config(tmp_path, epochs=1, evaluation_every=1, checkpoint_every=1)
     first = train_experiment(config)
-    with pytest.raises(FileExistsError):
-        train_experiment(config)
+    second = train_experiment(config)
 
-    overwritten = train_experiment(replace(config, output=replace(config.output, overwrite=True)))
-    assert overwritten.run_dir == first.run_dir
-    assert json.loads((overwritten.run_dir / "status.json").read_text())["state"] == "complete"
+    assert second.run_dir != first.run_dir
+    assert second.run_id == first.run_id
+    assert json.loads((second.run_dir / "status.json").read_text())["state"] == "complete"
+
+
+def test_synthetic_schema_v1_checkpoint_remains_resumable(tmp_path: Path) -> None:
+    original = _config(tmp_path, epochs=1, evaluation_every=1, checkpoint_every=1)
+    result = train_experiment(original)
+    checkpoint_path = result.run_dir / "checkpoint.pt"
+    checkpoint = _load_checkpoint(checkpoint_path)
+    checkpoint["schema_version"] = 1
+    checkpoint.pop("objective")
+    checkpoint.pop("dataset_fingerprint")
+    checkpoint.pop("replicate_seed")
+    checkpoint["config"].pop("objective")
+    checkpoint["initial_config"].pop("objective")
+    torch.save(checkpoint, checkpoint_path)
+
+    status = json.loads((result.run_dir / "status.json").read_text())
+    status.update(schema_version=1, state="failed")
+    (result.run_dir / "status.json").write_text(json.dumps(status))
+    artifact_path = result.run_dir / "config.yaml"
+    artifact = yaml.safe_load(artifact_path.read_text())
+    artifact["schema_version"] = 1
+    artifact["config"].pop("objective")
+    artifact_path.write_text(yaml.safe_dump(artifact))
+
+    extended = replace(original, training=replace(original.training, epochs=2))
+    resumed = train_experiment(extended, resume_from=checkpoint_path)
+
+    assert resumed.metrics["schema_version"] == 2
+    assert _load_checkpoint(checkpoint_path)["schema_version"] == 2

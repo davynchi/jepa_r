@@ -12,9 +12,9 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -26,16 +26,27 @@ import yaml
 from torch import nn
 from torch.nn import functional as F
 
+from jepa.artifacts import create_timestamped_directory
 from jepa.config import (
+    BinanceDataConfig,
     EvaluationConfig,
     ExperimentConfig,
     config_from_dict,
     config_identity_hash,
     config_to_dict,
+    context_steps,
+    data_source,
     derive_seed,
+    sample_steps,
     validate_config,
 )
-from jepa.data import DatasetSplits, LatentDynamicsDataset, build_dataset_splits
+from jepa.data import (
+    DatasetBundle,
+    DatasetSplits,
+    WindowDataset,
+    build_dataset_bundle,
+    resolved_data_config,
+)
 from jepa.metrics import (
     MetricValue,
     RepresentationMetrics,
@@ -45,9 +56,17 @@ from jepa.metrics import (
     global_gradient_norm,
     ridge_r2_score,
 )
-from jepa.models import Architecture, build_model_pair
+from jepa.models import (
+    Architecture,
+    MaskedPatchPredictor,
+    build_masked_model_pair,
+    build_model_pair,
+)
+from jepa.visualization import run_history_svg
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, SCHEMA_VERSION})
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 _REPRESENTATION_FIELDS = (
     "latent_std_mean",
@@ -170,6 +189,35 @@ def build_jepa_core(
     return JEPACore(context_encoder, predictor, target_encoder, policy)
 
 
+def build_masked_jepa_core(
+    architecture: Architecture,
+    *,
+    patch_input_dim: int,
+    num_patches: int,
+    latent_dim: int,
+    position_dim: int,
+    stop_gradient: bool,
+    ema_enabled: bool,
+    hidden_dim: int = 64,
+    hidden_layers: int = 1,
+) -> JEPACore:
+    """Build a local-patch JEPA core with an explicit positional predictor."""
+    context_encoder, predictor = build_masked_model_pair(
+        architecture,
+        patch_input_dim=patch_input_dim,
+        num_patches=num_patches,
+        latent_dim=latent_dim,
+        position_dim=position_dim,
+        hidden_dim=hidden_dim,
+        hidden_layers=hidden_layers,
+    )
+    policy = resolve_policy(stop_gradient=stop_gradient, ema_enabled=ema_enabled)
+    target_encoder = deepcopy(context_encoder) if policy.separate_target else context_encoder
+    if policy.separate_target and not policy.optimize_target:
+        target_encoder.requires_grad_(False)
+    return JEPACore(context_encoder, predictor, target_encoder, policy)
+
+
 def optimizer_parameters(core: JEPACore) -> tuple[nn.Parameter, ...]:
     """Return the exact, de-duplicated parameter set for Adam."""
     groups = [core.context_encoder.parameters(), core.predictor.parameters()]
@@ -198,6 +246,84 @@ def compute_loss(
     objective_target = target_latent.detach() if core.policy.stop_gradient else target_latent
     loss = F.mse_loss(prediction, objective_target)
     return ForwardPass(context_latent, target_latent, prediction, loss)
+
+
+def masked_patch_indices(
+    *,
+    replicate_seed: int,
+    dataset_fingerprint: str,
+    split: str,
+    sample_indices: torch.Tensor,
+    num_patches: int,
+    masked_count: int,
+    epoch: int | None,
+) -> torch.Tensor:
+    """Return deterministic per-sample masks independent of loader order."""
+    if sample_indices.ndim != 1:
+        raise ValueError("sample_indices must be one-dimensional")
+    if not 0 < masked_count < num_patches:
+        raise ValueError("masked_count must be between zero and num_patches")
+    schedule = "eval" if epoch is None else epoch
+    masks: list[torch.Tensor] = []
+    for index in sample_indices.detach().cpu().tolist():
+        seed = derive_seed(
+            replicate_seed,
+            dataset_fingerprint,
+            split,
+            int(index),
+            schedule,
+        )
+        permutation = torch.randperm(num_patches, generator=torch.Generator().manual_seed(seed))
+        masks.append(permutation[:masked_count].sort().values)
+    return torch.stack(masks)
+
+
+def compute_masked_loss(
+    core: JEPACore,
+    sequences: torch.Tensor,
+    target_indices: torch.Tensor,
+    *,
+    patch_size: int,
+) -> ForwardPass:
+    """Compute vectorized local-patch JEPA loss without exposing masked inputs."""
+    if sequences.ndim != 3 or sequences.shape[1] % patch_size:
+        raise ValueError("sequences must be [B, steps, features] divisible into patches")
+    batch_size, steps, features = sequences.shape
+    num_patches = steps // patch_size
+    if target_indices.ndim != 2 or target_indices.shape[0] != batch_size:
+        raise ValueError("target_indices must have shape [B, masked_count]")
+    if target_indices.dtype != torch.long:
+        target_indices = target_indices.long()
+    patches = sequences.reshape(batch_size, num_patches, patch_size * features)
+    visibility = torch.ones(batch_size, num_patches, dtype=torch.bool, device=sequences.device)
+    visibility.scatter_(1, target_indices, False)
+    visible_indices = visibility.nonzero(as_tuple=False)[:, 1].reshape(batch_size, -1)
+    visible = patches.gather(1, visible_indices.unsqueeze(-1).expand(-1, -1, patches.shape[-1]))
+    masked = patches.gather(1, target_indices.unsqueeze(-1).expand(-1, -1, patches.shape[-1]))
+    context_latent = core.context_encoder(visible)
+    target_latent = core.target_encoder(masked)
+    context_grid = torch.zeros(
+        batch_size,
+        num_patches,
+        context_latent.shape[-1],
+        dtype=context_latent.dtype,
+        device=context_latent.device,
+    )
+    context_grid.scatter_(
+        1,
+        visible_indices.unsqueeze(-1).expand(-1, -1, context_latent.shape[-1]),
+        context_latent,
+    )
+    if not isinstance(core.predictor, MaskedPatchPredictor):
+        raise TypeError("masked objective requires MaskedPatchPredictor")
+    prediction = core.predictor(context_grid, visibility, target_indices)
+    objective_target = target_latent.detach() if core.policy.stop_gradient else target_latent
+    return ForwardPass(
+        context_latent,
+        target_latent,
+        prediction,
+        F.mse_loss(prediction, objective_target),
+    )
 
 
 @torch.no_grad()
@@ -247,8 +373,10 @@ class SplitOutputs:
     context_latents: torch.Tensor
     target_latents: torch.Tensor
     predictions: torch.Tensor
-    context_states: torch.Tensor
-    target_states: torch.Tensor
+    objective_context_latents: torch.Tensor
+    objective_target_latents: torch.Tensor
+    context_states: torch.Tensor | None
+    target_states: torch.Tensor | None
     target_windows: torch.Tensor
 
 
@@ -314,10 +442,35 @@ def build_run_id(config: ExperimentConfig, seed_label: int | None = None) -> str
     label = config.training.seed if seed_label is None else seed_label
     sg = "on" if config.training.stop_gradient else "off"
     ema = "on" if config.training.ema.enabled else "off"
+    if isinstance(config.data, BinanceDataConfig):
+        objective = f"_objective-{config.objective.kind.replace('_', '-')}"
+        fingerprint = (config.data.fingerprint or "unresolved")[:8]
+        return (
+            f"data-binance-spot-15m{objective}_model-{config.model.architecture}"
+            f"_sg-{sg}_ema-{ema}_seed-{label}_data-{fingerprint}"
+            f"_cfg-{config_identity_hash(config)[:8]}"
+        )
+    objective = "" if config.objective.kind == "future_window" else "_objective-masked-patches"
     return (
-        f"dynamics-{config.data.system_kind}_model-{config.model.architecture}"
+        f"dynamics-{config.data.system_kind}{objective}_model-{config.model.architecture}"
         f"_sg-{sg}_ema-{ema}_seed-{label}_cfg-{config_identity_hash(config)[:8]}"
     )
+
+
+def parameter_counts(core: JEPACore) -> dict[str, int]:
+    """Count parameters once even when context and target modules are shared."""
+    unique: dict[int, nn.Parameter] = {}
+    for module in (core.context_encoder, core.predictor, core.target_encoder):
+        for parameter in module.parameters():
+            unique.setdefault(id(parameter), parameter)
+    optimizer_ids = {id(parameter) for parameter in optimizer_parameters(core)}
+    return {
+        "unique_total": sum(parameter.numel() for parameter in unique.values()),
+        "requires_grad": sum(
+            parameter.numel() for parameter in unique.values() if parameter.requires_grad
+        ),
+        "optimizer": sum(unique[identity].numel() for identity in optimizer_ids),
+    }
 
 
 def _atomic_bytes(path: Path, payload: bytes) -> None:
@@ -448,13 +601,71 @@ def _batch_indices(size: int, batch_size: int, *, seed: int, shuffle: bool) -> l
     return list(order.split(batch_size))
 
 
+def _masked_dimensions(config: ExperimentConfig) -> tuple[int, int, int]:
+    patch_size = config.objective.masked_patches.patch_size
+    num_patches = sample_steps(config.data) // patch_size
+    masked_count = int(round(num_patches * config.objective.masked_patches.mask_ratio))
+    return patch_size, num_patches, masked_count
+
+
+def _forward_for_batch(
+    core: JEPACore,
+    dataset: WindowDataset,
+    indices: torch.Tensor,
+    config: ExperimentConfig,
+    device: torch.device,
+    *,
+    fingerprint: str,
+    replicate_seed: int,
+    epoch: int | None,
+) -> ForwardPass:
+    if config.objective.kind == "future_window":
+        return compute_loss(
+            core,
+            dataset.contexts[indices].flatten(1).to(device),
+            dataset.targets[indices].flatten(1).to(device),
+        )
+    patch_size, num_patches, masked_count = _masked_dimensions(config)
+    targets = masked_patch_indices(
+        replicate_seed=replicate_seed,
+        dataset_fingerprint=fingerprint,
+        split=dataset.split,
+        sample_indices=indices,
+        num_patches=num_patches,
+        masked_count=masked_count,
+        epoch=epoch,
+    ).to(device)
+    return compute_masked_loss(
+        core,
+        dataset.sequences[indices].to(device),
+        targets,
+        patch_size=patch_size,
+    )
+
+
+def _encode_observed_window(
+    encoder: nn.Module,
+    windows: torch.Tensor,
+    *,
+    patch_size: int,
+) -> torch.Tensor:
+    """Encode all local patches in a 32-step probe window and mean-pool them."""
+    batch, steps, features = windows.shape
+    if steps % patch_size:
+        raise ValueError("probe window is not divisible by patch_size")
+    patches = windows.reshape(batch, steps // patch_size, patch_size * features)
+    return encoder(patches).mean(dim=1)
+
+
 def _train_epoch(
     core: JEPACore,
     optimizer: torch.optim.Optimizer,
-    dataset: LatentDynamicsDataset,
+    dataset: WindowDataset,
     config: ExperimentConfig,
     device: torch.device,
     epoch: int,
+    fingerprint: str = "legacy",
+    replicate_seed: int | None = None,
 ) -> dict[str, MetricValue]:
     core.context_encoder.train()
     core.predictor.train()
@@ -467,10 +678,17 @@ def _train_epoch(
         seed=derive_seed(config.training.seed, "train-order", epoch),
         shuffle=config.training.shuffle,
     ):
-        context = dataset.contexts[indices].flatten(1).to(device)
-        target = dataset.targets[indices].flatten(1).to(device)
         optimizer.zero_grad(set_to_none=True)
-        forward = compute_loss(core, context, target)
+        forward = _forward_for_batch(
+            core,
+            dataset,
+            indices,
+            config,
+            device,
+            fingerprint=fingerprint,
+            replicate_seed=(config.training.seed if replicate_seed is None else replicate_seed),
+            epoch=epoch,
+        )
         if not torch.isfinite(forward.loss):
             raise FloatingPointError(f"non-finite training loss at epoch {epoch}")
         if forward.context_latent.requires_grad:
@@ -531,9 +749,12 @@ def _train_epoch(
 @torch.no_grad()
 def _collect_split_outputs(
     core: JEPACore,
-    dataset: LatentDynamicsDataset,
+    dataset: WindowDataset,
     batch_size: int,
     device: torch.device,
+    config: ExperimentConfig,
+    fingerprint: str,
+    replicate_seed: int,
 ) -> SplitOutputs:
     core.context_encoder.eval()
     core.predictor.eval()
@@ -541,16 +762,44 @@ def _collect_split_outputs(
     loss_mean = WeightedMean()
     context_latents: list[torch.Tensor] = []
     target_latents: list[torch.Tensor] = []
+    objective_context_latents: list[torch.Tensor] = []
+    objective_target_latents: list[torch.Tensor] = []
     predictions: list[torch.Tensor] = []
     for indices in _batch_indices(len(dataset), batch_size, seed=0, shuffle=False):
-        context = dataset.contexts[indices].flatten(1).to(device)
-        target = dataset.targets[indices].flatten(1).to(device)
-        forward = compute_loss(core, context, target)
+        forward = _forward_for_batch(
+            core,
+            dataset,
+            indices,
+            config,
+            device,
+            fingerprint=fingerprint,
+            replicate_seed=replicate_seed,
+            epoch=None,
+        )
         if not torch.isfinite(forward.loss):
             raise FloatingPointError(f"non-finite evaluation loss on {dataset.split}")
         loss_mean.update(forward.loss.item(), len(indices))
-        context_latents.append(forward.context_latent.cpu())
-        target_latents.append(forward.target_latent.cpu())
+        objective_context_latents.append(forward.context_latent.cpu())
+        objective_target_latents.append(forward.target_latent.cpu())
+        if config.objective.kind == "masked_patches":
+            patch_size = config.objective.masked_patches.patch_size
+            context_latents.append(
+                _encode_observed_window(
+                    core.context_encoder,
+                    dataset.contexts[indices].to(device),
+                    patch_size=patch_size,
+                ).cpu()
+            )
+            target_latents.append(
+                _encode_observed_window(
+                    core.target_encoder,
+                    dataset.targets[indices].to(device),
+                    patch_size=patch_size,
+                ).cpu()
+            )
+        else:
+            context_latents.append(forward.context_latent.cpu())
+            target_latents.append(forward.target_latent.cpu())
         predictions.append(forward.prediction.cpu())
     mse = loss_mean.compute()
     if mse.value is None:
@@ -560,8 +809,14 @@ def _collect_split_outputs(
         context_latents=torch.cat(context_latents),
         target_latents=torch.cat(target_latents),
         predictions=torch.cat(predictions),
-        context_states=dataset.context_states.detach().cpu(),
-        target_states=dataset.target_states.detach().cpu(),
+        objective_context_latents=torch.cat(objective_context_latents),
+        objective_target_latents=torch.cat(objective_target_latents),
+        context_states=(
+            None if dataset.context_states is None else dataset.context_states.detach().cpu()
+        ),
+        target_states=(
+            None if dataset.target_states is None else dataset.target_states.detach().cpu()
+        ),
         target_windows=dataset.targets.flatten(1).detach().cpu(),
     )
 
@@ -577,10 +832,20 @@ def _history_row(
     distance: MetricValue,
     elapsed_seconds: float,
 ) -> dict[str, Any]:
-    context = compute_representation_metrics(outputs.context_latents, evaluation_config)
-    target = compute_representation_metrics(outputs.target_latents, evaluation_config)
+    context = compute_representation_metrics(
+        outputs.objective_context_latents.reshape(-1, outputs.objective_context_latents.shape[-1]),
+        evaluation_config,
+    )
+    target = compute_representation_metrics(
+        outputs.objective_target_latents.reshape(-1, outputs.objective_target_latents.shape[-1]),
+        evaluation_config,
+    )
     prediction_norm = MetricValue(
-        torch.linalg.vector_norm(outputs.predictions.double(), dim=1).mean().item()
+        torch.linalg.vector_norm(
+            outputs.predictions.reshape(-1, outputs.predictions.shape[-1]).double(), dim=1
+        )
+        .mean()
+        .item()
     )
     row: dict[str, Any] = {
         "run_id": run_id,
@@ -633,8 +898,10 @@ def _config_artifact(
     initial_hash: str,
     resume_history: list[dict[str, Any]],
     datasets: DatasetSplits,
+    replicate_seed: int,
 ) -> dict[str, Any]:
-    return {
+    synthetic = not isinstance(config.data, BinanceDataConfig)
+    payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "config": config_to_dict(config),
@@ -642,22 +909,40 @@ def _config_artifact(
             "initial_config_hash": initial_hash,
             "current_config_hash": config_identity_hash(config),
             "model_seed": derive_seed(config.training.seed, config.model.architecture, "model"),
+            "replicate_seed": replicate_seed,
         },
         "derived_seeds": {
-            "system": config.data.system_seed,
-            "train_samples": config.data.train_sample_seed,
-            "validation_samples": config.data.validation_sample_seed,
-            "test_samples": config.data.test_sample_seed,
             "training": config.training.seed,
             "epoch_order_rule": "sha256(training.seed, 'train-order', epoch)",
+            "mask_rule": (
+                "sha256(training.seed, dataset_fingerprint, split, sample_index, epoch|'eval')"
+            ),
         },
         "resume_history": resume_history,
-        "system": {
-            "transition": datasets.system.transition.tolist(),
-            "observation": datasets.system.observation.tolist(),
+        "dataset": {
+            "source": data_source(config.data),
+            "fingerprint": datasets.fingerprint,
+            "metadata": datasets.metadata,
         },
         "environment": _environment_metadata(),
     }
+    if synthetic:
+        if isinstance(config.data, BinanceDataConfig):
+            raise AssertionError("synthetic data discriminator is inconsistent")
+        assert datasets.system is not None
+        payload["derived_seeds"].update(
+            system=config.data.system_seed,
+            train_samples=config.data.train_sample_seed,
+            validation_samples=config.data.validation_sample_seed,
+            test_samples=config.data.test_sample_seed,
+        )
+        payload["system"] = {
+            "transition": datasets.system.transition.tolist(),
+            "observation": datasets.system.observation.tolist(),
+        }
+    else:
+        payload["system"] = None
+    return payload
 
 
 def _rng_state() -> dict[str, Any]:
@@ -689,8 +974,9 @@ def _checkpoint_payload(
     optimizer: torch.optim.Optimizer,
     datasets: DatasetSplits,
     elapsed_seconds: float,
+    replicate_seed: int,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "epoch": epoch,
@@ -698,18 +984,24 @@ def _checkpoint_payload(
         "initial_config": dict(initial_config),
         "config_hash": config_identity_hash(config),
         "initial_config_hash": initial_hash,
+        "objective": config.objective.kind,
+        "replicate_seed": replicate_seed,
         "device": str(device),
         "context_encoder": core.context_encoder.state_dict(),
         "predictor": core.predictor.state_dict(),
         "target_encoder": core.target_encoder.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "system": {
-            "transition": datasets.system.transition,
-            "observation": datasets.system.observation,
-        },
+        "dataset_fingerprint": datasets.fingerprint,
+        "system": None,
         "rng": _rng_state(),
         "elapsed_seconds": elapsed_seconds,
     }
+    if datasets.system is not None:
+        payload["system"] = {
+            "transition": datasets.system.transition,
+            "observation": datasets.system.observation,
+        }
+    return payload
 
 
 def _resume_compatible(stored: ExperimentConfig, current: ExperimentConfig, epoch: int) -> None:
@@ -725,7 +1017,10 @@ def _resume_compatible(stored: ExperimentConfig, current: ExperimentConfig, epoc
 
 def _load_checkpoint(path: Path) -> dict[str, Any]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != SCHEMA_VERSION:
+    if (
+        not isinstance(checkpoint, dict)
+        or checkpoint.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS
+    ):
         raise ValueError("checkpoint has an incompatible schema")
     return checkpoint
 
@@ -756,9 +1051,16 @@ def _final_metrics(outputs: Mapping[str, SplitOutputs], config: ExperimentConfig
     probes: dict[str, Any] = {}
     train = outputs["train"]
     for name, (feature_name, target_name) in specifications.items():
+        train_target = getattr(train, target_name)
+        if train_target is None:
+            probes[name] = {
+                split: _probe_metric(MetricValue(None, "not_available_for_dataset"))
+                for split in outputs
+            }
+            continue
         probe = fit_ridge_probe(
             getattr(train, feature_name),
-            getattr(train, target_name),
+            train_target,
             alpha=config.evaluation.probe_ridge,
         )
         probes[name] = {
@@ -774,12 +1076,24 @@ def _final_metrics(outputs: Mapping[str, SplitOutputs], config: ExperimentConfig
     representations = {
         split: {
             "context": _representation_payload(
-                compute_representation_metrics(value.context_latents, config.evaluation)
+                compute_representation_metrics(
+                    value.objective_context_latents.reshape(
+                        -1, value.objective_context_latents.shape[-1]
+                    ),
+                    config.evaluation,
+                )
             ),
             "target": _representation_payload(
-                compute_representation_metrics(value.target_latents, config.evaluation)
+                compute_representation_metrics(
+                    value.objective_target_latents.reshape(
+                        -1, value.objective_target_latents.shape[-1]
+                    ),
+                    config.evaluation,
+                )
             ),
-            "prediction_norm_mean": torch.linalg.vector_norm(value.predictions.double(), dim=1)
+            "prediction_norm_mean": torch.linalg.vector_norm(
+                value.predictions.reshape(-1, value.predictions.shape[-1]).double(), dim=1
+            )
             .mean()
             .item(),
         }
@@ -787,13 +1101,22 @@ def _final_metrics(outputs: Mapping[str, SplitOutputs], config: ExperimentConfig
     }
     return {
         "schema_version": SCHEMA_VERSION,
+        "objective_kind": config.objective.kind,
         "objective": {split: value.mse for split, value in outputs.items()},
+        "objective_shapes": {
+            split: {
+                "prediction": list(value.predictions.shape),
+                "target": list(value.objective_target_latents.shape),
+            }
+            for split, value in outputs.items()
+        },
         "representations": representations,
         "probes": probes,
         "artifacts": {
             "config": "config.yaml",
             "status": "status.json",
             "history": "history.csv",
+            "history_plot": "history.svg",
             "metrics": "metrics.json",
             "checkpoint": "checkpoint.pt",
         },
@@ -805,21 +1128,31 @@ def train_experiment(
     *,
     resume_from: str | Path | None = None,
     seed_label: int | None = None,
+    datasets: DatasetBundle | None = None,
+    progress: ProgressCallback | None = None,
+    run_dir_override: str | Path | None = None,
 ) -> TrainResult:
     """Train one JEPA run and durably record enough state for exact CPU resume."""
+    validate_config(config)
+    datasets = build_dataset_bundle(config.data) if datasets is None else datasets
+    config = replace(config, data=resolved_data_config(config.data, datasets))
     validate_config(config)
     started_at = _utc_now()
     start_time = time.monotonic()
     checkpoint: dict[str, Any] | None = None
     resume_history: list[dict[str, Any]] = []
+    replicate_seed = config.training.seed if seed_label is None else seed_label
     if resume_from is None:
         run_id = build_run_id(config, seed_label)
-        run_dir = Path(config.output.root).expanduser().resolve() / run_id
-        if run_dir.exists() and any(run_dir.iterdir()):
-            if not config.output.overwrite:
-                raise FileExistsError(f"run directory already exists: {run_dir}")
-            shutil.rmtree(run_dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
+        if run_dir_override is None:
+            run_dir = create_timestamped_directory(config.output.root)
+        else:
+            run_dir = Path(run_dir_override).expanduser().resolve()
+            if run_dir.exists() and any(run_dir.iterdir()):
+                if not config.output.overwrite:
+                    raise FileExistsError(f"run directory already exists: {run_dir}")
+                shutil.rmtree(run_dir)
+            run_dir.mkdir(parents=True, exist_ok=True)
         initial_hash = config_identity_hash(config)
         initial_config = config_to_dict(config)
         completed_epoch = 0
@@ -828,13 +1161,14 @@ def train_experiment(
     else:
         checkpoint_path = Path(resume_from).expanduser().resolve()
         checkpoint = _load_checkpoint(checkpoint_path)
+        replicate_seed = int(checkpoint.get("replicate_seed", config.training.seed))
         run_dir = checkpoint_path.parent
         run_id = checkpoint["run_id"]
         status_path = run_dir / "status.json"
         if not status_path.exists():
             raise ValueError("resume requires status.json beside the checkpoint")
         stored_status = json.loads(status_path.read_text())
-        if stored_status.get("schema_version") != SCHEMA_VERSION:
+        if stored_status.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
             raise ValueError("status.json has an incompatible schema")
         if stored_status.get("run_id") != run_id:
             raise ValueError("status.json run ID differs from checkpoint")
@@ -859,7 +1193,7 @@ def train_experiment(
         if not artifact_path.exists():
             raise ValueError("resume requires config.yaml beside the checkpoint")
         existing_artifact = yaml.safe_load(artifact_path.read_text()) or {}
-        if existing_artifact.get("schema_version") != SCHEMA_VERSION:
+        if existing_artifact.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
             raise ValueError("config.yaml has an incompatible schema")
         if existing_artifact.get("run_id") != run_id:
             raise ValueError("config.yaml run ID differs from checkpoint")
@@ -889,25 +1223,54 @@ def train_experiment(
         "updated_at": started_at,
         "completed_epoch": completed_epoch,
         "config_hash": config_identity_hash(config),
+        "objective": config.objective.kind,
+        "dataset_fingerprint": datasets.fingerprint,
+        "replicate_seed": replicate_seed,
         "error": None,
     }
     _atomic_json(status_path, status)
+    if progress is not None:
+        progress(
+            {
+                "event": "run_start",
+                "run_id": run_id,
+                "objective": config.objective.kind,
+                "architecture": config.model.architecture,
+                "stop_gradient": config.training.stop_gradient,
+                "ema_enabled": config.training.ema.enabled,
+                "completed_epoch": completed_epoch,
+                "total_epochs": config.training.epochs,
+            }
+        )
+    starting_epoch = completed_epoch
     try:
         device = _resolve_device(config.training.device)
         if checkpoint is not None:
             device = torch.device("cpu")
         _seed_everything(derive_seed(config.training.seed, config.model.architecture, "model"))
-        datasets = build_dataset_splits(config.data)
-        input_dim = config.data.window_size * config.data.observation_dim
-        core = build_jepa_core(
-            config.model.architecture,
-            input_dim=input_dim,
-            latent_dim=config.model.latent_dim,
-            stop_gradient=config.training.stop_gradient,
-            ema_enabled=config.training.ema.enabled,
-            hidden_dim=config.model.hidden_dim,
-            hidden_layers=config.model.hidden_layers,
-        )
+        if config.objective.kind == "future_window":
+            core = build_jepa_core(
+                config.model.architecture,
+                input_dim=context_steps(config.data) * config.data.observation_dim,
+                latent_dim=config.model.latent_dim,
+                stop_gradient=config.training.stop_gradient,
+                ema_enabled=config.training.ema.enabled,
+                hidden_dim=config.model.hidden_dim,
+                hidden_layers=config.model.hidden_layers,
+            )
+        else:
+            patch_size, num_patches, _ = _masked_dimensions(config)
+            core = build_masked_jepa_core(
+                config.model.architecture,
+                patch_input_dim=patch_size * config.data.observation_dim,
+                num_patches=num_patches,
+                latent_dim=config.model.latent_dim,
+                position_dim=config.objective.masked_patches.position_dim,
+                stop_gradient=config.training.stop_gradient,
+                ema_enabled=config.training.ema.enabled,
+                hidden_dim=config.model.hidden_dim,
+                hidden_layers=config.model.hidden_layers,
+            )
         core.context_encoder.to(device)
         core.predictor.to(device)
         core.target_encoder.to(device)
@@ -919,11 +1282,19 @@ def train_experiment(
             amsgrad=config.training.amsgrad,
         )
         if checkpoint is not None:
-            expected = checkpoint["system"]
-            if not torch.equal(datasets.system.transition, expected["transition"]):
-                raise ValueError("regenerated transition matrix differs from checkpoint")
-            if not torch.equal(datasets.system.observation, expected["observation"]):
-                raise ValueError("regenerated observation matrix differs from checkpoint")
+            stored_fingerprint = checkpoint.get("dataset_fingerprint")
+            if stored_fingerprint is not None and stored_fingerprint != datasets.fingerprint:
+                raise ValueError("dataset fingerprint differs from checkpoint")
+            expected = checkpoint.get("system")
+            if expected is not None:
+                if datasets.system is None:
+                    raise ValueError("checkpoint dataset source differs from current dataset")
+                if not torch.equal(datasets.system.transition, expected["transition"]):
+                    raise ValueError("regenerated transition matrix differs from checkpoint")
+                if not torch.equal(datasets.system.observation, expected["observation"]):
+                    raise ValueError("regenerated observation matrix differs from checkpoint")
+            elif checkpoint.get("schema_version") == 1:
+                raise ValueError("v1 checkpoints are supported only for synthetic datasets")
             core.context_encoder.load_state_dict(checkpoint["context_encoder"])
             core.predictor.load_state_dict(checkpoint["predictor"])
             core.target_encoder.load_state_dict(checkpoint["target_encoder"])
@@ -938,11 +1309,21 @@ def train_experiment(
                 initial_hash=initial_hash,
                 resume_history=resume_history,
                 datasets=datasets,
+                replicate_seed=replicate_seed,
             ),
         )
         latest_outputs: dict[str, SplitOutputs] = {}
         for epoch in range(completed_epoch + 1, config.training.epochs + 1):
-            gradients = _train_epoch(core, optimizer, datasets.train, config, device, epoch)
+            gradients = _train_epoch(
+                core,
+                optimizer,
+                datasets.train,
+                config,
+                device,
+                epoch,
+                fingerprint=datasets.fingerprint,
+                replicate_seed=replicate_seed,
+            )
             due_evaluation = (
                 epoch % config.training.evaluation_every_epochs == 0
                 or epoch == config.training.epochs
@@ -954,7 +1335,13 @@ def train_experiment(
                     ("validation", datasets.validation),
                 ):
                     outputs = _collect_split_outputs(
-                        core, dataset, config.training.batch_size, device
+                        core,
+                        dataset,
+                        config.training.batch_size,
+                        device,
+                        config,
+                        datasets.fingerprint,
+                        replicate_seed,
                     )
                     latest_outputs[split] = outputs
                     _append_history(
@@ -989,6 +1376,7 @@ def train_experiment(
                         optimizer=optimizer,
                         datasets=datasets,
                         elapsed_seconds=elapsed,
+                        replicate_seed=replicate_seed,
                     ),
                 )
             completed_epoch = epoch
@@ -998,6 +1386,29 @@ def train_experiment(
                 completed_epoch=completed_epoch,
             )
             _atomic_json(status_path, status)
+            if progress is not None:
+                session_elapsed = time.monotonic() - start_time
+                session_epochs = epoch - starting_epoch
+                eta_seconds = (
+                    session_elapsed / session_epochs * (config.training.epochs - epoch)
+                    if session_epochs > 0
+                    else None
+                )
+                progress(
+                    {
+                        "event": "epoch_complete",
+                        "run_id": run_id,
+                        "objective": config.objective.kind,
+                        "architecture": config.model.architecture,
+                        "stop_gradient": config.training.stop_gradient,
+                        "ema_enabled": config.training.ema.enabled,
+                        "epoch": epoch,
+                        "total_epochs": config.training.epochs,
+                        "train_mse": gradients["mse"].value,
+                        "elapsed_seconds": elapsed_offset + session_elapsed,
+                        "eta_seconds": eta_seconds,
+                    }
+                )
 
         final_epoch = config.training.epochs
         for split, dataset in (
@@ -1007,7 +1418,13 @@ def train_experiment(
         ):
             if split not in latest_outputs or split == "test":
                 latest_outputs[split] = _collect_split_outputs(
-                    core, dataset, config.training.batch_size, device
+                    core,
+                    dataset,
+                    config.training.batch_size,
+                    device,
+                    config,
+                    datasets.fingerprint,
+                    replicate_seed,
                 )
             if split == "test":
                 _append_history(
@@ -1024,12 +1441,21 @@ def train_experiment(
                     ),
                 )
         _atomic_history(run_dir / "history.csv", history)
+        _atomic_bytes(
+            run_dir / "history.svg",
+            run_history_svg(history, run_id).encode("utf-8"),
+        )
         metrics = _final_metrics(latest_outputs, config)
         metrics.update(
             run_id=run_id,
             epoch=final_epoch,
+            objective_kind=config.objective.kind,
+            dataset_fingerprint=datasets.fingerprint,
+            replicate_seed=replicate_seed,
             policy=asdict(core.policy),
+            parameter_counts=parameter_counts(core),
             config_hash=config_identity_hash(config),
+            wall_clock_seconds=elapsed_offset + time.monotonic() - start_time,
         )
         validation_rows = [row for row in history if row["split"] == "validation"]
         best_validation = min(validation_rows, key=lambda row: row["mse"])
@@ -1044,8 +1470,21 @@ def train_experiment(
             updated_at=_utc_now(),
             completed_at=_utc_now(),
             completed_epoch=final_epoch,
+            objective=config.objective.kind,
+            dataset_fingerprint=datasets.fingerprint,
+            wall_clock_seconds=elapsed_offset + time.monotonic() - start_time,
         )
         _atomic_json(status_path, status)
+        if progress is not None:
+            progress(
+                {
+                    "event": "run_complete",
+                    "run_id": run_id,
+                    "objective": config.objective.kind,
+                    "architecture": config.model.architecture,
+                    "wall_clock_seconds": metrics["wall_clock_seconds"],
+                }
+            )
         return TrainResult(run_id, run_dir, tuple(history), metrics)
     except Exception as error:
         status.update(
@@ -1055,4 +1494,16 @@ def train_experiment(
             error={"type": type(error).__name__, "message": str(error)},
         )
         _atomic_json(status_path, status)
+        if progress is not None:
+            progress(
+                {
+                    "event": "run_failed",
+                    "run_id": run_id,
+                    "objective": config.objective.kind,
+                    "architecture": config.model.architecture,
+                    "completed_epoch": completed_epoch,
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                }
+            )
         raise

@@ -13,6 +13,7 @@ RUN_ARTIFACTS = {
     "checkpoint.pt",
     "config.yaml",
     "history.csv",
+    "history.svg",
     "metrics.json",
     "status.json",
 }
@@ -25,18 +26,21 @@ FINITE_SUMMARY_FIELDS = (
 
 
 def verify_smoke(output_root: Path) -> Path:
-    sweep_dirs = sorted(path for path in output_root.glob("sweep-*") if path.is_dir())
+    sweep_dirs = sorted(
+        path for path in output_root.iterdir() if path.is_dir() and (path / "status.json").is_file()
+    )
     if len(sweep_dirs) != 1:
         raise AssertionError(f"expected one sweep directory, found {len(sweep_dirs)}")
     sweep_dir = sweep_dirs[0]
     status = json.loads((sweep_dir / "status.json").read_text())
-    if status != {
-        "schema_version": 1,
+    expected_status = {
+        "schema_version": 2,
         "state": "complete",
         "completed_count": 16,
         "failed_count": 0,
         "cell_count": 16,
-    }:
+    }
+    if any(status.get(key) != value for key, value in expected_status.items()):
         raise AssertionError(f"unexpected sweep status: {status}")
 
     with (sweep_dir / "summary.csv").open(newline="") as stream:
@@ -60,12 +64,14 @@ def verify_smoke(output_root: Path) -> Path:
             raise AssertionError(f"invalid run status in {run_dir}")
         if not all(math.isfinite(float(value)) for value in metrics["objective"].values()):
             raise AssertionError(f"non-finite objective in {run_dir}")
+        ET.parse(run_dir / "history.svg")
 
     with (sweep_dir / "summary_by_variant.csv").open(newline="") as stream:
         aggregates = list(csv.DictReader(stream))
     if len(aggregates) != 16:
         raise AssertionError("expected one aggregate row per dynamics/variant cell")
     ET.parse(sweep_dir / "summary.svg")
+    ET.parse(sweep_dir / "learning_curves.svg")
     return sweep_dir
 
 

@@ -86,6 +86,82 @@ class TanhPredictor(_TanhMLP):
         super().__init__(latent_dim, latent_dim, hidden_dim, hidden_layers)
 
 
+def sincos_position_table(num_positions: int, dimension: int) -> torch.Tensor:
+    """Build a fixed one-dimensional sin/cos table using standard frequencies."""
+    _require_positive("num_positions", num_positions)
+    _require_positive("dimension", dimension)
+    if dimension % 2:
+        raise ValueError("position dimension must be even")
+    positions = torch.arange(num_positions, dtype=torch.float64).unsqueeze(1)
+    frequencies = torch.arange(0, dimension, 2, dtype=torch.float64) / dimension
+    angles = positions * torch.pow(10000.0, -frequencies).unsqueeze(0)
+    table = torch.empty(num_positions, dimension, dtype=torch.float64)
+    table[:, 0::2] = torch.sin(angles)
+    table[:, 1::2] = torch.cos(angles)
+    return table.float()
+
+
+class MaskedPatchPredictor(nn.Module):
+    """Vectorized target-query predictor for local-patch masked JEPA."""
+
+    def __init__(
+        self,
+        architecture: Architecture,
+        *,
+        num_patches: int,
+        latent_dim: int,
+        position_dim: int,
+        hidden_dim: int,
+        hidden_layers: int,
+    ) -> None:
+        super().__init__()
+        for name, value in (
+            ("num_patches", num_patches),
+            ("latent_dim", latent_dim),
+            ("position_dim", position_dim),
+        ):
+            _require_positive(name, value)
+        self.num_patches = num_patches
+        self.latent_dim = latent_dim
+        self.position_dim = position_dim
+        self.register_buffer(
+            "position_table", sincos_position_table(num_patches, position_dim), persistent=True
+        )
+        input_dim = num_patches * latent_dim + num_patches + position_dim
+        if architecture == "linear":
+            self.network: nn.Module = nn.Linear(input_dim, latent_dim)
+        elif architecture == "nonlinear":
+            self.network = _TanhMLP(
+                input_dim, latent_dim, hidden_dim=hidden_dim, hidden_layers=hidden_layers
+            )
+        else:
+            raise ValueError(f"unknown architecture: {architecture!r}")
+
+    def forward(
+        self,
+        context_grid: torch.Tensor,
+        visibility: torch.Tensor,
+        target_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if context_grid.ndim != 3 or context_grid.shape[1:] != (
+            self.num_patches,
+            self.latent_dim,
+        ):
+            raise ValueError("context_grid has an invalid shape")
+        if visibility.shape != context_grid.shape[:2]:
+            raise ValueError("visibility has an invalid shape")
+        if target_indices.ndim != 2 or target_indices.shape[0] != context_grid.shape[0]:
+            raise ValueError("target_indices has an invalid shape")
+        if target_indices.dtype != torch.long:
+            raise ValueError("target_indices must use torch.long")
+        batch_size, target_count = target_indices.shape
+        shared = torch.cat((context_grid.flatten(1), visibility.to(context_grid.dtype)), dim=1)
+        shared = shared.unsqueeze(1).expand(batch_size, target_count, shared.shape[1])
+        positions = self.get_buffer("position_table")[target_indices]
+        queries = torch.cat((shared, positions.to(context_grid.dtype)), dim=-1)
+        return self.network(queries)
+
+
 def build_model_pair(
     architecture: Architecture,
     *,
@@ -103,3 +179,31 @@ def build_model_pair(
             TanhPredictor(latent_dim, hidden_dim, hidden_layers),
         )
     raise ValueError(f"unknown architecture: {architecture!r}")
+
+
+def build_masked_model_pair(
+    architecture: Architecture,
+    *,
+    patch_input_dim: int,
+    num_patches: int,
+    latent_dim: int,
+    position_dim: int,
+    hidden_dim: int = 64,
+    hidden_layers: int = 1,
+) -> tuple[nn.Module, MaskedPatchPredictor]:
+    """Build a local patch encoder and explicit position-conditioned predictor."""
+    if architecture == "linear":
+        encoder: nn.Module = LinearEncoder(patch_input_dim, latent_dim)
+    elif architecture == "nonlinear":
+        encoder = TanhEncoder(patch_input_dim, latent_dim, hidden_dim, hidden_layers)
+    else:
+        raise ValueError(f"unknown architecture: {architecture!r}")
+    predictor = MaskedPatchPredictor(
+        architecture,
+        num_patches=num_patches,
+        latent_dim=latent_dim,
+        position_dim=position_dim,
+        hidden_dim=hidden_dim,
+        hidden_layers=hidden_layers,
+    )
+    return encoder, predictor

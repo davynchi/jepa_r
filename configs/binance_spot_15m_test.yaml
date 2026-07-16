@@ -1,0 +1,61 @@
+data:
+  source: binance_spot
+  symbols: [BTCUSDT, ETHUSDT, BNBUSDT]
+  interval: 15m
+  start: "2021-01-01"
+  end: "2025-01-01"
+  train_start: "2021-01-01"
+  train_end: "2024-01-01"
+  validation_start: "2024-01-02"
+  validation_end: "2024-07-01"
+  test_start: "2024-07-02"
+  test_end: "2025-01-01"
+  context_steps: 32
+  target_steps: 32
+  train_stride: 8
+  evaluation_stride: 32
+  observation_dim: 18
+  raw_cache_dir: data/raw/binance
+  processed_root: data/processed/binance
+  download_workers: 4
+  download_retries: 3
+
+objective:
+  kind: future_window
+  masked_patches:
+    patch_size: 8
+    mask_ratio: 0.5
+    position_dim: 16
+
+model:
+  architecture: linear
+  latent_dim: 32
+  hidden_dim: 64
+  hidden_layers: 1
+
+training:
+  seed: 0
+  learning_rate: 0.001
+  betas: [0.9, 0.999]
+  epsilon: 1.0e-8
+  amsgrad: false
+  batch_size: 512
+  epochs: 10
+  shuffle: true
+  device: auto
+  evaluation_every_epochs: 1
+  checkpoint_every_epochs: 5
+  stop_gradient: true
+  ema:
+    enabled: true
+    decay: 0.99
+
+evaluation:
+  covariance_epsilon: 1.0e-8
+  collapse_std_threshold: 1.0e-3
+  collapse_rank_threshold: 0.1
+  probe_ridge: 1.0e-6
+
+output:
+  root: outputs/binance_spot_15m
+  overwrite: false

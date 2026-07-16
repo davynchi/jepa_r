@@ -81,6 +81,11 @@ class WeightedMean:
         return MetricValue(self.weighted_total / self.total_weight)
 
 
+def _cpu_float64(values: torch.Tensor) -> torch.Tensor:
+    """Move first, then cast: MPS cannot perform a direct float64 conversion."""
+    return values.detach().to(device="cpu").to(dtype=torch.float64)
+
+
 def _as_finite_matrix(name: str, values: torch.Tensor) -> torch.Tensor:
     if not isinstance(values, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
@@ -88,7 +93,7 @@ def _as_finite_matrix(name: str, values: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"{name} must have shape [samples, dimensions]")
     if values.shape[1] == 0:
         raise ValueError(f"{name} must have at least one dimension")
-    matrix = values.detach().to(device="cpu", dtype=torch.float64)
+    matrix = _cpu_float64(values)
     if not torch.isfinite(matrix).all():
         raise ValueError(f"{name} contains non-finite values")
     return matrix
@@ -134,7 +139,7 @@ def compute_representation_metrics(
         raise ValueError("representations must have shape [samples, dimensions]")
     if representations.shape[1] == 0:
         raise ValueError("representations must have at least one dimension")
-    matrix = representations.detach().to(device="cpu", dtype=torch.float64)
+    matrix = _cpu_float64(representations)
     if not torch.isfinite(matrix).all():
         missing = MetricValue(None, "non_finite")
         return _null_representation_metrics("non_finite", missing)
@@ -206,7 +211,7 @@ def global_gradient_norm(
         if parameter.grad is None:
             continue
         found = True
-        gradient = parameter.grad.detach().to(device="cpu", dtype=torch.float64)
+        gradient = _cpu_float64(parameter.grad)
         if not torch.isfinite(gradient).all():
             return MetricValue(None, "non_finite")
         squared_norm += gradient.square().sum()
