@@ -1,0 +1,70 @@
+# Smoke-test config for the Shapes3D-backed entity/context world.
+# Requires data/3dshapes.h5 (download once, see README):
+#   curl -o data/3dshapes.h5 https://storage.googleapis.com/3d-shapes/3dshapes.h5
+data:
+  h5_path: data/3dshapes.h5
+  trajectory_length: 16
+  entity_switch_probability: 0.05
+  context_step_probability: 0.7
+  context_step_max: 1
+  num_train_trajectories: 300
+  num_val_trajectories: 60
+  num_test_trajectories: 60
+  num_train_samples: 300
+  num_val_samples: 60
+  num_test_samples: 60
+  train_sample_seed: 1000
+  validation_sample_seed: 2000
+  test_sample_seed: 3000
+  counterfactual_seed: 4000
+
+model:
+  kind: standard
+  architecture: linear
+  latent_dim: 8
+  hidden_dim: 64
+  hidden_layers: 1
+  entity_latent_dim: 4
+  context_latent_dim: 4
+
+training:
+  seed: 0
+  learning_rate: 0.001
+  betas: [0.9, 0.999]
+  epsilon: 1.0e-8
+  batch_size: 32
+  epochs: 5
+  device: auto
+  stop_gradient: true
+  ema:
+    enabled: true
+    decay: 0.99
+  prediction_horizon: 1
+  target_pairing: temporal
+  evaluation_every_epochs: 1
+  checkpoint_every_epochs: 5
+
+hierarchical:
+  short_horizon: 1
+  long_horizon: 8
+  lambda_entity: 1.0
+  lambda_context: 1.0
+  lambda_var: 1.0
+  lambda_cross: 1.0
+  variance_gamma: 1.0
+  use_horizon_split: true
+  use_variance_reg: true
+  use_cross_cov_reg: true
+  epsilon: 1.0e-6
+
+evaluation:
+  entity_subspace_dims: [1, 2, 4]
+  covariance_epsilon: 1.0e-6
+  probe_ridge: 1.0e-6
+  autocorrelation_max_lag: 8
+  counterfactual_pairs: 100
+  selectivity_alpha: 1.0
+
+output:
+  root: outputs/temporal_shapes3d_quick
+  overwrite: true

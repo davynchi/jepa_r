@@ -1,0 +1,17 @@
+# Grid axes consumed by scripts/run_temporal_grid.py --preset full.
+# This is NOT a TemporalExperimentConfig; it is a small enumeration spec.
+# Never launched implicitly by the default training command.
+base_config: configs/temporal_hierarchy_full.yaml
+seeds: [0, 1, 2, 3, 4]
+model_types: [linear, nonlinear]
+observation_modes: [linear, nonlinear]
+entity_switch_probabilities: [0.01, 0.05, 0.20, 0.50]
+prediction_horizons: [1, 4, 8]
+target_pairings: [temporal, shuffled]
+include_random_baseline: true
+
+hierarchical:
+  base_config: configs/temporal_hierarchy_explicit.yaml
+  entity_switch_probabilities: [0.01, 0.05, 0.20]
+  short_horizon: 1
+  long_horizon: 8

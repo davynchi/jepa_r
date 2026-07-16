@@ -1,0 +1,72 @@
+# Explicit entity/context hierarchical JEPA (Section 5.4), default settings.
+# Ablations (see temporal_grids/) independently disable the horizon split,
+# the variance regularizer, and the cross-covariance regularizer.
+data:
+  num_entities: 3
+  context_dim: 6
+  trajectory_length: 16
+  observation_dim: 32
+  entity_switch_probability: 0.05
+  context_rho: 0.5
+  observation_noise_std: 0.01
+  observation_mode: linear
+  nonlinear_hidden_dim: 64
+  num_train_trajectories: 2000
+  num_val_trajectories: 500
+  num_test_trajectories: 500
+  system_seed: 123
+  train_sample_seed: 1000
+  validation_sample_seed: 2000
+  test_sample_seed: 3000
+  counterfactual_seed: 4000
+
+model:
+  kind: hierarchical
+  architecture: linear
+  latent_dim: 32
+  hidden_dim: 64
+  hidden_layers: 1
+  entity_latent_dim: 8
+  context_latent_dim: 24
+
+training:
+  seed: 0
+  learning_rate: 0.001
+  betas: [0.9, 0.999]
+  epsilon: 1.0e-8
+  batch_size: 128
+  epochs: 30
+  device: auto
+  stop_gradient: true
+  ema:
+    enabled: true
+    decay: 0.99
+  prediction_horizon: 1
+  target_pairing: temporal
+  evaluation_every_epochs: 1
+  checkpoint_every_epochs: 10
+
+hierarchical:
+  short_horizon: 1
+  long_horizon: 8
+  lambda_entity: 1.0
+  lambda_context: 1.0
+  lambda_var: 1.0
+  lambda_cross: 1.0
+  variance_gamma: 1.0
+  use_horizon_split: true
+  use_variance_reg: false
+  use_cross_cov_reg: true
+  epsilon: 1.0e-6
+
+evaluation:
+  entity_subspace_dims: [1, 2, 4, 8]
+  covariance_epsilon: 1.0e-6
+  probe_ridge: 1.0e-6
+  autocorrelation_max_lag: 8
+  counterfactual_pairs: 500
+  selectivity_alpha: 1.0
+
+output:
+  root: outputs/temporal_hierarchy_ablation_no_variance_reg
+  overwrite: false
