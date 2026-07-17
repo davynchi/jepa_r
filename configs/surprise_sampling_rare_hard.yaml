@@ -1,0 +1,41 @@
+experiment:
+  name: surprise_sampling_rare_hard
+  output_root: outputs/surprise_sampling
+  target_update: frozen
+
+data:
+  sequence_length: 256
+  context_steps: 128
+  train_easy_samples: 4096
+  train_hard_samples: 384
+  train_noise_samples: 128
+  validation_samples_per_group: 512
+  test_samples_per_group: 512
+  seed: 0
+
+model:
+  architecture: nonlinear
+  latent_dim: 32
+  hidden_dim: 128
+  hidden_layers: 1
+
+training:
+  epochs: 30
+  batch_size: 256
+  learning_rate: 0.001
+  ema_decay: 0.99
+  lp_delta: 5
+  lp_ema_beta: 0.9
+
+sampling:
+  strategies:
+    - uniform
+    - soft_surprise
+    - warmup_soft_surprise
+    - warmup_learnable_surprise
+    - capped_learnable_surprise
+  strength: 1.0
+  max_ratio: 8.0
+  warmup_epochs: 5
+  hard_cap: 0.45
+  noise_cap: 0.10
