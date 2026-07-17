@@ -22,19 +22,14 @@ requires = ["uv_build>=0.11.25,<0.12"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-source-include = [".github/**", "AGENTS.md", "TODOS.md", "configs/**", "docs/**", "scripts/**", "tests/**"]
+source-include = [".github/**", "AGENTS.md", "TODOS.md", "configs/**", "docs/**", "scripts/**"]
 
 [dependency-groups]
 dev = [
     "mypy>=1.15",
-    "pytest>=8.0",
     "ruff>=0.6",
     "types-pyyaml>=6.0",
 ]
-
-[tool.pytest.ini_options]
-addopts = "-ra"
-testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100

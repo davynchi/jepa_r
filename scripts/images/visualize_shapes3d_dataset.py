@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Preview-grid visualizations for the Shapes3D-backed entity/context world.
 
-    python scripts/visualize_temporal_shapes3d_dataset.py \\
-        --config configs/temporal_shapes3d_quick.yaml \\
+    python scripts/images/visualize_shapes3d_dataset.py \\
+        --config configs/images/shapes3d/quick.yaml \\
         --output-dir outputs/temporal_shapes3d_previews
 
 Mirrors ``visualize_temporal_image_dataset.py``: random static samples, random
 temporal trajectories, same-entity/different-context and
-different-entity/same-context counterfactual pairs, and spatial-JEPA masking
-examples -- all real Shapes3D renders rather than procedurally rasterized.
+and different-entity/same-context counterfactual pairs.
 """
 
 from __future__ import annotations
@@ -17,17 +16,15 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from jepa.temporal_image_config import SpatialMaskingConfig  # noqa: E402
-from jepa.temporal_image_data import build_static_spatial_dataset  # noqa: E402
-from jepa.temporal_shapes3d_config import SHAPES3D_ENTITY_NAMES, load_shapes3d_config  # noqa: E402
-from jepa.temporal_shapes3d_data import (  # noqa: E402
+from jepa.configs.images.shapes3d import SHAPES3D_ENTITY_NAMES, load_shapes3d_config  # noqa: E402
+from jepa.data.images.shapes3d import (  # noqa: E402
     Shapes3DEntityContextTrajectoryDataset,
     Shapes3DStaticImageDataset,
     build_shapes3d_counterfactual_pairs,
@@ -117,25 +114,6 @@ def visualize_counterfactual_pairs(config, out_dir: Path, *, n: int = 4) -> None
     plt.close(fig)
 
 
-def visualize_masking(config, out_dir: Path, *, n: int = 4) -> None:
-    dataset = Shapes3DStaticImageDataset(config.data, "train")
-    n = min(n, len(dataset))
-    spatial = build_static_spatial_dataset(dataset, SpatialMaskingConfig(), seed=0)
-    fig, axes = _save_grid(n, 3, 2.0)
-    for i in range(n):
-        axes[i, 0].imshow(_to_hw3(dataset.images[i]))
-        axes[i, 1].imshow(_to_hw3(spatial.visible[i]))
-        axes[i, 2].imshow(_to_hw3(spatial.target[i]))
-        if i == 0:
-            axes[i, 0].set_title("original", fontsize=8)
-            axes[i, 1].set_title("visible (context view)", fontsize=8)
-            axes[i, 2].set_title("target block", fontsize=8)
-    fig.suptitle("Spatial-JEPA block masking (Shapes3D)")
-    fig.tight_layout()
-    fig.savefig(out_dir / "preview_spatial_masking.png", dpi=150)
-    plt.close(fig)
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config")
@@ -147,7 +125,6 @@ def main(argv: list[str] | None = None) -> int:
     visualize_static_samples(config, args.output_dir)
     visualize_temporal_trajectories(config, args.output_dir)
     visualize_counterfactual_pairs(config, args.output_dir)
-    visualize_masking(config, args.output_dir)
     print(f"wrote previews to {args.output_dir}")
     return 0
 

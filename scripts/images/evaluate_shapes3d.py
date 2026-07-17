@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Full post-hoc analysis for one completed Shapes3D run.
 
-    python scripts/evaluate_temporal_shapes3d.py --run-dir outputs/temporal_shapes3d_quick/<run-id>
+    python scripts/images/evaluate_shapes3d.py --run-dir outputs/temporal_shapes3d_quick/<run-id>
 
 Mirrors ``evaluate_temporal_image.py`` exactly (same scatter-matrix /
 generalized-eigenproblem / probe / counterfactual-invariance pipeline from
-:mod:`jepa.temporal_analysis`, fully generic over latent tensors) plus the
+:mod:`jepa.analysis.subspace`, fully generic over latent tensors) plus the
 auxiliary 2D-PCA-by-entity plot.
 """
 
@@ -18,29 +18,13 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-from jepa.metrics import compute_representation_metrics  # noqa: E402
-from jepa.models import build_model_pair  # noqa: E402
-from jepa.temporal_analysis import (  # noqa: E402
-    classifier_accuracy,
-    compute_autocorrelation,
-    compute_scatter_matrices,
-    context_r2_mean,
-    counterfactual_invariance,
-    entity_selectivity_score,
-    entity_subspace_projection,
-    fit_context_regressor,
-    fit_entity_classifier,
-    project,
-    select_entity_subspace_dim,
-    solve_generalized_eigenproblem,
-)
-from jepa.temporal_models import HierarchicalEncoderPredictor  # noqa: E402
-from jepa.temporal_plots import (  # noqa: E402
+from jepa.analysis.metrics import compute_representation_metrics  # noqa: E402
+from jepa.analysis.plots import (  # noqa: E402
     plot_counterfactual_distances,
     plot_effective_rank_over_training,
     plot_generalized_eigenvalue_spectrum,
@@ -48,15 +32,35 @@ from jepa.temporal_plots import (  # noqa: E402
     plot_prediction_loss_curves,
     plot_probe_matrix,
 )
-from jepa.temporal_shapes3d_config import (  # noqa: E402
+from jepa.analysis.subspace import (  # noqa: E402
+    apply_whitening,
+    classifier_accuracy,
+    compute_autocorrelation,
+    compute_latent_spectrum,
+    compute_scatter_matrices,
+    context_r2_mean,
+    counterfactual_invariance,
+    empirical_entity_predictability,
+    entity_selectivity_score,
+    entity_subspace_projection,
+    fit_context_regressor,
+    fit_entity_classifier,
+    fit_whitening,
+    project,
+    select_entity_subspace_dim,
+    solve_generalized_eigenproblem,
+)
+from jepa.configs.images.shapes3d import (  # noqa: E402
     SHAPES3D_ENTITY_NAMES,
     shapes3d_config_from_dict,
 )
-from jepa.temporal_shapes3d_data import (
+from jepa.data.images.shapes3d import (
     build_shapes3d_counterfactual_pairs,
     build_shapes3d_dataset_splits,
 )  # noqa: E402
-from jepa.temporal_shapes3d_training import load_shapes3d_checkpoint  # noqa: E402
+from jepa.models.encoders import build_model_pair  # noqa: E402
+from jepa.models.hierarchical import HierarchicalEncoderPredictor  # noqa: E402
+from jepa.training.images.shapes3d import load_shapes3d_checkpoint  # noqa: E402
 
 
 def _pca_2d(latents: torch.Tensor) -> np.ndarray:
@@ -199,13 +203,39 @@ def evaluate_shapes3d_run(run_dir: Path) -> dict[str, Any]:
         num_pairs=evaluation.counterfactual_pairs,
         seed=config.data.counterfactual_seed,
     )
-    same_1 = project(encoder(counterfactual.same_entity_x1.reshape(-1, obs_dim)), projection)
-    same_2 = project(encoder(counterfactual.same_entity_x2.reshape(-1, obs_dim)), projection)
-    diff_1 = project(encoder(counterfactual.diff_entity_x1.reshape(-1, obs_dim)), projection)
-    diff_2 = project(encoder(counterfactual.diff_entity_x2.reshape(-1, obs_dim)), projection)
+    with torch.no_grad():
+        same_1_z = encoder(counterfactual.same_entity_x1.reshape(-1, obs_dim))
+        same_2_z = encoder(counterfactual.same_entity_x2.reshape(-1, obs_dim))
+        diff_1_z = encoder(counterfactual.diff_entity_x1.reshape(-1, obs_dim))
+        diff_2_z = encoder(counterfactual.diff_entity_x2.reshape(-1, obs_dim))
+    same_1 = project(same_1_z, projection)
+    same_2 = project(same_2_z, projection)
+    diff_1 = project(diff_1_z, projection)
+    diff_2 = project(diff_2_z, projection)
     invariance = counterfactual_invariance(same_1, same_2, diff_1, diff_2)
 
+    # Whitened counterfactual invariance -- strips a raw-scale confound; see
+    # evaluate_temporal_hierarchy.py for the full rationale.
+    whitening = fit_whitening(train_z)
+    train_z_white = apply_whitening(whitening, train_z)
+    scatter_white = compute_scatter_matrices(train_z_white, train_entity, config.data.num_entities)
+    eigen_white = solve_generalized_eigenproblem(
+        scatter_white, epsilon=evaluation.covariance_epsilon
+    )
+    projection_white = entity_subspace_projection(eigen_white.eigenvectors, best_k)
+    invariance_white = counterfactual_invariance(
+        project(apply_whitening(whitening, same_1_z), projection_white),
+        project(apply_whitening(whitening, same_2_z), projection_white),
+        project(apply_whitening(whitening, diff_1_z), projection_white),
+        project(apply_whitening(whitening, diff_2_z), projection_white),
+    )
+
     collapse = compute_representation_metrics(test_z)
+    spectrum = compute_latent_spectrum(test_z)
+    mean_latent_norm = float(torch.linalg.vector_norm(test_z.double(), dim=1).mean().item())
+    predictability = empirical_entity_predictability(
+        train_ds.entities, horizon=config.training.prediction_horizon
+    )
 
     analysis_dir = run_dir / "analysis"
     analysis_dir.mkdir(exist_ok=True)
@@ -269,6 +299,18 @@ def evaluate_shapes3d_run(run_dir: Path) -> dict[str, Any]:
         "probe_matrix": probe_rows,
         "selectivity_score": selectivity,
         "counterfactual": asdict(invariance),
+        "counterfactual_whitened": asdict(invariance_white),
+        "spectrum": {
+            "trace_covariance": spectrum.trace_covariance,
+            "effective_rank": spectrum.effective_rank,
+            "top_eigenvalues": spectrum.eigenvalues[
+                : min(8, spectrum.eigenvalues.shape[0])
+            ].tolist(),
+            "std_min": float(spectrum.per_dimension_std.min()),
+            "std_max": float(spectrum.per_dimension_std.max()),
+        },
+        "mean_latent_norm": mean_latent_norm,
+        "predictability": predictability,
         "collapse_diagnostics": {
             "effective_rank": collapse.effective_rank.value,
             "effective_rank_normalized": collapse.effective_rank_normalized.value,

@@ -16,13 +16,13 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any, Literal
 
-from jepa.config import (
+from jepa.configs.base import (
     ExperimentConfig,
     SystemKind,
     apply_paired_replicate,
     config_identity_hash,
 )
-from jepa.training import SCHEMA_VERSION, build_run_id, train_experiment
+from jepa.training.core import SCHEMA_VERSION, build_run_id, train_experiment
 
 SUMMARY_COLUMNS = (
     "replicate_seed",

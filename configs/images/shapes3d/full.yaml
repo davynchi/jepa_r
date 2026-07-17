@@ -21,18 +21,18 @@ data:
 model:
   kind: standard
   architecture: linear
-  latent_dim: 32
+  latent_dim: 8
   hidden_dim: 64
   hidden_layers: 1
-  entity_latent_dim: 8
-  context_latent_dim: 24
+  entity_latent_dim: 2
+  context_latent_dim: 6
 
 training:
   seed: 0
   learning_rate: 0.001
   betas: [0.9, 0.999]
   epsilon: 1.0e-8
-  batch_size: 256
+  batch_size: 1024
   epochs: 60
   device: auto
   stop_gradient: true
@@ -66,5 +66,5 @@ evaluation:
   selectivity_alpha: 1.0
 
 output:
-  root: outputs/temporal_shapes3d_full
+  root: outputs/images/shapes3d/full
   overwrite: false

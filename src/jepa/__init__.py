@@ -1,16 +1,6 @@
 """Compact JEPA research primitives for time-series experiments."""
 
-from jepa.config import (
-    ExperimentConfig,
-    PairedReplicateSeeds,
-    apply_paired_replicate,
-    config_from_dict,
-    config_identity_hash,
-    derive_paired_replicate,
-    load_config,
-)
-from jepa.data import LatentDynamicsDataset, build_dataset_splits, generate_system
-from jepa.metrics import (
+from jepa.analysis.metrics import (
     MetricValue,
     RepresentationMetrics,
     RidgeProbe,
@@ -20,7 +10,21 @@ from jepa.metrics import (
     global_gradient_norm,
     ridge_r2_score,
 )
-from jepa.models import (
+from jepa.configs.base import (
+    ExperimentConfig,
+    PairedReplicateSeeds,
+    apply_paired_replicate,
+    config_from_dict,
+    config_identity_hash,
+    derive_paired_replicate,
+    load_config,
+)
+from jepa.data.timeseries.dynamics import (
+    LatentDynamicsDataset,
+    build_dataset_splits,
+    generate_system,
+)
+from jepa.models.encoders import (
     LinearEncoder,
     LinearPredictor,
     TanhEncoder,
@@ -28,7 +32,7 @@ from jepa.models import (
     build_model_pair,
 )
 from jepa.reporting import SweepResult, aggregate_rows, run_sweep, variant_label
-from jepa.training import (
+from jepa.training.core import (
     JEPACore,
     OptimizationPolicy,
     TrainResult,

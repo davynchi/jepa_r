@@ -1,5 +1,5 @@
 # Defaults for the entity/context temporal-persistence experiment (Section 2).
-# Matches jepa.temporal_config.TemporalExperimentConfig field-for-field.
+# Matches jepa.configs.timeseries.TemporalExperimentConfig field-for-field.
 data:
   num_entities: 3
   context_dim: 6
@@ -22,11 +22,11 @@ data:
 model:
   kind: standard
   architecture: linear
-  latent_dim: 32
+  latent_dim: 8
   hidden_dim: 64
   hidden_layers: 1
-  entity_latent_dim: 8
-  context_latent_dim: 24
+  entity_latent_dim: 2
+  context_latent_dim: 6
 
 training:
   seed: 0
@@ -67,5 +67,5 @@ evaluation:
   selectivity_alpha: 1.0
 
 output:
-  root: outputs/temporal
+  root: outputs/timeseries/base
   overwrite: false

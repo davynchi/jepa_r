@@ -24,11 +24,11 @@ data:
 model:
   kind: standard
   architecture: linear
-  latent_dim: 32
+  latent_dim: 8
   hidden_dim: 64
   hidden_layers: 1
-  entity_latent_dim: 8
-  context_latent_dim: 24
+  entity_latent_dim: 2
+  context_latent_dim: 6
 
 training:
   seed: 0
@@ -69,5 +69,5 @@ evaluation:
   selectivity_alpha: 1.0
 
 output:
-  root: outputs/temporal_hierarchy_full
+  root: outputs/timeseries/hierarchy_full
   overwrite: false

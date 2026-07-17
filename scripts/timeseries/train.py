@@ -3,16 +3,16 @@
 
 Usage (Hydra-style, resolved against ``configs/<name>.yaml``):
 
-    python scripts/train_temporal.py experiment=temporal_hierarchy_quick
-    python scripts/train_temporal.py experiment=temporal_hierarchy_full
+    python scripts/timeseries/train.py experiment=temporal_hierarchy_quick
+    python scripts/timeseries/train.py experiment=temporal_hierarchy_full
 
 Equivalent explicit form:
 
-    python scripts/train_temporal.py --config configs/temporal_hierarchy_quick.yaml
+    python scripts/timeseries/train.py --config configs/timeseries/hierarchy_quick.yaml
 
 Strict dotted overrides are supported either way:
 
-    python scripts/train_temporal.py experiment=temporal_hierarchy_quick \\
+    python scripts/timeseries/train.py experiment=temporal_hierarchy_quick \\
         data.entity_switch_probability=0.20 training.epochs=10
 """
 
@@ -23,10 +23,10 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from jepa.temporal_config import load_temporal_config  # noqa: E402
-from jepa.temporal_training import train_temporal_experiment  # noqa: E402
+from jepa.configs.timeseries import load_temporal_config  # noqa: E402
+from jepa.training.timeseries import train_temporal_experiment  # noqa: E402
 
 
 def _parse_args(argv: list[str]) -> tuple[str | None, dict[str, str], int | None]:

@@ -9,9 +9,9 @@ from collections.abc import Sequence
 from typing import Any
 
 from jepa import __version__
-from jepa.config import load_config
+from jepa.configs.base import load_config
 from jepa.reporting import run_sweep
-from jepa.training import train_experiment
+from jepa.training.core import train_experiment
 
 
 def _key_value(value: str) -> tuple[str, str]:

@@ -23,11 +23,11 @@ data:
 model:
   kind: hierarchical
   architecture: linear
-  latent_dim: 32
+  latent_dim: 8
   hidden_dim: 64
   hidden_layers: 1
-  entity_latent_dim: 8
-  context_latent_dim: 24
+  entity_latent_dim: 2
+  context_latent_dim: 6
 
 training:
   seed: 0
@@ -68,5 +68,5 @@ evaluation:
   selectivity_alpha: 1.0
 
 output:
-  root: outputs/temporal_hierarchy_ablation_no_variance_reg
+  root: outputs/timeseries/ablation_no_variance_reg
   overwrite: false

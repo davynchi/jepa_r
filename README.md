@@ -110,15 +110,15 @@ compared numerically rather than assumed to be bitwise identical.
 
 ## Running on GPU
 
-All `configs/temporal_*.yaml` / `configs/spatial_semantics_*.yaml` set `training.device: auto`,
+All configs set `training.device: auto`,
 so copying the repository to a CUDA machine and running the same commands automatically picks
 up the GPU (`jepa.training._resolve_device` prefers CUDA, then MPS, then CPU) -- no config
 edits needed. To force a device explicitly instead, use the same strict override mechanism as
 every other setting:
 
 ```bash
-python scripts/train_temporal.py experiment=temporal_hierarchy_full training.device=cuda
-python scripts/train_temporal_image.py experiment=temporal_hierarchy_image_full training.device=cuda
+python scripts/timeseries/train.py experiment=hierarchy_full training.device=cuda
+python scripts/images/train_shapes3d.py --config configs/images/shapes3d/full.yaml training.device=cuda
 ```
 
 Two things to check before running on a CUDA server:
@@ -181,7 +181,7 @@ part of the new package.
 
 ## Entity/context temporal-persistence experiment
 
-A second, self-contained experiment (`jepa.temporal_*`) tests whether **temporal
+A second, self-contained experiment (`jepa.*.timeseries`) tests whether **temporal
 persistence causes JEPA to discover a low-dimensional, context-invariant entity
 subspace**. It reuses the model families, the strict-config/override machinery, the
 SG/EMA policy resolver, the atomic artifact writers, and the ridge-probe/effective-rank
@@ -208,7 +208,7 @@ tell the two apart:
 Only (2) is evidence for the hypothesis. Because JEPA's objective is invariant to any
 rotation of the latent space, there is generally no single "entity neuron" to find —
 individual coordinates are not identifiable, only subspaces are. **Failing to find one
-axis that "is" the entity is expected, not a negative result;** `jepa.temporal_analysis`
+axis that "is" the entity is expected, not a negative result;** `jepa.analysis.subspace`
 never looks for one. It solves a regularized generalized eigenproblem
 (`S_B v = λ (S_W + εI) v`, via `scipy.linalg.eigh`) between the between-entity and
 within-entity scatter matrices of the frozen latent and takes the top-`k` eigenvectors as
@@ -221,8 +221,8 @@ step) and a fast context `C_t ∈ R^{d_C}` (a stationary AR(1) process with corr
 `context_rho`), sampled **independently** so entity decoding cannot piggyback on
 accidental entity/context correlation. Observations are `X_t = h(E_t, C_t) + noise` under
 a fixed linear or `tanh`-MLP map `h`, generated once per dataset instance and shared
-across train/validation/test splits (`jepa.temporal_data.generate_observation_system`).
-**Entity and context labels are returned only for evaluation** — `jepa.temporal_training`
+across train/validation/test splits (`jepa.data.timeseries.entity_context.generate_observation_system`).
+**Entity and context labels are returned only for evaluation** — `jepa.training.timeseries`
 never passes them to an encoder's forward call; `test_entity_labels_are_not_passed_into_
 the_training_forward_call` in `tests/test_temporal_training.py` asserts this by hooking
 the encoder and checking every captured input is a float observation tensor of the right
@@ -242,11 +242,11 @@ width, not an entity/context tensor.
 
 ### Explicit entity/context model
 
-`model.kind: hierarchical` (`jepa.temporal_models.HierarchicalEncoderPredictor`) splits
+`model.kind: hierarchical` (`jepa.models.hierarchical.HierarchicalEncoderPredictor`) splits
 the latent into `z = (z_E, z_C)` and adds two heads reading the *full* latent `z_t`: a
 long-horizon head predicting the entity block of the target `h_E` steps ahead, and a
 short-horizon head predicting the context block `h_C` steps ahead
-(`jepa.temporal_training.hierarchical_loss`). The loss is
+(`jepa.training.timeseries.hierarchical_loss`). The loss is
 `λ_E L_E + λ_C L_C + λ_var L_var + λ_cross L_cross`, where `L_E`/`L_C` are normalized by
 the batch's own `z_E`/`z_C` covariance trace, `L_var` is a per-dimension standard-deviation
 floor, and `L_cross` penalizes the Frobenius norm of `Cov(z_E, z_C)`. Each of the horizon
@@ -260,28 +260,28 @@ model.
 
 | File | Purpose |
 |---|---|
-| `configs/temporal_base.yaml` | Field-for-field defaults (`TemporalExperimentConfig`) |
-| `configs/temporal_hierarchy_quick.yaml` | Small single-run smoke config |
-| `configs/temporal_hierarchy_full.yaml` | Full-scale single-run config |
-| `configs/temporal_hierarchy_explicit.yaml` | Hierarchical model, default regularizers |
-| `configs/temporal_hierarchy_ablation_no_horizon_split.yaml` | Ablation: one shared horizon |
-| `configs/temporal_hierarchy_ablation_no_variance_reg.yaml` | Ablation: variance floor off |
-| `configs/temporal_hierarchy_ablation_no_cross_cov_reg.yaml` | Ablation: cross-cov penalty off |
-| `configs/temporal_grids/quick.yaml` | Grid axes for the quick preset (Section 8) |
-| `configs/temporal_grids/full.yaml` | Grid axes for the full preset (Section 8) |
+| `configs/timeseries/base.yaml` | Field-for-field defaults (`TemporalExperimentConfig`) |
+| `configs/timeseries/hierarchy_quick.yaml` | Small single-run smoke config |
+| `configs/timeseries/hierarchy_full.yaml` | Full-scale single-run config |
+| `configs/timeseries/hierarchy_explicit.yaml` | Hierarchical model, default regularizers |
+| `configs/timeseries/ablation_no_horizon_split.yaml` | Ablation: one shared horizon |
+| `configs/timeseries/ablation_no_variance_reg.yaml` | Ablation: variance floor off |
+| `configs/timeseries/ablation_no_cross_cov_reg.yaml` | Ablation: cross-cov penalty off |
+| `configs/timeseries/grids/quick.yaml` | Grid axes for the quick preset (Section 8) |
+| `configs/timeseries/grids/full.yaml` | Grid axes for the full preset (Section 8) |
 
 ### Commands
 
 Smoke test (single run, seconds):
 
 ```bash
-python scripts/train_temporal.py experiment=temporal_hierarchy_quick
+python scripts/timeseries/train.py experiment=temporal_hierarchy_quick
 ```
 
 Full single run:
 
 ```bash
-python scripts/train_temporal.py experiment=temporal_hierarchy_full
+python scripts/timeseries/train.py experiment=temporal_hierarchy_full
 ```
 
 Full experimental grid (5 seeds × {linear, nonlinear} × {linear, nonlinear obs} × 4
@@ -289,8 +289,8 @@ switch probabilities × 3 horizons × {temporal, shuffled}, plus the random base
 hierarchical model at `p_E ∈ {0.01, 0.05, 0.20}`) — **never launched implicitly**, only via:
 
 ```bash
-python scripts/run_temporal_grid.py --preset quick   # sanity-check the grid machinery
-python scripts/run_temporal_grid.py --preset full
+python scripts/timeseries/run_grid.py --preset quick   # sanity-check the grid machinery
+python scripts/timeseries/run_grid.py --preset full
 ```
 
 Evaluate one completed run — encodes train/validation/test, estimates the post-hoc entity
@@ -298,7 +298,7 @@ subspace from train+validation, fits probes, computes every Section 7 metric on 
 writes the per-run plots and `analysis/summary.json`:
 
 ```bash
-python scripts/evaluate_temporal_hierarchy.py --run-dir outputs/temporal/<run-id>
+python scripts/timeseries/evaluate.py --run-dir outputs/temporal/<run-id>
 ```
 
 Aggregate a grid across seeds/conditions (auto-runs evaluation on any un-analyzed run,
@@ -307,7 +307,7 @@ then writes `aggregate_summary.csv`/`.json`, `entity_selectivity_vs_timescale.pn
 questions):
 
 ```bash
-python scripts/aggregate_temporal_hierarchy.py --root outputs/temporal_grid_full
+python scripts/analysis/aggregate_temporal.py --root outputs/temporal_grid_full
 ```
 
 ### Expected outputs
@@ -334,122 +334,24 @@ PNGs (`generalized_eigenvalue_spectrum.png`, `probe_matrix.png`,
   default `k` (highest validation entity accuracy); the full curve over `k` is still
   reported, per the spec's instruction not to hide it behind the selected value.
 
-## Rendered-image entity/context experiment
-
-A third variant of the same experiment (`jepa.temporal_image_*`) replaces the vector
-observation map with a small rasterizer: `E_t in {none, circle, square, triangle}`,
-`C_t = (x, y, scale, rotation, r, g, b, visibility, background)`, `X_t = h(E_t, C_t)` is a
-64x64x3 rendered frame. It answers the same scientific question as the vector world and
-reuses almost everything from it.
-
-### What's actually new vs. reused
-
-- **New**: `jepa.temporal_image_config` (config), `jepa.temporal_image_data` (a
-  dependency-free, vectorized NumPy rasterizer with 2x-supersample anti-aliasing;
-  the entity/context temporal process; a static independent-sample dataset; block
-  masking for the spatial-JEPA control; image counterfactual pairs).
-- **Reused unmodified**: `jepa.temporal_data.make_temporal_pairs` /
-  `make_hierarchical_pairs`, and `jepa.temporal_training`'s `_standard_epoch_loss`,
-  `_hierarchical_epoch_loss`, `build_jepa_core`, `build_hierarchical_core`,
-  `encode_split_standard`. None of these functions were touched or duplicated for
-  images — `EntityContextImageTrajectoryDataset` simply exposes `.observations`
-  (flattened frames), `.entities`, `.contexts`, and `config.trajectory_length` /
-  `config.observation_dim` with the exact same meaning the vector dataset uses, so the
-  pair builders and per-epoch training loops run against it untouched. The entire
-  post-hoc analysis pipeline (`jepa.temporal_analysis`: scatter matrices, the
-  generalized eigenproblem, probes, counterfactual invariance, autocorrelation) and
-  every plot in `jepa.temporal_plots` are equally generic over latent tensors and are
-  reused as-is; only one new auxiliary plot was added (`plot_latent_pca_scatter`).
-
-### Hidden-factor design choices (documented assumptions)
-
-- **Clipping vs. occlusion, as two independent factors.** Position `x, y` range over
-  an extended `[-0.15, 1.15]` normalized window, so objects are naturally cropped by
-  the 64x64 canvas edge when they drift near the border (real geometric clipping).
-  `visibility` is a *separate* continuous opacity/alpha factor in `[0.3, 1.0]`
-  blending the shape into the background (simulating partial occlusion/haze
-  independent of position). This covers both aspects of Section 2.4.1 without
-  conflating them into one variable.
-- **Anti-aliasing**: frames are rasterized at 2x resolution with vectorized NumPy
-  boolean masks (circle: distance test; square: rotated half-plane test; triangle:
-  barycentric sign test against an equilateral triangle) and then average-pooled
-  down — no image library dependency was added.
-- **Static spatial-JEPA control (Section 2.4.3/2.4.6)**: `block_mask` splits an image
-  into two *complementary* full-size views — `visible` (the image with one random
-  rectangular block zeroed out) and `target` (only that block's original pixels,
-  everything else zeroed). Both share the same `[C, H, W]` shape, so the existing
-  single-global-latent `JEPACore` (`build_jepa_core`, `compute_loss`) is reused
-  as-is: the context encoder reads the visible view, the target encoder (SG/EMA per
-  the usual policy) reads the target-block view, and the predictor is trained to
-  match the two — "predict the latent of the masked block from the visible part"
-  at the level of one global vector latent rather than a patch-embedding sequence
-  (a full per-patch I-JEPA-style architecture was out of scope for this iteration).
-
-### Commands
-
-```bash
-# smoke test
-python scripts/train_temporal_image.py experiment=temporal_hierarchy_image_quick
-python scripts/train_temporal_image.py experiment=temporal_hierarchy_image_quick_shuffled
-
-# full preset
-python scripts/train_temporal_image.py experiment=temporal_hierarchy_image_full
-
-# static spatial-JEPA semantics control (Section 2.4.7)
-python scripts/train_temporal_image.py experiment=spatial_semantics_image_quick
-python scripts/train_temporal_image.py experiment=spatial_semantics_image_quick_control
-
-# evaluate any completed image run (same Section 7 metrics + an auxiliary PCA-by-entity plot)
-python scripts/evaluate_temporal_image.py --run-dir outputs/temporal_image_quick/<run-id>
-
-# preview grids: static samples, temporal trajectories, counterfactual pairs, masking
-python scripts/visualize_temporal_image_dataset.py \
-    --config configs/temporal_hierarchy_image_quick.yaml \
-    --output-dir outputs/temporal_image_previews
-```
-
-### Configs
-
-| File | Purpose |
-|---|---|
-| `configs/temporal_hierarchy_image_quick.yaml` | Smoke test, `temporal_image` |
-| `configs/temporal_hierarchy_image_quick_shuffled.yaml` | Shuffled-target control |
-| `configs/temporal_hierarchy_image_full.yaml` | Full-scale `temporal_image` |
-| `configs/spatial_semantics_image_quick.yaml` | Static spatial-JEPA masking |
-| `configs/spatial_semantics_image_quick_control.yaml` | Same, but excludes `none` so there is no object/no-object shortcut |
-
-### Expected outputs
-
-Same artifact set as the vector world (`config.yaml`, `status.json`, `history.json`,
-`metrics.json`, `checkpoint.pt`), plus `analysis/summary.json` and PNGs
-(`generalized_eigenvalue_spectrum.png`, `probe_matrix.png`,
-`counterfactual_distances.png`, `effective_rank_over_training.png`,
-`prediction_loss_curves.png`, `latent_pca_by_entity.png`) after running the evaluate
-script. `visualize_temporal_image_dataset.py` writes `preview_*.png` grids into
-`--output-dir` for a visual sanity check of the generator before spending a training
-budget on it.
-
 ## Shapes3D-backed entity/context world
 
-A third image variant (`jepa.temporal_shapes3d_*`) swaps the procedural rasterizer for an
-**exact lookup** into DeepMind's [3D Shapes dataset](https://github.com/deepmind/3d-shapes)
+The image variant of the experiment (`jepa.*.images.shapes3d`) uses an **exact lookup**
+into DeepMind's [3D Shapes dataset](https://github.com/deepmind/3d-shapes)
 (480,000 real rendered images, every combination of 6 factors: `floor_hue`, `wall_hue`,
-`object_hue`, `scale`, `shape`, `orientation`). It is *additive*: nothing in
-`jepa.temporal_image_*` changed, and both stay usable independently.
+`object_hue`, `scale`, `shape`, `orientation`).
 
 - **Entity** = `shape` (4 classes: cube, cylinder, sphere, capsule). **Context** = the other
   5 factors.
 - Because every reachable image is a real row already in the dataset, the context process is
   a **discrete random walk over factor indices** (`context_step_probability` chance of moving
   `±1..context_step_max` per factor per step, clipped to the valid range) rather than the
-  continuous AR(1) process used by the procedural renderer -- there is no snapping or
-  interpolation, no approximation error, and indexing is exact (`jepa.temporal_shapes3d_data.flat_index`
+  continuous AR(1) process of the vector world -- there is no snapping or
+  interpolation, no approximation error, and indexing is exact (`jepa.data.images.shapes3d.flat_index`
   implements the dataset's own row-major formula).
-- Reuses `jepa.temporal_image_data.block_mask` / `build_static_spatial_dataset` unmodified for
-  the spatial-JEPA masking control, and (like the procedural image world) is duck-type
-  compatible with `jepa.temporal_data.make_temporal_pairs` / `jepa.temporal_training`'s
-  per-epoch training helpers, so training needed no new core logic -- only a new dataset and a
-  thin `train_shapes3d_experiment` orchestration wrapper mirroring `temporal_image_training.py`.
+- Duck-type compatible with `jepa.data.timeseries.entity_context.make_temporal_pairs` /
+  `jepa.training.timeseries`'s per-epoch training helpers, so training needed no new core
+  logic -- only a new dataset and a thin `train_shapes3d_experiment` orchestration wrapper.
 
 ### Setup (one-time download)
 
@@ -479,13 +381,13 @@ fixed while building this, in case the dataset is re-used elsewhere:
 ### Commands
 
 ```bash
-python scripts/train_temporal_shapes3d.py experiment=temporal_shapes3d_quick
-python scripts/train_temporal_shapes3d.py experiment=temporal_shapes3d_full
+python scripts/images/train_shapes3d.py experiment=temporal_shapes3d_quick
+python scripts/images/train_shapes3d.py experiment=temporal_shapes3d_full
 
-python scripts/evaluate_temporal_shapes3d.py --run-dir outputs/temporal_shapes3d_quick/<run-id>
+python scripts/images/evaluate_shapes3d.py --run-dir outputs/temporal_shapes3d_quick/<run-id>
 
-python scripts/visualize_temporal_shapes3d_dataset.py \
-    --config configs/temporal_shapes3d_quick.yaml \
+python scripts/images/visualize_shapes3d_dataset.py \
+    --config configs/images/shapes3d/quick.yaml \
     --output-dir outputs/temporal_shapes3d_previews
 ```
 

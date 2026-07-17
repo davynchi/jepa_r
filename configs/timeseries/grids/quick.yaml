@@ -1,12 +1,12 @@
 # Grid axes consumed by scripts/run_temporal_grid.py --preset quick.
 # This is NOT a TemporalExperimentConfig; it is a small enumeration spec.
-base_config: configs/temporal_hierarchy_quick.yaml
+base_config: configs/timeseries/hierarchy_quick.yaml
 seeds: [0, 1]
 model_types: [linear, nonlinear]
 observation_modes: [linear, nonlinear]
 entity_switch_probabilities: [0.01, 0.20]
 prediction_horizons: [1, 8]
-target_pairings: [temporal, shuffled]
+target_pairings: [temporal, shuffled, shuffled_same_entity]
 include_random_baseline: true
 num_train_trajectories: 200
 num_val_trajectories: 50
@@ -14,7 +14,7 @@ num_test_trajectories: 50
 epochs: 5
 
 hierarchical:
-  base_config: configs/temporal_hierarchy_quick.yaml
+  base_config: configs/timeseries/hierarchy_quick.yaml
   entity_switch_probabilities: [0.01, 0.20]
   short_horizon: 1
   long_horizon: 8

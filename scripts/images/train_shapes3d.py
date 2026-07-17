@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Train one Shapes3D-backed entity/context run.
 
-    python scripts/train_temporal_shapes3d.py experiment=temporal_shapes3d_quick
+    python scripts/images/train_shapes3d.py experiment=temporal_shapes3d_quick
 
 Requires ``data/3dshapes.h5`` (downloaded once):
     curl -o data/3dshapes.h5 https://storage.googleapis.com/3d-shapes/3dshapes.h5
@@ -17,10 +17,10 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from jepa.temporal_shapes3d_config import load_shapes3d_config  # noqa: E402
-from jepa.temporal_shapes3d_training import train_shapes3d_experiment  # noqa: E402
+from jepa.configs.images.shapes3d import load_shapes3d_config  # noqa: E402
+from jepa.training.images.shapes3d import train_shapes3d_experiment  # noqa: E402
 
 
 def _parse_args(argv: list[str]) -> tuple[str | None, dict[str, str], int | None]:

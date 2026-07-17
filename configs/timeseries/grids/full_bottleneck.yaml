@@ -1,0 +1,24 @@
+# Grid axes consumed by scripts/run_temporal_grid.py --preset full_bottleneck.
+# This is NOT a TemporalExperimentConfig; it is a small enumeration spec.
+#
+# This is the "official pipeline" version of what scripts/_investigate_pairing_controls.py
+# checked ad-hoc: is a random/untrained encoder distinguishable from a trained one
+# once you sweep latent_dim across (and past) the world's true signal dimensionality
+# ((num_entities-1)+context_dim = 2+6 = 8 by default), and does entity selectivity
+# depend on the SG/EMA policy or the entity/context timescale ratio (context_rho)?
+# Never launched implicitly by the default training command.
+base_config: configs/timeseries/hierarchy_full.yaml
+seeds: [0, 1, 2, 3, 4]
+model_types: [linear, nonlinear]
+observation_modes: [linear]
+entity_switch_probabilities: [0.05]
+prediction_horizons: [1]
+target_pairings: [temporal, shuffled, shuffled_same_entity]
+include_random_baseline: true
+latent_dims: [4, 8, 16, 32]
+context_rhos: [0.0, 0.5, 0.9]
+sg_ema_combinations:
+  - [true, true] # SG on, EMA on (current default policy)
+  - [true, false] # SG on, EMA off
+  - [false, true] # SG off, EMA on
+  - [false, false] # SG off, EMA off (shared, no stop-gradient)

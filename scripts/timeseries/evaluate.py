@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Full post-hoc analysis for one completed temporal-persistence run.
 
-    python scripts/evaluate_temporal_hierarchy.py --run-dir outputs/temporal/<run-id>
+    python scripts/timeseries/evaluate.py --run-dir outputs/temporal/<run-id>
 
 Loads the checkpoint, re-derives the identical train/validation/test/
 counterfactual data (deterministic given the stored config), estimates the
@@ -18,36 +18,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from dataclasses import asdict  # noqa: E402
 
 import torch  # noqa: E402
 
-from jepa.metrics import compute_representation_metrics  # noqa: E402
-from jepa.models import build_model_pair  # noqa: E402
-from jepa.temporal_analysis import (  # noqa: E402
-    classifier_accuracy,
-    compute_autocorrelation,
-    compute_scatter_matrices,
-    context_r2_mean,
-    counterfactual_invariance,
-    entity_selectivity_score,
-    entity_subspace_projection,
-    fit_context_regressor,
-    fit_entity_classifier,
-    project,
-    select_entity_subspace_dim,
-    solve_generalized_eigenproblem,
-)
-from jepa.temporal_config import TemporalEvaluationConfig, temporal_config_from_dict  # noqa: E402
-from jepa.temporal_data import (  # noqa: E402
-    EntityContextTrajectoryDataset,
-    ObservationSystem,
-    build_counterfactual_pairs,
-)
-from jepa.temporal_models import HierarchicalEncoderPredictor  # noqa: E402
-from jepa.temporal_plots import (  # noqa: E402
+from jepa.analysis.metrics import compute_representation_metrics  # noqa: E402
+from jepa.analysis.plots import (  # noqa: E402
     plot_counterfactual_distances,
     plot_effective_rank_over_training,
     plot_generalized_eigenvalue_spectrum,
@@ -55,7 +33,36 @@ from jepa.temporal_plots import (  # noqa: E402
     plot_prediction_loss_curves,
     plot_probe_matrix,
 )
-from jepa.temporal_training import load_temporal_checkpoint  # noqa: E402
+from jepa.analysis.subspace import (  # noqa: E402
+    apply_whitening,
+    classifier_accuracy,
+    compute_autocorrelation,
+    compute_latent_spectrum,
+    compute_scatter_matrices,
+    context_r2_mean,
+    counterfactual_invariance,
+    empirical_entity_predictability,
+    entity_selectivity_score,
+    entity_subspace_projection,
+    fit_context_regressor,
+    fit_entity_classifier,
+    fit_whitening,
+    project,
+    select_entity_subspace_dim,
+    solve_generalized_eigenproblem,
+)
+from jepa.configs.timeseries import (  # noqa: E402
+    TemporalEvaluationConfig,
+    temporal_config_from_dict,
+)
+from jepa.data.timeseries.entity_context import (  # noqa: E402
+    EntityContextTrajectoryDataset,
+    ObservationSystem,
+    build_counterfactual_pairs,
+)
+from jepa.models.encoders import build_model_pair  # noqa: E402
+from jepa.models.hierarchical import HierarchicalEncoderPredictor  # noqa: E402
+from jepa.training.timeseries import load_temporal_checkpoint  # noqa: E402
 
 
 def _rebuild_system(config, checkpoint: dict[str, Any]) -> ObservationSystem:
@@ -208,13 +215,43 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
         num_pairs=evaluation.counterfactual_pairs,
         seed=config.data.counterfactual_seed,
     )
-    same_1 = project(encoder(counterfactual_config.same_entity_x1), projection)
-    same_2 = project(encoder(counterfactual_config.same_entity_x2), projection)
-    diff_1 = project(encoder(counterfactual_config.diff_entity_x1), projection)
-    diff_2 = project(encoder(counterfactual_config.diff_entity_x2), projection)
+    with torch.no_grad():
+        same_1_z = encoder(counterfactual_config.same_entity_x1)
+        same_2_z = encoder(counterfactual_config.same_entity_x2)
+        diff_1_z = encoder(counterfactual_config.diff_entity_x1)
+        diff_2_z = encoder(counterfactual_config.diff_entity_x2)
+    same_1 = project(same_1_z, projection)
+    same_2 = project(same_2_z, projection)
+    diff_1 = project(diff_1_z, projection)
+    diff_2 = project(diff_2_z, projection)
     invariance = counterfactual_invariance(same_1, same_2, diff_1, diff_2)
 
+    # Whitened counterfactual invariance: strips out a raw-scale confound (an
+    # encoder can shrink/grow D_same and D_diff together just by changing its
+    # overall output norm, without its relative entity/context geometry
+    # changing at all -- see the P0 bottleneck-confound writeup). Re-derive the
+    # entity subspace in whitened coordinates rather than reusing `projection`,
+    # since whitening changes the geometry the generalized eigenproblem sees.
+    whitening = fit_whitening(train_z)
+    train_z_white = apply_whitening(whitening, train_z)
+    scatter_white = compute_scatter_matrices(train_z_white, train_entity, config.data.num_entities)
+    eigen_white = solve_generalized_eigenproblem(
+        scatter_white, epsilon=evaluation.covariance_epsilon
+    )
+    projection_white = entity_subspace_projection(eigen_white.eigenvectors, best_k)
+    invariance_white = counterfactual_invariance(
+        project(apply_whitening(whitening, same_1_z), projection_white),
+        project(apply_whitening(whitening, same_2_z), projection_white),
+        project(apply_whitening(whitening, diff_1_z), projection_white),
+        project(apply_whitening(whitening, diff_2_z), projection_white),
+    )
+
     collapse = compute_representation_metrics(test_z)
+    spectrum = compute_latent_spectrum(test_z)
+    predictability = empirical_entity_predictability(
+        train_ds.entities, horizon=config.training.prediction_horizon
+    )
+    mean_latent_norm = float(torch.linalg.vector_norm(test_z.double(), dim=1).mean().item())
     autocorr = compute_autocorrelation(
         val_z.reshape(len(val_ds), config.data.trajectory_length, -1),
         max_lag=evaluation.autocorrelation_max_lag,
@@ -276,6 +313,18 @@ def evaluate_run(run_dir: Path) -> dict[str, Any]:
         "probe_matrix": probe_rows,
         "selectivity_score": selectivity,
         "counterfactual": asdict(invariance),
+        "counterfactual_whitened": asdict(invariance_white),
+        "spectrum": {
+            "trace_covariance": spectrum.trace_covariance,
+            "effective_rank": spectrum.effective_rank,
+            "top_eigenvalues": spectrum.eigenvalues[
+                : min(8, spectrum.eigenvalues.shape[0])
+            ].tolist(),
+            "std_min": float(spectrum.per_dimension_std.min()),
+            "std_max": float(spectrum.per_dimension_std.max()),
+        },
+        "mean_latent_norm": mean_latent_norm,
+        "predictability": predictability,
         "collapse_diagnostics": {
             "effective_rank": collapse.effective_rank.value,
             "effective_rank_normalized": collapse.effective_rank_normalized.value,

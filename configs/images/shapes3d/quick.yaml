@@ -66,5 +66,5 @@ evaluation:
   selectivity_alpha: 1.0
 
 output:
-  root: outputs/temporal_shapes3d_quick
+  root: outputs/images/shapes3d/quick
   overwrite: true

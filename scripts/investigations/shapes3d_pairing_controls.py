@@ -2,7 +2,7 @@
 """Ad-hoc diagnostic investigation for the Shapes3D image world.
 
 Mirrors ``_investigate_pairing_controls.py`` (vector world) and
-``_investigate_image_pairing_controls.py`` (procedural renderer) exactly: same
+exactly: same
 bottleneck question, same controls ({temporal, shuffled, oracle_same_entity}
 plus random_encoder / random_orthogonal baselines), same metrics (D_same/D_diff
 raw + whitened, full spectrum, entity/context probes on full latent and
@@ -22,13 +22,11 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 import torch  # noqa: E402
 
-from jepa.config import derive_seed  # noqa: E402
-from jepa.models import build_model_pair  # noqa: E402
-from jepa.temporal_analysis import (  # noqa: E402
+from jepa.analysis.subspace import (  # noqa: E402
     apply_whitening,
     classifier_accuracy,
     compute_latent_spectrum,
@@ -42,19 +40,22 @@ from jepa.temporal_analysis import (  # noqa: E402
     project,
     solve_generalized_eigenproblem,
 )
-from jepa.temporal_shapes3d_config import (  # noqa: E402
+from jepa.configs.base import derive_seed  # noqa: E402
+from jepa.configs.images.shapes3d import (  # noqa: E402
     Shapes3DExperimentConfig,
     load_shapes3d_config,
 )
-from jepa.temporal_shapes3d_data import (  # noqa: E402
-    Shapes3DEntityContextTrajectoryDataset,
+from jepa.data.images.shapes3d import (  # noqa: E402
+    Shapes3DDatasetSplits,
     Shapes3DSource,
     build_shapes3d_counterfactual_pairs,
+    build_shapes3d_dataset_splits,
 )
-from jepa.temporal_shapes3d_training import train_shapes3d_experiment  # noqa: E402
-from jepa.training import build_jepa_core  # noqa: E402
+from jepa.models.encoders import build_model_pair  # noqa: E402
+from jepa.training.core import build_jepa_core  # noqa: E402
+from jepa.training.images.shapes3d import train_shapes3d_experiment  # noqa: E402
 
-OUTPUT_ROOT = "/tmp/shapes3d_bottleneck_grid"
+OUTPUT_ROOT = str(Path(__file__).resolve().parents[2] / "outputs" / "shapes3d_bottleneck_grid")
 SEEDS = (0, 1, 2)
 D_Z_VALUES = (8, 32)
 PAIRINGS = ("temporal", "shuffled", "shuffled_same_entity")
@@ -65,19 +66,51 @@ PAIRING_LABELS = {
 }
 K_ENTITY_SUBSPACE = 2
 
+# config.data (and evaluation.counterfactual_pairs) never varies across a grid run --
+# only model/training fields do (d_z, architecture, pairing, seed) -- so the full
+# train/validation/test trajectory splits and the counterfactual pairs are
+# bit-identical for every one of the 27-39 cells in a run. Rebuilding them per cell
+# (both here for analysis AND again inside train_shapes3d_experiment for training)
+# was pure CPU waste -- each split is a multi-GB fancy-index gather out of the
+# Shapes3D memmap plus a per-trajectory Python generation loop (~20s alone) -- and
+# was the main reason the GPU sat idle for minutes before/between cells.
+_DATASET_CACHE: dict[tuple, tuple[Shapes3DDatasetSplits, object]] = {}
+
 
 def base_config() -> Shapes3DExperimentConfig:
     return load_shapes3d_config(
-        "configs/temporal_shapes3d_quick.yaml",
+        "configs/images/shapes3d/quick.yaml",
         overrides={"output.root": OUTPUT_ROOT, "output.overwrite": "on"},
     )
 
 
+def _cached_datasets(
+    config: Shapes3DExperimentConfig, source: Shapes3DSource
+) -> tuple[Shapes3DDatasetSplits, object]:
+    key = (config.data, config.evaluation.counterfactual_pairs)
+    cached = _DATASET_CACHE.get(key)
+    if cached is None:
+        splits = build_shapes3d_dataset_splits(config.data)
+        cf = build_shapes3d_counterfactual_pairs(
+            config.data,
+            source,
+            num_pairs=config.evaluation.counterfactual_pairs,
+            seed=config.data.counterfactual_seed,
+        )
+        cached = (splits, cf)
+        _DATASET_CACHE[key] = cached
+    return cached
+
+
 def _full_analysis(
-    encoder, config: Shapes3DExperimentConfig, source: Shapes3DSource, *, extra: dict
+    encoder,
+    config: Shapes3DExperimentConfig,
+    source: Shapes3DSource,
+    *,
+    extra: dict,
 ) -> dict:
-    train_ds = Shapes3DEntityContextTrajectoryDataset(config.data, "train", source=source)
-    test_ds = Shapes3DEntityContextTrajectoryDataset(config.data, "test", source=source)
+    splits, cf = _cached_datasets(config, source)
+    train_ds, test_ds = splits.train, splits.test
     obs_dim = config.data.observation_dim
 
     with torch.no_grad():
@@ -97,12 +130,6 @@ def _full_analysis(
     identity = torch.eye(latent_dim, dtype=torch.float64).numpy()
     complement = identity - projection
 
-    cf = build_shapes3d_counterfactual_pairs(
-        config.data,
-        source,
-        num_pairs=config.evaluation.counterfactual_pairs,
-        seed=config.data.counterfactual_seed,
-    )
     with torch.no_grad():
         same_1 = encoder(cf.same_entity_x1.reshape(-1, obs_dim))
         same_2 = encoder(cf.same_entity_x2.reshape(-1, obs_dim))
@@ -179,8 +206,9 @@ def run_trained(seed: int, d_z: int, pairing: str, source: Shapes3DSource) -> di
         model=replace(config.model, kind="standard", latent_dim=d_z),
         training=replace(config.training, seed=seed, target_pairing=pairing),
     )
+    splits, _ = _cached_datasets(config, source)
     result = train_shapes3d_experiment(
-        config, seed_label=derive_seed(seed, "dz", d_z, "pairing", pairing)
+        config, seed_label=derive_seed(seed, "dz", d_z, "pairing", pairing), datasets=splits
     )
     checkpoint = torch.load(
         result.run_dir / "checkpoint.pt", map_location="cpu", weights_only=False
@@ -215,8 +243,8 @@ def run_random_encoder(seed: int, d_z: int, source: Shapes3DSource) -> dict:
         model=replace(config.model, kind="random", latent_dim=d_z),
         training=replace(config.training, seed=seed),
     )
-    from jepa.config import derive_seed as _derive
-    from jepa.training import _seed_everything
+    from jepa.configs.base import derive_seed as _derive
+    from jepa.training.core import _seed_everything
 
     _seed_everything(_derive(seed, config.model.architecture, "model"))
     core = build_jepa_core(
