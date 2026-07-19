@@ -38,6 +38,7 @@ from jepa.analysis.subspace import (  # noqa: E402
     fit_context_regressor,
     fit_entity_classifier,
     fit_whitening,
+    max_useful_subspace_dim,
     project,
     solve_generalized_eigenproblem,
 )
@@ -63,7 +64,6 @@ PAIRING_LABELS = {
     "shuffled": "shuffled",
     "shuffled_same_entity": "oracle_same_entity",
 }
-K_ENTITY_SUBSPACE = 2
 
 
 def base_config() -> TemporalExperimentConfig:
@@ -97,7 +97,7 @@ def _full_analysis(
     test_context = test_ds.contexts.reshape(-1, config.data.context_dim)
 
     latent_dim = train_z.shape[1]
-    k = min(K_ENTITY_SUBSPACE, latent_dim - 1) if latent_dim > 1 else latent_dim
+    k = max_useful_subspace_dim(config.data.num_entities, latent_dim)
 
     scatter = compute_scatter_matrices(train_z, train_entity, config.data.num_entities)
     eigen = solve_generalized_eigenproblem(scatter, epsilon=config.evaluation.covariance_epsilon)

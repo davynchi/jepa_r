@@ -211,6 +211,20 @@ def compute_autocorrelation(trajectories: torch.Tensor, *, max_lag: int) -> Auto
     )
 
 
+def max_useful_subspace_dim(num_entities: int, latent_dim: int) -> int:
+    """The largest entity-subspace dimension that can carry any signal.
+
+    S_B is built from the ``num_entities`` class means centered on the grand
+    mean, so those vectors sum to zero and span at most ``num_entities - 1``
+    dimensions -- every generalized eigenvalue past that is exactly 0. Taking a
+    larger k appends pure noise directions: they add no between-class distance
+    (D_diff barely moves) but do carry context variation (D_same grows), so Q_E
+    collapses toward 1 and looks like "no structure" when the structure is
+    simply being diluted.
+    """
+    return max(1, min(num_entities - 1, latent_dim))
+
+
 def select_entity_subspace_dim(
     candidate_dims: tuple[int, ...],
     validation_entity_accuracy: dict[int, float],

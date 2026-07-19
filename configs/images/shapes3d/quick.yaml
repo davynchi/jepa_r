@@ -58,7 +58,8 @@ hierarchical:
   epsilon: 1.0e-6
 
 evaluation:
-  entity_subspace_dims: [1, 2, 4]
+  # rank(S_B) = num_entities - 1 = 3; larger k is noise
+  entity_subspace_dims: [1, 2, 3]
   covariance_epsilon: 1.0e-6
   probe_ridge: 1.0e-6
   autocorrelation_max_lag: 8

@@ -21,10 +21,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 # the reference every trained number has to beat to mean anything.
 UNTRAINED = {
     "effective_rank": 3.788,
-    "entity_accuracy": 0.490,
-    "context_r2": 0.284,
-    "raw_q_entity": 0.029,
-    "white_q_entity": 0.809,
+    "entity_accuracy": 0.421,
+    "context_accuracy_mean": 0.439,
     "mi_ratio": 0.035,
 }
 
@@ -73,11 +71,17 @@ def main() -> None:
         label="entity acc",
     )
     ax.plot(
-        epochs, [r["context_r2"] for r in records], marker="s", markersize=4, label="context R²"
+        epochs,
+        [r["context_accuracy_mean"] for r in records],
+        marker="s",
+        markersize=4,
+        label="context acc (mean)",
     )
     ax.axhline(UNTRAINED["entity_accuracy"], color="red", linestyle="--", linewidth=1, alpha=0.5)
-    ax.axhline(UNTRAINED["context_r2"], color="red", linestyle=":", linewidth=1, alpha=0.5)
-    ax.set_title("Linear probes (dashed/dotted = untrained)")
+    ax.axhline(
+        UNTRAINED["context_accuracy_mean"], color="red", linestyle=":", linewidth=1, alpha=0.5
+    )
+    ax.set_title("Linear probes, classification (dashed/dotted = untrained)")
     ax.legend(fontsize=8)
 
     # raw vs whitened Q_E: a growing gap means raw is tracking output scale,
@@ -91,8 +95,7 @@ def main() -> None:
         markersize=4,
         label="Q_E whitened",
     )
-    baseline(ax, "white_q_entity")
-    ax.set_title("Counterfactual invariance Q_E")
+    ax.set_title("Counterfactual invariance Q_E (k = rank S_B = 3)")
     ax.set_xlabel("epoch")
     ax.legend(fontsize=8)
 

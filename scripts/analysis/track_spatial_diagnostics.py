@@ -10,7 +10,9 @@ checkpoint this reports, all on the held-out test split:
   effective_rank     entropy of the covariance spectrum (collapse detector)
   top_eigs           leading covariance eigenvalues (is variance spread or in 1 dim?)
   entity_acc         linear probe: shape readable from the frozen latent?
-  context_r2         linear probe: are the 5 context factors readable?
+  context_acc        linear probe per factor (classification, not R^2: the
+                     factors are discrete and the hues are cyclic, which R^2
+                     scores as maximally-distant neighbours)
   Q_E raw/white      counterfactual invariance in the LDA entity subspace
   MI ratio           I(top LDA direction; shape) / H(shape), a nonlinear check
 
@@ -28,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from jepa.analysis.subspace import (  # noqa: E402
@@ -35,19 +38,22 @@ from jepa.analysis.subspace import (  # noqa: E402
     classifier_accuracy,
     compute_latent_spectrum,
     compute_scatter_matrices,
-    context_r2_mean,
     counterfactual_invariance,
     entity_label_entropy,
     entity_subspace_projection,
-    fit_context_regressor,
     fit_entity_classifier,
     fit_whitening,
+    max_useful_subspace_dim,
     mutual_information_entity,
     project,
     solve_generalized_eigenproblem,
 )
 from jepa.configs.base import derive_seed  # noqa: E402
-from jepa.configs.images.shapes3d import load_shapes3d_config  # noqa: E402
+from jepa.configs.images.shapes3d import (  # noqa: E402
+    SHAPES3D_CONTEXT_FACTORS,
+    SHAPES3D_FACTOR_SIZES,
+    load_shapes3d_config,
+)
 from jepa.data.images.shapes3d import (  # noqa: E402
     build_shapes3d_counterfactual_pairs,
     build_shapes3d_dataset_splits,
@@ -68,8 +74,13 @@ RECORDS_PATH = OUTPUT_DIR / "metrics" / "diagnostics.json"
 PATCH_SIZE = 8
 PATCH_LATENT_DIM = 16
 BATCH_SIZE = 128
-K_ENTITY_SUBSPACE = 2
 POLL_SECONDS = 15
+
+
+def _context_class_labels(contexts: torch.Tensor, factor_index: int) -> torch.Tensor:
+    """Undo the [0, 1] normalisation back to the factor's original class index."""
+    size = SHAPES3D_FACTOR_SIZES[SHAPES3D_CONTEXT_FACTORS[factor_index]]
+    return (contexts[:, factor_index] * (size - 1)).round().long()
 
 
 def _held_out_loss(core, test_patches, grid, mask_config, device) -> float:
@@ -113,6 +124,9 @@ def main() -> None:
     num_patches = test_patches.shape[1]
     patch_dim = test_patches.shape[2]
     mask_config = MaskConfig()
+    # rank(S_B) = num_entities - 1; any k beyond that is a zero-eigenvalue
+    # noise direction that inflates D_same and drags Q_E toward 1
+    k_entity = max_useful_subspace_dim(num_entities, PATCH_LATENT_DIM)
 
     source = datasets.train.source
     counterfactual = build_shapes3d_counterfactual_pairs(
@@ -156,13 +170,23 @@ def main() -> None:
 
                 classifier = fit_entity_classifier(train_z, train_entity, num_entities, ridge=ridge)
                 entity_acc = classifier_accuracy(classifier, test_z, test_entity)
-                regressor = fit_context_regressor(train_z, train_context, ridge=ridge)
-                context_r2 = context_r2_mean(regressor, test_z, test_context)
+                context_acc = {}
+                for index, factor in enumerate(SHAPES3D_CONTEXT_FACTORS):
+                    factor_classifier = fit_entity_classifier(
+                        train_z,
+                        _context_class_labels(train_context, index),
+                        SHAPES3D_FACTOR_SIZES[factor],
+                        ridge=ridge,
+                    )
+                    context_acc[factor] = classifier_accuracy(
+                        factor_classifier, test_z, _context_class_labels(test_context, index)
+                    )
+                context_acc_mean = float(np.mean(list(context_acc.values())))
 
                 # LDA entity subspace, fit on train only.
                 scatter = compute_scatter_matrices(train_z, train_entity, num_entities)
                 eigen = solve_generalized_eigenproblem(scatter, epsilon=covariance_epsilon)
-                projection = entity_subspace_projection(eigen.eigenvectors, K_ENTITY_SUBSPACE)
+                projection = entity_subspace_projection(eigen.eigenvectors, k_entity)
 
                 with torch.no_grad():
                     same_1 = encode_frames_pooled(
@@ -188,7 +212,7 @@ def main() -> None:
                     apply_whitening(whitening, train_z), train_entity, num_entities
                 )
                 eigen_w = solve_generalized_eigenproblem(scatter_w, epsilon=covariance_epsilon)
-                projection_w = entity_subspace_projection(eigen_w.eigenvectors, K_ENTITY_SUBSPACE)
+                projection_w = entity_subspace_projection(eigen_w.eigenvectors, k_entity)
                 white_inv = counterfactual_invariance(
                     project(apply_whitening(whitening, same_1), projection_w),
                     project(apply_whitening(whitening, same_2), projection_w),
@@ -204,25 +228,24 @@ def main() -> None:
 
                 record = {
                     "epoch": checkpoint["epoch"],
+                    "subspace_dim": k_entity,
                     "test_loss": test_loss,
                     "effective_rank": spectrum.effective_rank,
                     "trace_covariance": spectrum.trace_covariance,
                     "top_eigenvalues": spectrum.eigenvalues[:6].tolist(),
                     "entity_accuracy": entity_acc,
-                    "context_r2": context_r2.value,
+                    "context_accuracy": context_acc,
+                    "context_accuracy_mean": context_acc_mean,
                     "raw_q_entity": raw_inv.q_entity,
                     "white_q_entity": white_inv.q_entity,
                     "mi_ratio": mi / entropy if entropy > 0 else float("nan"),
                 }
                 records.append(record)
                 RECORDS_PATH.write_text(json.dumps(records, indent=2))
-                context_r2_text = (
-                    "n/a" if record["context_r2"] is None else f"{record['context_r2']:.3f}"
-                )
                 print(
                     f"epoch={record['epoch']:4d} test_loss={test_loss:9.5f} "
                     f"eff_rank={spectrum.effective_rank:6.3f} "
-                    f"entity_acc={entity_acc:.3f} context_r2={context_r2_text} "
+                    f"entity_acc={entity_acc:.3f} context_acc={context_acc_mean:.3f} "
                     f"Q_E={raw_inv.q_entity:8.3f} Q_E_w={white_inv.q_entity:8.3f} "
                     f"MI_ratio={record['mi_ratio']:.3f}",
                     flush=True,
