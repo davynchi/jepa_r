@@ -85,6 +85,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint-pattern", default="epoch_*.pt")
     parser.add_argument("--poll-seconds", type=float, default=POLL_SECONDS)
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Device for diagnostics; use cpu to avoid competing with training GPU",
+    )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--no-tensorboard", action="store_true")
     return parser.parse_args()
@@ -135,7 +141,10 @@ def main() -> None:
     run_config = json.loads(run_config_path.read_text())
     config = shapes3d_config_from_dict(run_config["config"])
     datasets = build_shapes3d_static_dataset_splits(config.data)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
 
     train_frames = datasets.train.images
     test_frames = datasets.test.images
