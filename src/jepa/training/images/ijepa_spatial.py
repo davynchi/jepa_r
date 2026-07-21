@@ -20,15 +20,17 @@ positional embedding rather than a transformer over mask tokens.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from jepa.models.encoders import build_model_pair
+from jepa.models.encoders import Architecture, build_model_pair
 from jepa.models.patches import patchify
 from jepa.training.core import (
     SCHEMA_VERSION,
@@ -183,7 +185,7 @@ class SpatialIJEPACore:
 
 
 def build_spatial_ijepa_core(
-    architecture: str,
+    architecture: Architecture,
     *,
     patch_dim: int,
     patch_latent_dim: int,
@@ -211,13 +213,15 @@ def build_spatial_ijepa_core(
     return SpatialIJEPACore(encoder, predictor, target_encoder, policy)
 
 
-def spatial_ijepa_loss(
+def spatial_ijepa_per_sample_loss(
     core: SpatialIJEPACore,
     patches: torch.Tensor,
     context_mask: torch.Tensor,
     target_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """``patches``: [B, num_patches, patch_dim]; masks are 1-D index tensors.
+    """Return one spatial I-JEPA loss value per frame in the batch.
+
+    ``patches``: [B, num_patches, patch_dim]; masks are 1-D index tensors.
 
     Target-side ``layer_norm`` over the feature dim and ``smooth_l1_loss`` are
     taken from upstream's src/train.py (forward_target / loss_fn).
@@ -234,7 +238,18 @@ def spatial_ijepa_loss(
     context_latents = core.context_encoder(context_patches)
     context_summary = context_latents.mean(dim=1)
     predicted = core.predictor(context_summary, target_mask)
-    return F.smooth_l1_loss(predicted, target_latents)
+    per_element = F.smooth_l1_loss(predicted, target_latents, reduction="none")
+    return per_element.mean(dim=(1, 2))
+
+
+def spatial_ijepa_loss(
+    core: SpatialIJEPACore,
+    patches: torch.Tensor,
+    context_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Mean spatial I-JEPA loss over the batch."""
+    return spatial_ijepa_per_sample_loss(core, patches, context_mask, target_mask).mean()
 
 
 @torch.no_grad()
@@ -249,16 +264,33 @@ def encode_frames_pooled(
     return core.context_encoder(patches).mean(dim=-2)
 
 
-def save_spatial_checkpoint(path: str | Path, core: SpatialIJEPACore, *, epoch: int) -> None:
+def save_spatial_checkpoint(
+    path: str | Path,
+    core: SpatialIJEPACore,
+    *,
+    epoch: int,
+    global_step: int | None = None,
+    optimizer: torch.optim.Optimizer | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    extra_state: Mapping[str, Any] | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "epoch": epoch,
+        "global_step": global_step,
+        "context_encoder": core.context_encoder.state_dict(),
+        "predictor": core.predictor.state_dict(),
+        "target_encoder": core.target_encoder.state_dict(),
+    }
+    if optimizer is not None:
+        payload["optimizer"] = optimizer.state_dict()
+    if metadata is not None:
+        payload["metadata"] = dict(metadata)
+    if extra_state is not None:
+        payload["extra_state"] = dict(extra_state)
     _atomic_torch_save(
         Path(path),
-        {
-            "schema_version": SCHEMA_VERSION,
-            "epoch": epoch,
-            "context_encoder": core.context_encoder.state_dict(),
-            "predictor": core.predictor.state_dict(),
-            "target_encoder": core.target_encoder.state_dict(),
-        },
+        payload,
     )
 
 

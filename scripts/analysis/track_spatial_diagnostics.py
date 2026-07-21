@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Watches /tmp/ijepa_spatial_checkpoints/ and runs the full held-out
-diagnostic suite on each checkpoint as training proceeds.
+"""Watch one spatial I-JEPA run directory and compute held-out diagnostics.
 
 The training script only reports train loss and effective_rank, which is not
 enough to tell "learned something" from "found a cheap low-rank solution". Per
@@ -23,6 +22,7 @@ training process; writes one JSON record per checkpoint.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import time
@@ -52,7 +52,7 @@ from jepa.configs.base import derive_seed  # noqa: E402
 from jepa.configs.images.shapes3d import (  # noqa: E402
     SHAPES3D_CONTEXT_FACTORS,
     SHAPES3D_FACTOR_SIZES,
-    load_shapes3d_config,
+    shapes3d_config_from_dict,
 )
 from jepa.data.images.shapes3d import (  # noqa: E402
     build_shapes3d_counterfactual_pairs,
@@ -67,14 +67,34 @@ from jepa.training.images.ijepa_spatial import (  # noqa: E402
     sample_masks,
     spatial_ijepa_loss,
 )
+from jepa.training.images.spatial_logging import SpatialRunLogger  # noqa: E402
 
-OUTPUT_DIR = Path(__file__).resolve().parents[2] / "outputs" / "ijepa_spatial"
-CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
-RECORDS_PATH = OUTPUT_DIR / "metrics" / "diagnostics.json"
+DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[2] / "outputs" / "ijepa_spatial"
 PATCH_SIZE = 8
 PATCH_LATENT_DIM = 16
 BATCH_SIZE = 128
 POLL_SECONDS = 15
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--run-dir",
+        required=True,
+        help=f"Spatial run directory under {DEFAULT_OUTPUT_ROOT} or an absolute path",
+    )
+    parser.add_argument("--checkpoint-pattern", default="epoch_*.pt")
+    parser.add_argument("--poll-seconds", type=float, default=POLL_SECONDS)
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--no-tensorboard", action="store_true")
+    return parser.parse_args()
+
+
+def _resolve_run_dir(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = DEFAULT_OUTPUT_ROOT / path
+    return path.resolve()
 
 
 def _context_class_labels(contexts: torch.Tensor, factor_index: int) -> torch.Tensor:
@@ -103,10 +123,17 @@ def _held_out_loss(core, test_patches, grid, mask_config, device) -> float:
 
 
 def main() -> None:
-    config = load_shapes3d_config(
-        "configs/images/shapes3d/quick.yaml",
-        overrides={"data.num_train_trajectories": "1000", "training.device": "cuda"},
-    )
+    args = _parse_args()
+    run_dir = _resolve_run_dir(args.run_dir)
+    checkpoint_dir = run_dir / "checkpoints"
+    records_path = run_dir / "metrics" / "diagnostics.json"
+    logger = SpatialRunLogger(run_dir, enable_tensorboard=not args.no_tensorboard)
+
+    run_config_path = run_dir / "config.json"
+    if not run_config_path.exists():
+        raise FileNotFoundError(f"missing run config: {run_config_path}")
+    run_config = json.loads(run_config_path.read_text())
+    config = shapes3d_config_from_dict(run_config["config"])
     datasets = build_shapes3d_dataset_splits(config.data)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -138,119 +165,145 @@ def main() -> None:
     ridge = config.evaluation.probe_ridge
     covariance_epsilon = config.evaluation.covariance_epsilon
 
-    RECORDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    records_path.parent.mkdir(parents=True, exist_ok=True)
     records: list[dict] = []
     seen: set[str] = set()
-    print(f"watching {CHECKPOINT_DIR}", flush=True)
-    while True:
-        if CHECKPOINT_DIR.exists():
-            for path in sorted(CHECKPOINT_DIR.glob("epoch_*.pt")):
-                if path.name in seen:
-                    continue
-                seen.add(path.name)
-                checkpoint = load_spatial_checkpoint(path)
-                core = build_spatial_ijepa_core(
-                    "cnn",
-                    patch_dim=patch_dim,
-                    patch_latent_dim=PATCH_LATENT_DIM,
-                    num_patches=num_patches,
-                )
-                core.context_encoder.load_state_dict(checkpoint["context_encoder"])
-                core.predictor.load_state_dict(checkpoint["predictor"])
-                core.target_encoder.load_state_dict(checkpoint["target_encoder"])
-                core.context_encoder.to(device).eval()
-                core.predictor.to(device).eval()
-                core.target_encoder.to(device).eval()
-
-                test_loss = _held_out_loss(core, test_patches, grid, mask_config, device)
-
-                train_z = encode_frames_pooled(core, train_frames, patch_size=PATCH_SIZE).cpu()
-                test_z = encode_frames_pooled(core, test_frames, patch_size=PATCH_SIZE).cpu()
-                spectrum = compute_latent_spectrum(test_z)
-
-                classifier = fit_entity_classifier(train_z, train_entity, num_entities, ridge=ridge)
-                entity_acc = classifier_accuracy(classifier, test_z, test_entity)
-                context_acc = {}
-                for index, factor in enumerate(SHAPES3D_CONTEXT_FACTORS):
-                    factor_classifier = fit_entity_classifier(
-                        train_z,
-                        _context_class_labels(train_context, index),
-                        SHAPES3D_FACTOR_SIZES[factor],
-                        ridge=ridge,
+    print(f"watching {checkpoint_dir}", flush=True)
+    try:
+        while True:
+            if checkpoint_dir.exists():
+                for path in sorted(checkpoint_dir.glob(args.checkpoint_pattern)):
+                    if path.name in seen:
+                        continue
+                    seen.add(path.name)
+                    checkpoint = load_spatial_checkpoint(path)
+                    core = build_spatial_ijepa_core(
+                        "cnn",
+                        patch_dim=patch_dim,
+                        patch_latent_dim=PATCH_LATENT_DIM,
+                        num_patches=num_patches,
                     )
-                    context_acc[factor] = classifier_accuracy(
-                        factor_classifier, test_z, _context_class_labels(test_context, index)
+                    core.context_encoder.load_state_dict(checkpoint["context_encoder"])
+                    core.predictor.load_state_dict(checkpoint["predictor"])
+                    core.target_encoder.load_state_dict(checkpoint["target_encoder"])
+                    core.context_encoder.to(device).eval()
+                    core.predictor.to(device).eval()
+                    core.target_encoder.to(device).eval()
+
+                    test_loss = _held_out_loss(core, test_patches, grid, mask_config, device)
+
+                    train_z = encode_frames_pooled(core, train_frames, patch_size=PATCH_SIZE).cpu()
+                    test_z = encode_frames_pooled(core, test_frames, patch_size=PATCH_SIZE).cpu()
+                    spectrum = compute_latent_spectrum(test_z)
+
+                    classifier = fit_entity_classifier(
+                        train_z, train_entity, num_entities, ridge=ridge
                     )
-                context_acc_mean = float(np.mean(list(context_acc.values())))
+                    entity_acc = classifier_accuracy(classifier, test_z, test_entity)
+                    context_acc = {}
+                    for index, factor in enumerate(SHAPES3D_CONTEXT_FACTORS):
+                        factor_classifier = fit_entity_classifier(
+                            train_z,
+                            _context_class_labels(train_context, index),
+                            SHAPES3D_FACTOR_SIZES[factor],
+                            ridge=ridge,
+                        )
+                        context_acc[factor] = classifier_accuracy(
+                            factor_classifier, test_z, _context_class_labels(test_context, index)
+                        )
+                    context_acc_mean = float(np.mean(list(context_acc.values())))
 
-                # LDA entity subspace, fit on train only.
-                scatter = compute_scatter_matrices(train_z, train_entity, num_entities)
-                eigen = solve_generalized_eigenproblem(scatter, epsilon=covariance_epsilon)
-                projection = entity_subspace_projection(eigen.eigenvectors, k_entity)
+                    # LDA entity subspace, fit on train only.
+                    scatter = compute_scatter_matrices(train_z, train_entity, num_entities)
+                    eigen = solve_generalized_eigenproblem(scatter, epsilon=covariance_epsilon)
+                    projection = entity_subspace_projection(eigen.eigenvectors, k_entity)
 
-                with torch.no_grad():
-                    same_1 = encode_frames_pooled(
-                        core, counterfactual.same_entity_x1, patch_size=PATCH_SIZE
-                    ).cpu()
-                    same_2 = encode_frames_pooled(
-                        core, counterfactual.same_entity_x2, patch_size=PATCH_SIZE
-                    ).cpu()
-                    diff_1 = encode_frames_pooled(
-                        core, counterfactual.diff_entity_x1, patch_size=PATCH_SIZE
-                    ).cpu()
-                    diff_2 = encode_frames_pooled(
-                        core, counterfactual.diff_entity_x2, patch_size=PATCH_SIZE
-                    ).cpu()
-                raw_inv = counterfactual_invariance(
-                    project(same_1, projection),
-                    project(same_2, projection),
-                    project(diff_1, projection),
-                    project(diff_2, projection),
-                )
-                whitening = fit_whitening(train_z)
-                scatter_w = compute_scatter_matrices(
-                    apply_whitening(whitening, train_z), train_entity, num_entities
-                )
-                eigen_w = solve_generalized_eigenproblem(scatter_w, epsilon=covariance_epsilon)
-                projection_w = entity_subspace_projection(eigen_w.eigenvectors, k_entity)
-                white_inv = counterfactual_invariance(
-                    project(apply_whitening(whitening, same_1), projection_w),
-                    project(apply_whitening(whitening, same_2), projection_w),
-                    project(apply_whitening(whitening, diff_1), projection_w),
-                    project(apply_whitening(whitening, diff_2), projection_w),
-                )
+                    with torch.no_grad():
+                        same_1 = encode_frames_pooled(
+                            core, counterfactual.same_entity_x1, patch_size=PATCH_SIZE
+                        ).cpu()
+                        same_2 = encode_frames_pooled(
+                            core, counterfactual.same_entity_x2, patch_size=PATCH_SIZE
+                        ).cpu()
+                        diff_1 = encode_frames_pooled(
+                            core, counterfactual.diff_entity_x1, patch_size=PATCH_SIZE
+                        ).cpu()
+                        diff_2 = encode_frames_pooled(
+                            core, counterfactual.diff_entity_x2, patch_size=PATCH_SIZE
+                        ).cpu()
+                    raw_inv = counterfactual_invariance(
+                        project(same_1, projection),
+                        project(same_2, projection),
+                        project(diff_1, projection),
+                        project(diff_2, projection),
+                    )
+                    whitening = fit_whitening(train_z)
+                    scatter_w = compute_scatter_matrices(
+                        apply_whitening(whitening, train_z), train_entity, num_entities
+                    )
+                    eigen_w = solve_generalized_eigenproblem(scatter_w, epsilon=covariance_epsilon)
+                    projection_w = entity_subspace_projection(eigen_w.eigenvectors, k_entity)
+                    white_inv = counterfactual_invariance(
+                        project(apply_whitening(whitening, same_1), projection_w),
+                        project(apply_whitening(whitening, same_2), projection_w),
+                        project(apply_whitening(whitening, diff_1), projection_w),
+                        project(apply_whitening(whitening, diff_2), projection_w),
+                    )
 
-                top_direction = torch.as_tensor(eigen.eigenvectors[:, 0])
-                mi = mutual_information_entity(
-                    test_z.to(torch.float64) @ top_direction, test_entity, num_entities
-                )
-                entropy = entity_label_entropy(test_entity, num_entities)
+                    top_direction = torch.as_tensor(eigen.eigenvectors[:, 0])
+                    mi = mutual_information_entity(
+                        test_z.to(torch.float64) @ top_direction, test_entity, num_entities
+                    )
+                    entropy = entity_label_entropy(test_entity, num_entities)
+                    step = int(checkpoint.get("global_step") or 0)
 
-                record = {
-                    "epoch": checkpoint["epoch"],
-                    "subspace_dim": k_entity,
-                    "test_loss": test_loss,
-                    "effective_rank": spectrum.effective_rank,
-                    "trace_covariance": spectrum.trace_covariance,
-                    "top_eigenvalues": spectrum.eigenvalues[:6].tolist(),
-                    "entity_accuracy": entity_acc,
-                    "context_accuracy": context_acc,
-                    "context_accuracy_mean": context_acc_mean,
-                    "raw_q_entity": raw_inv.q_entity,
-                    "white_q_entity": white_inv.q_entity,
-                    "mi_ratio": mi / entropy if entropy > 0 else float("nan"),
-                }
-                records.append(record)
-                RECORDS_PATH.write_text(json.dumps(records, indent=2))
-                print(
-                    f"epoch={record['epoch']:4d} test_loss={test_loss:9.5f} "
-                    f"eff_rank={spectrum.effective_rank:6.3f} "
-                    f"entity_acc={entity_acc:.3f} context_acc={context_acc_mean:.3f} "
-                    f"Q_E={raw_inv.q_entity:8.3f} Q_E_w={white_inv.q_entity:8.3f} "
-                    f"MI_ratio={record['mi_ratio']:.3f}",
-                    flush=True,
-                )
-        time.sleep(POLL_SECONDS)
+                    record = {
+                        "checkpoint": path.name,
+                        "epoch": checkpoint["epoch"],
+                        "global_step": step,
+                        "subspace_dim": k_entity,
+                        "test_loss": test_loss,
+                        "effective_rank": spectrum.effective_rank,
+                        "trace_covariance": spectrum.trace_covariance,
+                        "top_eigenvalues": spectrum.eigenvalues[:6].tolist(),
+                        "entity_accuracy": entity_acc,
+                        "context_accuracy": context_acc,
+                        "context_accuracy_mean": context_acc_mean,
+                        "raw_q_entity": raw_inv.q_entity,
+                        "white_q_entity": white_inv.q_entity,
+                        "mi_ratio": mi / entropy if entropy > 0 else float("nan"),
+                    }
+                    records.append(record)
+                    records_path.write_text(json.dumps(records, indent=2))
+                    logger.log(
+                        step=step,
+                        epoch=int(checkpoint["epoch"]),
+                        event="heldout_diagnostics",
+                        scalars={
+                            "diag/test_loss": test_loss,
+                            "diag/effective_rank": spectrum.effective_rank,
+                            "diag/trace_covariance": spectrum.trace_covariance,
+                            "diag/entity_accuracy": entity_acc,
+                            "diag/context_accuracy_mean": context_acc_mean,
+                            "diag/raw_q_entity": raw_inv.q_entity,
+                            "diag/white_q_entity": white_inv.q_entity,
+                            "diag/mi_ratio": record["mi_ratio"],
+                        },
+                        histograms={"hist/diag_eigenvalues": torch.as_tensor(spectrum.eigenvalues)},
+                    )
+                    print(
+                        f"checkpoint={path.name} epoch={record['epoch']:4d} "
+                        f"test_loss={test_loss:9.5f} eff_rank={spectrum.effective_rank:6.3f} "
+                        f"entity_acc={entity_acc:.3f} context_acc={context_acc_mean:.3f} "
+                        f"Q_E={raw_inv.q_entity:8.3f} Q_E_w={white_inv.q_entity:8.3f} "
+                        f"MI_ratio={record['mi_ratio']:.3f}",
+                        flush=True,
+                    )
+            if args.once:
+                break
+            time.sleep(args.poll_seconds)
+    finally:
+        logger.close()
 
 
 if __name__ == "__main__":
