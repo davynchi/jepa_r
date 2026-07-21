@@ -17,6 +17,44 @@ except ModuleNotFoundError:  # pragma: no cover - depends on optional local inst
     TensorBoardSummaryWriter = None
 
 
+_TENSORBOARD_SCALARS = {
+    "train/loss",
+    "train/lr",
+    "train/epoch_loss",
+    "train/epoch_seconds",
+    "train/elapsed_seconds",
+    "repr/effective_rank",
+    "repr/trace_covariance",
+    "repr/mean_latent_norm",
+    "repr/eig_mass_top_1",
+    "repr/eig_mass_top_4",
+    "repr/eig_mass_top_8",
+    "weighting/score_mean",
+    "weighting/score_std",
+    "weighting/prob_entropy_normalized",
+    "weighting/prob_max",
+    "weighting/effective_sample_size",
+    "weighting/top_10pct_mass",
+    "ras/richness_logdet",
+    "ras/grad_richness_norm",
+    "ras/positive_fraction",
+    "ras/negative_fraction",
+    "diag/test_loss",
+    "diag/entity_accuracy",
+    "diag/context_accuracy_mean",
+    "diag/raw_q_entity",
+    "diag/white_q_entity",
+    "diag/mi_ratio",
+}
+
+_TENSORBOARD_HISTOGRAMS = {
+    "hist/eigenvalues",
+    "hist/weighting_scores",
+    "hist/weighting_probabilities",
+    "hist/diag_eigenvalues",
+}
+
+
 class SpatialRunLogger:
     """Write durable JSONL metrics and optional TensorBoard summaries."""
 
@@ -54,10 +92,14 @@ class SpatialRunLogger:
         if self.writer is None:
             return
         for name, value in scalars.items():
+            if name not in _TENSORBOARD_SCALARS:
+                continue
             if value is None or isinstance(value, bool):
                 continue
             self.writer.add_scalar(name, float(value), step)
         for name, values in (histograms or {}).items():
+            if name not in _TENSORBOARD_HISTOGRAMS:
+                continue
             self.writer.add_histogram(name, values.detach().float().cpu(), step)
         self.writer.flush()
 

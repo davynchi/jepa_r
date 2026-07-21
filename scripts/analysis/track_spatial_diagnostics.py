@@ -56,7 +56,7 @@ from jepa.configs.images.shapes3d import (  # noqa: E402
 )
 from jepa.data.images.shapes3d import (  # noqa: E402
     build_shapes3d_counterfactual_pairs,
-    build_shapes3d_dataset_splits,
+    build_shapes3d_static_dataset_splits,
 )
 from jepa.models.patches import patchify  # noqa: E402
 from jepa.training.images.ijepa_spatial import (  # noqa: E402
@@ -134,17 +134,16 @@ def main() -> None:
         raise FileNotFoundError(f"missing run config: {run_config_path}")
     run_config = json.loads(run_config_path.read_text())
     config = shapes3d_config_from_dict(run_config["config"])
-    datasets = build_shapes3d_dataset_splits(config.data)
+    datasets = build_shapes3d_static_dataset_splits(config.data)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_frames = datasets.train.frames.reshape(-1, 3, 64, 64)
-    test_frames = datasets.test.frames.reshape(-1, 3, 64, 64)
-    train_entity = datasets.train.entities.reshape(-1)
-    test_entity = datasets.test.entities.reshape(-1)
+    train_frames = datasets.train.images
+    test_frames = datasets.test.images
+    train_entity = datasets.train.entities
+    test_entity = datasets.test.entities
     num_entities = config.data.num_entities
-    context_dim = config.data.context_dim
-    train_context = datasets.train.contexts.reshape(-1, context_dim)
-    test_context = datasets.test.contexts.reshape(-1, context_dim)
+    train_context = datasets.train.contexts
+    test_context = datasets.test.contexts
 
     test_patches = patchify(test_frames, PATCH_SIZE)
     grid = 64 // PATCH_SIZE

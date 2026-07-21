@@ -26,7 +26,7 @@ from jepa.configs.images.shapes3d import (  # noqa: E402
     load_shapes3d_config,
     shapes3d_config_to_dict,
 )
-from jepa.data.images.shapes3d import build_shapes3d_dataset_splits  # noqa: E402
+from jepa.data.images.shapes3d import build_shapes3d_static_dataset_splits  # noqa: E402
 from jepa.models.patches import patchify  # noqa: E402
 from jepa.training.core import ema_update  # noqa: E402
 from jepa.training.images.ijepa_spatial import (  # noqa: E402
@@ -78,7 +78,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--num-train-trajectories", type=int, default=1000)
+    parser.add_argument("--num-train-samples", type=int, default=16000)
+    parser.add_argument("--num-val-samples", type=int, default=1000)
+    parser.add_argument("--num-test-samples", type=int, default=1000)
     parser.add_argument("--eval-every-epochs", type=int, default=EVAL_EVERY_EPOCHS)
     parser.add_argument("--checkpoint-every-epochs", type=int, default=CHECKPOINT_EVERY_EPOCHS)
     parser.add_argument(
@@ -118,6 +120,7 @@ def _checkpoint_metadata(args: argparse.Namespace, run_dir: Path) -> dict[str, o
         "patch_latent_dim": PATCH_LATENT_DIM,
         "ema_decay": EMA_DECAY,
         "run_dir": str(run_dir),
+        "data_source": "static_shapes3d_images",
     }
 
 
@@ -155,7 +158,9 @@ def main() -> None:
     config = load_shapes3d_config(
         "configs/images/shapes3d/quick.yaml",
         overrides={
-            "data.num_train_trajectories": str(args.num_train_trajectories),
+            "data.num_train_samples": str(args.num_train_samples),
+            "data.num_val_samples": str(args.num_val_samples),
+            "data.num_test_samples": str(args.num_test_samples),
             "training.device": args.device,
         },
     )
@@ -171,6 +176,7 @@ def main() -> None:
                 "batch_size": args.batch_size,
                 "epochs": args.epochs,
                 "seed": args.seed,
+                "data_source": "static_shapes3d_images",
                 "eval_every_epochs": args.eval_every_epochs,
                 "checkpoint_every_epochs": args.checkpoint_every_epochs,
                 "checkpoint_every_steps": args.checkpoint_every_steps,
@@ -189,20 +195,18 @@ def main() -> None:
             },
         }
     )
-    datasets = build_shapes3d_dataset_splits(config.data)
+    datasets = build_shapes3d_static_dataset_splits(config.data)
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
 
-    # Frames are used as independent images here -- the temporal axis is
-    # flattened away, since this objective makes no use of it.
-    train_frames = datasets.train.frames.reshape(-1, 3, 64, 64)
-    test_frames = datasets.test.frames.reshape(-1, 3, 64, 64)
+    train_frames = datasets.train.images
+    test_frames = datasets.test.images
     train_patches = patchify(train_frames, PATCH_SIZE)
     grid = 64 // PATCH_SIZE
     num_patches = train_patches.shape[1]
     patch_dim = train_patches.shape[2]
     print(
         f"run_dir={run_dir}\n"
-        f"device={device} train_frames={train_frames.shape[0]} "
+        f"device={device} train_images={train_frames.shape[0]} "
         f"num_patches={num_patches} patch_dim={patch_dim}",
         flush=True,
     )
