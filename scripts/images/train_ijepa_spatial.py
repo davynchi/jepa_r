@@ -33,6 +33,7 @@ from jepa.training.images.ijepa_spatial import (  # noqa: E402
     MaskConfig,
     build_spatial_ijepa_core,
     encode_frames_pooled,
+    load_spatial_checkpoint,
     sample_masks,
     save_spatial_checkpoint,
     spatial_ijepa_loss,
@@ -91,6 +92,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--log-every-steps", type=int, default=LOG_EVERY_STEPS)
     parser.add_argument("--no-tensorboard", action="store_true")
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="Resume model, optimizer, global step, and weighting state from this checkpoint",
+    )
     parser.add_argument("--weighting-method", choices=("uniform", "loss", "ras"), default="uniform")
     parser.add_argument("--weighting-warmup-epochs", type=int, default=0)
     parser.add_argument("--weighting-update-every-epochs", type=int, default=1)
@@ -136,6 +142,36 @@ def _weighting_checkpoint_state(
     }
 
 
+def _restore_weighting_state(
+    checkpoint: dict[str, object],
+    *,
+    num_frames: int,
+) -> tuple[SpatialWeightingState, torch.Tensor]:
+    extra_state = checkpoint.get("extra_state")
+    if not isinstance(extra_state, dict):
+        raise ValueError("resume checkpoint is missing weighting extra_state")
+
+    memory = extra_state.get("weighting_memory")
+    probabilities = extra_state.get("weighting_probabilities")
+    last_scores = extra_state.get("weighting_last_scores")
+    ref_indices = extra_state.get("weighting_ref_indices")
+    if not all(isinstance(value, torch.Tensor) for value in (memory, probabilities, last_scores)):
+        raise ValueError("resume checkpoint has incomplete weighting tensors")
+    if not isinstance(ref_indices, torch.Tensor):
+        raise ValueError("resume checkpoint is missing weighting_ref_indices")
+    if memory.shape != (num_frames,) or probabilities.shape != (num_frames,):
+        raise ValueError("resume checkpoint weighting state does not match train set size")
+    if last_scores.shape != (num_frames,):
+        raise ValueError("resume checkpoint weighting scores do not match train set size")
+
+    state = SpatialWeightingState(
+        memory=memory.detach().cpu().to(torch.float64),
+        probabilities=probabilities.detach().cpu().to(torch.float64),
+        last_scores=last_scores.detach().cpu().to(torch.float64),
+    )
+    return state, ref_indices.detach().cpu().to(torch.long)
+
+
 @torch.no_grad()
 def _evaluate_spatial_loss(
     core,
@@ -173,7 +209,7 @@ def main() -> None:
     run_name = args.run_name or _default_run_name(args.seed)
     run_dir = Path(args.output_root).expanduser().resolve() / run_name
     checkpoint_dir = run_dir / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    checkpoint_dir.mkdir(parents=True, exist_ok=args.resume_from is not None)
     logger = SpatialRunLogger(run_dir, enable_tensorboard=not args.no_tensorboard)
     weighting_config = SpatialWeightingConfig(
         method=args.weighting_method,
@@ -268,8 +304,36 @@ def main() -> None:
         ref_size=weighting_config.ref_size,
         seed=derive_seed(args.seed, "weighting-ref"),
     )
+    start_epoch = 1
+    if args.resume_from is not None:
+        checkpoint_path = Path(args.resume_from).expanduser().resolve()
+        checkpoint = load_spatial_checkpoint(checkpoint_path)
+        completed_epoch = int(checkpoint["epoch"])
+        if completed_epoch >= args.epochs:
+            raise ValueError(
+                f"resume checkpoint is already at epoch {completed_epoch}, "
+                f"but --epochs is {args.epochs}"
+            )
+        core.context_encoder.load_state_dict(checkpoint["context_encoder"])
+        core.predictor.load_state_dict(checkpoint["predictor"])
+        core.target_encoder.load_state_dict(checkpoint["target_encoder"])
+        if "optimizer" not in checkpoint:
+            raise ValueError("resume checkpoint is missing optimizer state")
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        global_step = int(
+            checkpoint.get("global_step") or completed_epoch * max(n // args.batch_size, 1)
+        )
+        weighting_state, weighting_ref_indices = _restore_weighting_state(
+            checkpoint,
+            num_frames=n,
+        )
+        start_epoch = completed_epoch + 1
+        print(
+            f"resumed_from={checkpoint_path} start_epoch={start_epoch} global_step={global_step}",
+            flush=True,
+        )
     try:
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(start_epoch, args.epochs + 1):
             core.context_encoder.train()
             core.predictor.train()
             if weighting_config.method != "uniform" and epoch > weighting_config.warmup_epochs:
