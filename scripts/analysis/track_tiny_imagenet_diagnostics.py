@@ -127,7 +127,12 @@ def main() -> None:
 
     records_path.parent.mkdir(parents=True, exist_ok=True)
     records: list[dict] = []
-    seen: set[str] = set()
+    if records_path.exists():
+        loaded_records = json.loads(records_path.read_text())
+        if not isinstance(loaded_records, list):
+            raise ValueError(f"diagnostics records must be a list: {records_path}")
+        records = loaded_records
+    seen: set[str] = {str(record["checkpoint"]) for record in records if isinstance(record, dict)}
     print(f"watching {checkpoint_dir}", flush=True)
     try:
         while True:
