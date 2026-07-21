@@ -110,7 +110,15 @@ def _parse_args() -> argparse.Namespace:
         help="0 reuses --batch-size",
     )
     parser.add_argument("--weighting-ref-size", type=int, default=1024)
+    parser.add_argument(
+        "--weighting-richness",
+        choices=("logdet", "rbar", "pr"),
+        default="logdet",
+        help="Richness functional used by --weighting-method ras",
+    )
     parser.add_argument("--weighting-richness-delta", type=float, default=1.0e-4)
+    parser.add_argument("--weighting-richness-trace-target", type=float, default=1.0)
+    parser.add_argument("--weighting-richness-trace-beta", type=float, default=0.01)
     return parser.parse_args()
 
 
@@ -220,7 +228,10 @@ def main() -> None:
         uniform_mix=args.weighting_uniform_mix,
         score_batch_size=args.weighting_score_batch_size,
         ref_size=args.weighting_ref_size,
+        richness_functional=args.weighting_richness,
         richness_delta=args.weighting_richness_delta,
+        richness_trace_target=args.weighting_richness_trace_target,
+        richness_trace_beta=args.weighting_richness_trace_beta,
     )
 
     config = load_shapes3d_config(
@@ -258,7 +269,10 @@ def main() -> None:
                     "uniform_mix": weighting_config.uniform_mix,
                     "score_batch_size": weighting_config.score_batch_size,
                     "ref_size": weighting_config.ref_size,
+                    "richness_functional": weighting_config.richness_functional,
                     "richness_delta": weighting_config.richness_delta,
+                    "richness_trace_target": weighting_config.richness_trace_target,
+                    "richness_trace_beta": weighting_config.richness_trace_beta,
                 },
             },
         }
@@ -446,7 +460,10 @@ def main() -> None:
                         batch_size=score_batch_size,
                         seed=derive_seed(args.seed, "weighting", epoch),
                         device=device,
+                        richness_functional=weighting_config.richness_functional,
                         richness_delta=weighting_config.richness_delta,
+                        richness_trace_target=weighting_config.richness_trace_target,
+                        richness_trace_beta=weighting_config.richness_trace_beta,
                     )
                 else:
                     raise ValueError(f"unsupported weighting method: {weighting_config.method}")
