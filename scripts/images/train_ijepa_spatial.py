@@ -136,6 +136,38 @@ def _weighting_checkpoint_state(
     }
 
 
+@torch.no_grad()
+def _evaluate_spatial_loss(
+    core,
+    patches: torch.Tensor,
+    *,
+    grid: int,
+    mask_config: MaskConfig,
+    batch_size: int,
+    seed: int,
+    device: torch.device,
+) -> float:
+    core.context_encoder.eval()
+    core.predictor.eval()
+    core.target_encoder.eval()
+    generator = torch.Generator().manual_seed(seed)
+    total_loss = 0.0
+    total_examples = 0
+    for batch in patches.split(batch_size):
+        batch = batch.to(device)
+        context_masks, target_masks = sample_masks(grid, grid, mask_config, generator)
+        loss = torch.zeros((), device=device)
+        for context_mask in context_masks:
+            for target_mask in target_masks:
+                loss = loss + spatial_ijepa_loss(
+                    core, batch, context_mask.to(device), target_mask.to(device)
+                )
+        loss = loss / (len(context_masks) * len(target_masks))
+        total_loss += float(loss.item()) * batch.shape[0]
+        total_examples += batch.shape[0]
+    return total_loss / total_examples
+
+
 def main() -> None:
     args = _parse_args()
     run_name = args.run_name or _default_run_name(args.seed)
@@ -201,6 +233,7 @@ def main() -> None:
     train_frames = datasets.train.images
     test_frames = datasets.test.images
     train_patches = patchify(train_frames, PATCH_SIZE)
+    test_patches = patchify(test_frames, PATCH_SIZE)
     grid = 64 // PATCH_SIZE
     num_patches = train_patches.shape[1]
     patch_dim = train_patches.shape[2]
@@ -366,9 +399,19 @@ def main() -> None:
                 )
 
             if epoch % args.eval_every_epochs == 0 or epoch == 1:
+                test_loss = _evaluate_spatial_loss(
+                    core,
+                    test_patches,
+                    grid=grid,
+                    mask_config=mask_config,
+                    batch_size=args.batch_size,
+                    seed=derive_seed(args.seed, "eval-loss", epoch),
+                    device=device,
+                )
                 test_z = encode_frames_pooled(core, test_frames, patch_size=PATCH_SIZE)
                 spectrum = compute_latent_spectrum(test_z.reshape(-1, PATCH_LATENT_DIM))
                 scalars = {
+                    "eval/test_loss": test_loss,
                     "repr/effective_rank": spectrum.effective_rank,
                     "repr/trace_covariance": spectrum.trace_covariance,
                     "repr/mean_latent_norm": float(test_z.norm(dim=-1).mean().item()),
@@ -386,6 +429,7 @@ def main() -> None:
                 )
                 print(
                     f"epoch={epoch:4d} step={global_step:7d} loss={epoch_mean_loss:10.6f} "
+                    f"test_loss={test_loss:10.6f} "
                     f"effective_rank={spectrum.effective_rank:6.3f} "
                     f"trace_cov={spectrum.trace_covariance:9.4f} "
                     f"elapsed={time.time() - start:.0f}s",

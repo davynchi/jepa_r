@@ -23,6 +23,7 @@ _TENSORBOARD_SCALARS = {
     "train/epoch_loss",
     "train/epoch_seconds",
     "train/elapsed_seconds",
+    "eval/test_loss",
     "repr/effective_rank",
     "repr/trace_covariance",
     "repr/mean_latent_norm",
