@@ -12,6 +12,7 @@ dependencies = [
     "scipy>=1.11",
     "matplotlib>=3.8",
     "h5py>=3.10",
+    "pillow>=10.0",
 ]
 
 [project.scripts]

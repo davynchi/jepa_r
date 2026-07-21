@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,6 +28,10 @@ from jepa.configs.images.shapes3d import (  # noqa: E402
     shapes3d_config_to_dict,
 )
 from jepa.data.images.shapes3d import build_shapes3d_static_dataset_splits  # noqa: E402
+from jepa.data.images.tiny_imagenet import (  # noqa: E402
+    TinyImageNetDataConfig,
+    build_tiny_imagenet_static_dataset_splits,
+)
 from jepa.models.patches import patchify  # noqa: E402
 from jepa.training.core import ema_update  # noqa: E402
 from jepa.training.images.ijepa_spatial import (  # noqa: E402
@@ -79,6 +84,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dataset", choices=("shapes3d", "tiny-imagenet"), default="shapes3d")
+    parser.add_argument("--tiny-imagenet-root", default="data/tiny-imagenet-200")
     parser.add_argument("--num-train-samples", type=int, default=16000)
     parser.add_argument("--num-val-samples", type=int, default=1000)
     parser.add_argument("--num-test-samples", type=int, default=1000)
@@ -134,7 +141,8 @@ def _checkpoint_metadata(args: argparse.Namespace, run_dir: Path) -> dict[str, o
         "patch_latent_dim": PATCH_LATENT_DIM,
         "ema_decay": EMA_DECAY,
         "run_dir": str(run_dir),
-        "data_source": "static_shapes3d_images",
+        "dataset": args.dataset,
+        "data_source": f"static_{args.dataset}_images",
     }
 
 
@@ -234,18 +242,33 @@ def main() -> None:
         richness_trace_beta=args.weighting_richness_trace_beta,
     )
 
-    config = load_shapes3d_config(
-        "configs/images/shapes3d/quick.yaml",
-        overrides={
-            "data.num_train_samples": str(args.num_train_samples),
-            "data.num_val_samples": str(args.num_val_samples),
-            "data.num_test_samples": str(args.num_test_samples),
-            "training.device": args.device,
-        },
-    )
+    if args.dataset == "shapes3d":
+        config = load_shapes3d_config(
+            "configs/images/shapes3d/quick.yaml",
+            overrides={
+                "data.num_train_samples": str(args.num_train_samples),
+                "data.num_val_samples": str(args.num_val_samples),
+                "data.num_test_samples": str(args.num_test_samples),
+                "training.device": args.device,
+            },
+        )
+        datasets = build_shapes3d_static_dataset_splits(config.data)
+        config_payload: dict[str, object] = {"config": shapes3d_config_to_dict(config)}
+    elif args.dataset == "tiny-imagenet":
+        tiny_config = TinyImageNetDataConfig(
+            root=args.tiny_imagenet_root,
+            num_train_samples=args.num_train_samples,
+            num_val_samples=args.num_val_samples,
+            num_test_samples=args.num_test_samples,
+        )
+        datasets = build_tiny_imagenet_static_dataset_splits(tiny_config)
+        config_payload = {"tiny_imagenet": {"data": asdict(tiny_config)}}
+    else:
+        raise ValueError(f"unsupported dataset: {args.dataset!r}")
+
     logger.write_config(
         {
-            "config": shapes3d_config_to_dict(config),
+            **config_payload,
             "spatial": {
                 "architecture": ARCHITECTURE,
                 "patch_size": PATCH_SIZE,
@@ -255,7 +278,8 @@ def main() -> None:
                 "batch_size": args.batch_size,
                 "epochs": args.epochs,
                 "seed": args.seed,
-                "data_source": "static_shapes3d_images",
+                "dataset": args.dataset,
+                "data_source": f"static_{args.dataset}_images",
                 "eval_every_epochs": args.eval_every_epochs,
                 "checkpoint_every_epochs": args.checkpoint_every_epochs,
                 "checkpoint_every_steps": args.checkpoint_every_steps,
@@ -277,7 +301,6 @@ def main() -> None:
             },
         }
     )
-    datasets = build_shapes3d_static_dataset_splits(config.data)
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
 
     train_frames = datasets.train.images
@@ -289,7 +312,7 @@ def main() -> None:
     patch_dim = train_patches.shape[2]
     print(
         f"run_dir={run_dir}\n"
-        f"device={device} train_images={train_frames.shape[0]} "
+        f"dataset={args.dataset} device={device} train_images={train_frames.shape[0]} "
         f"num_patches={num_patches} patch_dim={patch_dim}",
         flush=True,
     )

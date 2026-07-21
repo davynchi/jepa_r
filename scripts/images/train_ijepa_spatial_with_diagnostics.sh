@@ -8,6 +8,7 @@ DIAGNOSTICS_TENSORBOARD="${DIAGNOSTICS_TENSORBOARD:-1}"
 
 RUN_NAME=""
 OUTPUT_ROOT="outputs/ijepa_spatial"
+DATASET="shapes3d"
 TRAIN_ARGS=("$@")
 
 while (($# > 0)); do
@@ -26,6 +27,14 @@ while (($# > 0)); do
       ;;
     --output-root=*)
       OUTPUT_ROOT="${1#--output-root=}"
+      shift
+      ;;
+    --dataset)
+      DATASET="${2:-}"
+      shift 2
+      ;;
+    --dataset=*)
+      DATASET="${1#--dataset=}"
       shift
       ;;
     *)
@@ -61,6 +70,13 @@ until [[ -f "$RUN_DIR/config.json" ]] || ! kill -0 "$TRAIN_PID" 2>/dev/null; do
 done
 
 if [[ ! -f "$RUN_DIR/config.json" ]]; then
+  wait "$TRAIN_PID"
+  exit $?
+fi
+
+if [[ "$DATASET" != "shapes3d" ]]; then
+  echo "diagnostics watcher is only implemented for shapes3d; training only for $DATASET" \
+    > "$DIAGNOSTICS_LOG"
   wait "$TRAIN_PID"
   exit $?
 fi
