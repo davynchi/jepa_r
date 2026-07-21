@@ -74,15 +74,22 @@ if [[ ! -f "$RUN_DIR/config.json" ]]; then
   exit $?
 fi
 
-if [[ "$DATASET" != "shapes3d" ]]; then
-  echo "diagnostics watcher is only implemented for shapes3d; training only for $DATASET" \
-    > "$DIAGNOSTICS_LOG"
-  wait "$TRAIN_PID"
-  exit $?
-fi
+case "$DATASET" in
+  shapes3d)
+    DIAGNOSTICS_SCRIPT="scripts/analysis/track_spatial_diagnostics.py"
+    ;;
+  tiny-imagenet)
+    DIAGNOSTICS_SCRIPT="scripts/analysis/track_tiny_imagenet_diagnostics.py"
+    ;;
+  *)
+    echo "error: no diagnostics watcher for dataset $DATASET" > "$DIAGNOSTICS_LOG"
+    wait "$TRAIN_PID"
+    exit $?
+    ;;
+esac
 
 DIAGNOSTICS_ARGS=(
-  scripts/analysis/track_spatial_diagnostics.py
+  "$DIAGNOSTICS_SCRIPT"
   --run-dir "$RUN_DIR"
   --poll-seconds "$DIAGNOSTICS_POLL_SECONDS"
   --device "$DIAGNOSTICS_DEVICE"

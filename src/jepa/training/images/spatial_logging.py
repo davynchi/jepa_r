@@ -47,6 +47,8 @@ _TENSORBOARD_SCALARS = {
     "ras/negative_fraction",
     "diag/test_loss",
     "diag/entity_accuracy",
+    "diag/class_accuracy",
+    "diag/class_top5_accuracy",
     "diag/context_accuracy_mean",
     "diag/raw_q_entity",
     "diag/white_q_entity",

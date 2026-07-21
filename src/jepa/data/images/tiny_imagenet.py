@@ -58,6 +58,22 @@ def _load_wnids(root: Path) -> list[str]:
     return sorted(path.name for path in train_root.iterdir() if path.is_dir())
 
 
+def _load_class_names(root: Path, wnids: list[str]) -> dict[str, str]:
+    names = {wnid: wnid for wnid in wnids}
+    words_path = root / "words.txt"
+    if not words_path.exists():
+        return names
+    wanted = set(wnids)
+    for line in words_path.read_text().splitlines():
+        fields = line.split("\t", maxsplit=1)
+        if len(fields) != 2:
+            continue
+        wnid, name = fields
+        if wnid in wanted:
+            names[wnid] = name
+    return names
+
+
 def _read_image(path: Path) -> torch.Tensor:
     with Image.open(path) as image:
         image = image.convert("RGB")
@@ -124,6 +140,7 @@ class TinyImageNetStaticImageDataset(Dataset):
                 f"Tiny ImageNet root not found at {root}. Expected tiny-imagenet-200/"
             )
         wnids = _load_wnids(root)
+        class_names = _load_class_names(root, wnids)
         class_to_index = {wnid: index for index, wnid in enumerate(wnids)}
         items = (
             _train_items(root, class_to_index)
@@ -137,6 +154,8 @@ class TinyImageNetStaticImageDataset(Dataset):
         selected = [items[int(index)] for index in indices]
 
         self.paths = [path for path, _ in selected]
+        self.wnids = tuple(wnids)
+        self.class_names = tuple(class_names[wnid] for wnid in wnids)
         self.entities = torch.tensor([label for _, label in selected], dtype=torch.long)
         self.contexts = torch.empty(len(selected), 0)
         self.images = torch.stack([_read_image(path) for path in self.paths])

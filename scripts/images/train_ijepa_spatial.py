@@ -262,7 +262,17 @@ def main() -> None:
             num_test_samples=args.num_test_samples,
         )
         datasets = build_tiny_imagenet_static_dataset_splits(tiny_config)
-        config_payload = {"tiny_imagenet": {"data": asdict(tiny_config)}}
+        config_payload = {
+            "tiny_imagenet": {
+                "data": asdict(tiny_config),
+                "classes": [
+                    {"index": index, "wnid": wnid, "name": name}
+                    for index, (wnid, name) in enumerate(
+                        zip(datasets.train.wnids, datasets.train.class_names, strict=True)
+                    )
+                ],
+            }
+        }
     else:
         raise ValueError(f"unsupported dataset: {args.dataset!r}")
 
