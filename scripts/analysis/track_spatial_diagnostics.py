@@ -139,6 +139,7 @@ def main() -> None:
     if not run_config_path.exists():
         raise FileNotFoundError(f"missing run config: {run_config_path}")
     run_config = json.loads(run_config_path.read_text())
+    architecture = run_config.get("spatial", {}).get("architecture", "cnn")
     config = shapes3d_config_from_dict(run_config["config"])
     datasets = build_shapes3d_static_dataset_splits(config.data)
     if args.device == "auto":
@@ -191,7 +192,7 @@ def main() -> None:
                     seen.add(path.name)
                     checkpoint = load_spatial_checkpoint(path)
                     core = build_spatial_ijepa_core(
-                        "cnn",
+                        architecture,
                         patch_dim=patch_dim,
                         patch_latent_dim=PATCH_LATENT_DIM,
                         num_patches=num_patches,

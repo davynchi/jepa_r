@@ -89,6 +89,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--architecture",
+        choices=("cnn", "resnet"),
+        default=ARCHITECTURE,
+        help="Patch encoder architecture. resnet is randomly initialized, not pretrained.",
+    )
     parser.add_argument("--dataset", choices=("shapes3d", "tiny-imagenet"), default="shapes3d")
     parser.add_argument("--tiny-imagenet-root", default="data/tiny-imagenet-200")
     parser.add_argument("--num-train-samples", type=int, default=16000)
@@ -153,12 +159,12 @@ def _parse_args() -> argparse.Namespace:
 
 def _default_run_name(seed: int) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return f"spatial_ijepa_cnn_seed{seed}_{stamp}"
+    return f"spatial_ijepa_seed{seed}_{stamp}"
 
 
 def _checkpoint_metadata(args: argparse.Namespace, run_dir: Path) -> dict[str, object]:
     return {
-        "architecture": ARCHITECTURE,
+        "architecture": args.architecture,
         "patch_size": PATCH_SIZE,
         "patch_latent_dim": PATCH_LATENT_DIM,
         "ema_decay": EMA_DECAY,
@@ -335,7 +341,7 @@ def main() -> None:
         {
             **config_payload,
             "spatial": {
-                "architecture": ARCHITECTURE,
+                "architecture": args.architecture,
                 "patch_size": PATCH_SIZE,
                 "patch_latent_dim": PATCH_LATENT_DIM,
                 "learning_rate": args.lr,
@@ -403,14 +409,15 @@ def main() -> None:
             )
     print(
         f"run_dir={run_dir}\n"
-        f"dataset={args.dataset} device={device} train_images={train_frames.shape[0]} "
+        f"dataset={args.dataset} architecture={args.architecture} device={device} "
+        f"train_images={train_frames.shape[0]} "
         f"num_patches={num_patches} patch_dim={patch_dim}",
         flush=True,
     )
 
     torch.manual_seed(args.seed)
     core = build_spatial_ijepa_core(
-        ARCHITECTURE,
+        args.architecture,
         patch_dim=patch_dim,
         patch_latent_dim=PATCH_LATENT_DIM,
         num_patches=num_patches,
