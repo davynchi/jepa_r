@@ -413,7 +413,9 @@ def score_frames_by_loss(
     mask_generator = torch.Generator().manual_seed(derive_seed(seed, "weighting-loss-masks"))
     try:
         with torch.no_grad():
-            for indices in torch.arange(train_patches.shape[0]).split(batch_size):
+            for indices in torch.arange(train_patches.shape[0], device=train_patches.device).split(
+                batch_size
+            ):
                 batch = train_patches[indices].to(device)
                 context_masks, target_masks = sample_masks(grid, grid, mask_config, mask_generator)
                 batch_losses = torch.zeros(batch.shape[0], device=device)
@@ -423,7 +425,7 @@ def score_frames_by_loss(
                             core, batch, context_mask.to(device), target_mask.to(device)
                         )
                 batch_losses = batch_losses / (len(context_masks) * len(target_masks))
-                scores[indices] = batch_losses.detach().cpu().to(torch.float64)
+                scores[indices.detach().cpu()] = batch_losses.detach().cpu().to(torch.float64)
     finally:
         core.context_encoder.train(context_was_training)
         core.predictor.train(predictor_was_training)
@@ -462,7 +464,7 @@ def score_frames_by_ras(
     scores = torch.empty(train_patches.shape[0], dtype=torch.float64)
     mask_generator = torch.Generator().manual_seed(derive_seed(seed, "weighting-ras-masks"))
     try:
-        ref_patches = train_patches[ref_indices].to(device)
+        ref_patches = train_patches[ref_indices.to(train_patches.device)].to(device)
         richness, richness_metadata = richness_from_patches(
             core,
             ref_patches,
@@ -480,7 +482,9 @@ def score_frames_by_ras(
             )
         )
 
-        for indices in torch.arange(train_patches.shape[0]).split(batch_size):
+        for indices in torch.arange(train_patches.shape[0], device=train_patches.device).split(
+            batch_size
+        ):
             batch = train_patches[indices].to(device)
             context_masks, target_masks = sample_masks(grid, grid, mask_config, mask_generator)
             batch_scores = torch.empty(batch.shape[0], dtype=torch.float64)
@@ -505,7 +509,7 @@ def score_frames_by_ras(
                 batch_scores[local_index] = float(
                     (-_dot_gradients(loss_gradients, richness_gradients)).detach().cpu().item()
                 )
-            scores[indices] = batch_scores
+            scores[indices.detach().cpu()] = batch_scores
     finally:
         core.context_encoder.train(context_was_training)
         core.predictor.train(predictor_was_training)
@@ -552,7 +556,7 @@ def score_frames_by_coordinate_importance(
     scores = torch.empty(train_patches.shape[0], dtype=torch.float64)
     mask_generator = torch.Generator().manual_seed(derive_seed(seed, "weighting-coord-masks"))
     try:
-        ref_patches = train_patches[ref_indices].to(device)
+        ref_patches = train_patches[ref_indices.to(train_patches.device)].to(device)
         ref_latents = core.context_encoder(ref_patches).mean(dim=1)
         if coordinate_importance == "covariance":
             coord_weights, basis, coord_metadata = _coordinate_importance_from_covariance(
@@ -599,7 +603,9 @@ def score_frames_by_coordinate_importance(
             )
         )
 
-        for indices in torch.arange(train_patches.shape[0]).split(batch_size):
+        for indices in torch.arange(train_patches.shape[0], device=train_patches.device).split(
+            batch_size
+        ):
             batch = train_patches[indices].to(device)
             context_masks, target_masks = sample_masks(grid, grid, mask_config, mask_generator)
             batch_scores = torch.empty(batch.shape[0], dtype=torch.float64)
@@ -633,7 +639,7 @@ def score_frames_by_coordinate_importance(
                 batch_scores[local_index] = float(
                     (coord_weights * impacts.abs()).sum().detach().cpu().item()
                 )
-            scores[indices] = batch_scores
+            scores[indices.detach().cpu()] = batch_scores
     finally:
         core.context_encoder.train(context_was_training)
         core.predictor.train(predictor_was_training)

@@ -105,6 +105,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every-steps", type=int, default=LOG_EVERY_STEPS)
     parser.add_argument("--no-tensorboard", action="store_true")
     parser.add_argument(
+        "--resident-device-data",
+        action="store_true",
+        help="Keep patch tensors on the training device to reduce CPU/GPU transfer overhead",
+    )
+    parser.add_argument(
         "--resume-from",
         default=None,
         help="Resume model, optimizer, global step, and weighting state from this checkpoint",
@@ -252,6 +257,21 @@ def _evaluate_spatial_loss(
     return total_loss / total_examples
 
 
+@torch.no_grad()
+def _encode_patches_pooled(
+    core,
+    patches: torch.Tensor,
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    core.context_encoder.eval()
+    encoded = []
+    for batch in patches.split(batch_size):
+        encoded.append(core.context_encoder(batch.to(device)).mean(dim=-2).detach().cpu())
+    return torch.cat(encoded, dim=0)
+
+
 def main() -> None:
     args = _parse_args()
     run_name = args.run_name or _default_run_name(args.seed)
@@ -329,6 +349,7 @@ def main() -> None:
                 "checkpoint_every_epochs": args.checkpoint_every_epochs,
                 "checkpoint_every_steps": args.checkpoint_every_steps,
                 "log_every_steps": args.log_every_steps,
+                "resident_device_data": args.resident_device_data,
                 "weighting": {
                     "method": weighting_config.method,
                     "warmup_epochs": weighting_config.warmup_epochs,
@@ -372,6 +393,14 @@ def main() -> None:
     grid = 64 // PATCH_SIZE
     num_patches = train_patches.shape[1]
     patch_dim = train_patches.shape[2]
+    if args.resident_device_data:
+        train_patches = train_patches.to(device)
+        test_patches = test_patches.to(device)
+        if transform_pair_patches is not None:
+            transform_pair_patches = (
+                transform_pair_patches[0].to(device),
+                transform_pair_patches[1].to(device),
+            )
     print(
         f"run_dir={run_dir}\n"
         f"dataset={args.dataset} device={device} train_images={train_frames.shape[0]} "
@@ -446,6 +475,8 @@ def main() -> None:
                     n,
                     generator=torch.Generator().manual_seed(derive_seed(args.seed, "order", epoch)),
                 )
+            if args.resident_device_data:
+                order = order.to(device)
             batch_chunks = order.split(args.batch_size)
             mask_generator = torch.Generator().manual_seed(derive_seed(args.seed, "masks", epoch))
             epoch_loss, batches = 0.0, 0
@@ -601,7 +632,15 @@ def main() -> None:
                     seed=derive_seed(args.seed, "eval-loss", epoch),
                     device=device,
                 )
-                test_z = encode_frames_pooled(core, test_frames, patch_size=PATCH_SIZE)
+                if args.resident_device_data:
+                    test_z = _encode_patches_pooled(
+                        core,
+                        test_patches,
+                        batch_size=args.batch_size,
+                        device=device,
+                    )
+                else:
+                    test_z = encode_frames_pooled(core, test_frames, patch_size=PATCH_SIZE)
                 spectrum = compute_latent_spectrum(test_z.reshape(-1, PATCH_LATENT_DIM))
                 scalars = {
                     "eval/test_loss": test_loss,

@@ -96,6 +96,11 @@ def _sample_indices(count: int, sample_count: int, *, seed: int) -> torch.Tensor
     return torch.cat([order, extra])
 
 
+def _selected_cache_path(root: Path, split: Split, *, sample_count: int, seed: int) -> Path:
+    cache_dir = root / ".jepa_cache"
+    return cache_dir / f"{split}_n{sample_count}_seed{seed}.pt"
+
+
 def _train_items(root: Path, class_to_index: dict[str, int]) -> list[tuple[Path, int]]:
     items: list[tuple[Path, int]] = []
     for wnid, class_index in class_to_index.items():
@@ -156,9 +161,19 @@ class TinyImageNetStaticImageDataset(Dataset):
         self.paths = [path for path, _ in selected]
         self.wnids = tuple(wnids)
         self.class_names = tuple(class_names[wnid] for wnid in wnids)
-        self.entities = torch.tensor([label for _, label in selected], dtype=torch.long)
         self.contexts = torch.empty(len(selected), 0)
-        self.images = torch.stack([_read_image(path) for path in self.paths])
+        cache_path = _selected_cache_path(root, split, sample_count=sample_count, seed=seed)
+        if cache_path.exists():
+            cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+            self.entities = cached["entities"].to(torch.long)
+            self.images = cached["images"].to(torch.float32)
+        else:
+            self.entities = torch.tensor([label for _, label in selected], dtype=torch.long)
+            self.images = torch.stack([_read_image(path) for path in self.paths])
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_suffix(".pt.tmp")
+            torch.save({"entities": self.entities, "images": self.images}, tmp_path)
+            tmp_path.replace(cache_path)
         self.observations = self.images.reshape(len(selected), -1)
 
     def __len__(self) -> int:
