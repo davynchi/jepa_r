@@ -15,7 +15,7 @@ import time
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -281,7 +281,7 @@ class _OptionalWeightedMean:
 
 
 def _utc_now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _resolve_device(name: str) -> torch.device:

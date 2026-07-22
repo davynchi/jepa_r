@@ -1,0 +1,39 @@
+name: jepa-shapes3d-smoke
+desc: Spatial I-JEPA smoke run on Shapes3D
+
+cmd: >
+  python scripts/images/train_ijepa_spatial.py
+  --run-name cloud_smoke_uniform
+  --epochs 2
+  --batch-size 32
+  --device cuda
+  --dataset shapes3d
+  --num-train-samples 256
+  --num-val-samples 64
+  --num-test-samples 64
+  --eval-every-epochs 1
+  --checkpoint-every-epochs 1
+  --no-tensorboard
+  --weighting-method uniform
+
+env:
+  python:
+    type: manual
+    version: "3.10"
+    requirements-file: requirements-datasphere.txt
+    local-paths:
+      - scripts
+      - src
+      - configs
+
+inputs:
+  - requirements-datasphere.txt
+  - pyproject.toml
+  - data/3dshapes.h5
+
+outputs:
+  - outputs
+
+cloud-instance-types:
+  - g1.1
+  - gt4.1

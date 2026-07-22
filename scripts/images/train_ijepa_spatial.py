@@ -14,7 +14,7 @@ import argparse
 import sys
 import time
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
@@ -147,7 +147,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _default_run_name(seed: int) -> str:
-    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"spatial_ijepa_cnn_seed{seed}_{stamp}"
 
 
