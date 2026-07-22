@@ -27,7 +27,10 @@ from jepa.configs.images.shapes3d import (  # noqa: E402
     load_shapes3d_config,
     shapes3d_config_to_dict,
 )
-from jepa.data.images.shapes3d import build_shapes3d_static_dataset_splits  # noqa: E402
+from jepa.data.images.shapes3d import (  # noqa: E402
+    build_shapes3d_counterfactual_pairs,
+    build_shapes3d_static_dataset_splits,
+)
 from jepa.data.images.tiny_imagenet import (  # noqa: E402
     TinyImageNetDataConfig,
     build_tiny_imagenet_static_dataset_splits,
@@ -49,9 +52,11 @@ from jepa.training.images.spatial_curriculum import (  # noqa: E402
     init_spatial_weighting,
     sample_frame_indices,
     score_frames_by_loss,
+    score_frames_by_coordinate_importance,
     score_frames_by_ras,
     select_reference_indices,
     should_update_weights,
+    update_coordinate_weighting_state,
     update_spatial_weights,
     weighting_diagnostics,
 )
@@ -104,7 +109,11 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Resume model, optimizer, global step, and weighting state from this checkpoint",
     )
-    parser.add_argument("--weighting-method", choices=("uniform", "loss", "ras"), default="uniform")
+    parser.add_argument(
+        "--weighting-method",
+        choices=("uniform", "loss", "ras", "coord"),
+        default="uniform",
+    )
     parser.add_argument("--weighting-warmup-epochs", type=int, default=0)
     parser.add_argument("--weighting-update-every-epochs", type=int, default=1)
     parser.add_argument("--weighting-temperature", type=float, default=1.0)
@@ -126,6 +135,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--weighting-richness-delta", type=float, default=1.0e-4)
     parser.add_argument("--weighting-richness-trace-target", type=float, default=1.0)
     parser.add_argument("--weighting-richness-trace-beta", type=float, default=0.01)
+    parser.add_argument(
+        "--coordinate-importance",
+        choices=("covariance", "transformation", "dynamics"),
+        default="covariance",
+        help="Coordinate importance estimator used by --weighting-method coord",
+    )
+    parser.add_argument("--coordinate-ema-beta", type=float, default=0.1)
+    parser.add_argument("--coordinate-delta", type=float, default=1.0e-6)
     return parser.parse_args()
 
 
@@ -155,6 +172,8 @@ def _weighting_checkpoint_state(
         "weighting_probabilities": weighting_state.probabilities,
         "weighting_last_scores": weighting_state.last_scores,
         "weighting_ref_indices": ref_indices,
+        "coordinate_importance": weighting_state.coordinate_importance,
+        "coordinate_previous_ref_latents": weighting_state.coordinate_previous_ref_latents,
     }
 
 
@@ -180,10 +199,23 @@ def _restore_weighting_state(
     if last_scores.shape != (num_frames,):
         raise ValueError("resume checkpoint weighting scores do not match train set size")
 
+    coordinate_importance = extra_state.get("coordinate_importance")
+    coordinate_previous_ref_latents = extra_state.get("coordinate_previous_ref_latents")
+    if isinstance(coordinate_importance, torch.Tensor):
+        coordinate_importance = coordinate_importance.detach().cpu().to(torch.float64)
+    else:
+        coordinate_importance = None
+    if isinstance(coordinate_previous_ref_latents, torch.Tensor):
+        coordinate_previous_ref_latents = coordinate_previous_ref_latents.detach().cpu().to(torch.float64)
+    else:
+        coordinate_previous_ref_latents = None
+
     state = SpatialWeightingState(
         memory=memory.detach().cpu().to(torch.float64),
         probabilities=probabilities.detach().cpu().to(torch.float64),
         last_scores=last_scores.detach().cpu().to(torch.float64),
+        coordinate_importance=coordinate_importance,
+        coordinate_previous_ref_latents=coordinate_previous_ref_latents,
     )
     return state, ref_indices.detach().cpu().to(torch.long)
 
@@ -240,6 +272,9 @@ def main() -> None:
         richness_delta=args.weighting_richness_delta,
         richness_trace_target=args.weighting_richness_trace_target,
         richness_trace_beta=args.weighting_richness_trace_beta,
+        coordinate_importance=args.coordinate_importance,
+        coordinate_ema_beta=args.coordinate_ema_beta,
+        coordinate_delta=args.coordinate_delta,
     )
 
     if args.dataset == "shapes3d":
@@ -307,6 +342,9 @@ def main() -> None:
                     "richness_delta": weighting_config.richness_delta,
                     "richness_trace_target": weighting_config.richness_trace_target,
                     "richness_trace_beta": weighting_config.richness_trace_beta,
+                    "coordinate_importance": weighting_config.coordinate_importance,
+                    "coordinate_ema_beta": weighting_config.coordinate_ema_beta,
+                    "coordinate_delta": weighting_config.coordinate_delta,
                 },
             },
         }
@@ -317,6 +355,20 @@ def main() -> None:
     test_frames = datasets.test.images
     train_patches = patchify(train_frames, PATCH_SIZE)
     test_patches = patchify(test_frames, PATCH_SIZE)
+    transform_pair_patches: tuple[torch.Tensor, torch.Tensor] | None = None
+    if weighting_config.method == "coord" and weighting_config.coordinate_importance == "transformation":
+        if args.dataset != "shapes3d":
+            raise ValueError("transformation coordinate importance is currently Shapes3D-only")
+        pairs = build_shapes3d_counterfactual_pairs(
+            config.data,
+            datasets.train.source,
+            num_pairs=weighting_config.ref_size,
+            seed=derive_seed(args.seed, "coordinate-transform-pairs"),
+        )
+        transform_pair_patches = (
+            patchify(pairs.same_entity_x1, PATCH_SIZE),
+            patchify(pairs.same_entity_x2, PATCH_SIZE),
+        )
     grid = 64 // PATCH_SIZE
     num_patches = train_patches.shape[1]
     patch_dim = train_patches.shape[2]
@@ -498,9 +550,36 @@ def main() -> None:
                         richness_trace_target=weighting_config.richness_trace_target,
                         richness_trace_beta=weighting_config.richness_trace_beta,
                     )
+                elif weighting_config.method == "coord":
+                    (
+                        scores,
+                        score_metadata,
+                        coordinate_importance,
+                        coordinate_previous_ref_latents,
+                    ) = score_frames_by_coordinate_importance(
+                        core,
+                        train_patches,
+                        ref_indices=weighting_ref_indices,
+                        state=weighting_state,
+                        grid=grid,
+                        mask_config=mask_config,
+                        batch_size=score_batch_size,
+                        seed=derive_seed(args.seed, "weighting", epoch),
+                        device=device,
+                        coordinate_importance=weighting_config.coordinate_importance,
+                        coordinate_ema_beta=weighting_config.coordinate_ema_beta,
+                        coordinate_delta=weighting_config.coordinate_delta,
+                        transform_pair_patches=transform_pair_patches,
+                    )
                 else:
                     raise ValueError(f"unsupported weighting method: {weighting_config.method}")
                 weighting_state = update_spatial_weights(weighting_state, scores, weighting_config)
+                if weighting_config.method == "coord":
+                    weighting_state = update_coordinate_weighting_state(
+                        weighting_state,
+                        coordinate_importance=coordinate_importance,
+                        previous_ref_latents=coordinate_previous_ref_latents,
+                    )
                 logger.log(
                     step=global_step,
                     epoch=epoch,

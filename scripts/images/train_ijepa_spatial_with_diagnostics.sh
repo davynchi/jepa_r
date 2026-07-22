@@ -48,7 +48,14 @@ if [[ -z "$RUN_NAME" ]]; then
   exit 2
 fi
 
-RUN_DIR="$OUTPUT_ROOT/$RUN_NAME"
+case "$OUTPUT_ROOT" in
+  /*)
+    RUN_DIR="$OUTPUT_ROOT/$RUN_NAME"
+    ;;
+  *)
+    RUN_DIR="$(pwd -P)/$OUTPUT_ROOT/$RUN_NAME"
+    ;;
+esac
 TRAIN_LOG="$RUN_DIR/train.log"
 DIAGNOSTICS_LOG="$RUN_DIR/diagnostics_watcher.log"
 

@@ -15,8 +15,9 @@ from jepa.training.images.ijepa_spatial import (
     spatial_ijepa_per_sample_loss,
 )
 
-SpatialWeightingMethod = Literal["uniform", "loss", "ras"]
+SpatialWeightingMethod = Literal["uniform", "loss", "ras", "coord"]
 SpatialRichnessFunctional = Literal["logdet", "rbar", "pr"]
+CoordinateImportanceMethod = Literal["covariance", "transformation", "dynamics"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,9 @@ class SpatialWeightingConfig:
     richness_delta: float = 1.0e-4
     richness_trace_target: float = 1.0
     richness_trace_beta: float = 0.01
+    coordinate_importance: CoordinateImportanceMethod = "covariance"
+    coordinate_ema_beta: float = 0.1
+    coordinate_delta: float = 1.0e-6
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +44,8 @@ class SpatialWeightingState:
     memory: torch.Tensor
     probabilities: torch.Tensor
     last_scores: torch.Tensor
+    coordinate_importance: torch.Tensor | None = None
+    coordinate_previous_ref_latents: torch.Tensor | None = None
 
 
 def init_spatial_weighting(num_frames: int) -> SpatialWeightingState:
@@ -54,7 +60,7 @@ def init_spatial_weighting(num_frames: int) -> SpatialWeightingState:
 
 
 def _validate_config(config: SpatialWeightingConfig) -> None:
-    if config.method not in {"uniform", "loss", "ras"}:
+    if config.method not in {"uniform", "loss", "ras", "coord"}:
         raise ValueError(f"unknown spatial weighting method: {config.method!r}")
     if config.warmup_epochs < 0:
         raise ValueError("warmup_epochs must be non-negative")
@@ -78,6 +84,12 @@ def _validate_config(config: SpatialWeightingConfig) -> None:
         raise ValueError("richness_trace_target must be positive")
     if config.richness_trace_beta < 0:
         raise ValueError("richness_trace_beta must be non-negative")
+    if config.coordinate_importance not in {"covariance", "transformation", "dynamics"}:
+        raise ValueError(f"unknown coordinate importance: {config.coordinate_importance!r}")
+    if not 0 <= config.coordinate_ema_beta <= 1:
+        raise ValueError("coordinate_ema_beta must be in [0, 1]")
+    if config.coordinate_delta <= 0:
+        raise ValueError("coordinate_delta must be positive")
 
 
 def should_update_weights(epoch: int, config: SpatialWeightingConfig) -> bool:
@@ -132,7 +144,28 @@ def update_spatial_weights(
         uniform = torch.full_like(probabilities, 1.0 / probabilities.numel())
         probabilities = (1.0 - config.uniform_mix) * probabilities + config.uniform_mix * uniform
     probabilities = probabilities / probabilities.sum()
-    return SpatialWeightingState(memory=memory, probabilities=probabilities, last_scores=scores64)
+    return SpatialWeightingState(
+        memory=memory,
+        probabilities=probabilities,
+        last_scores=scores64,
+        coordinate_importance=state.coordinate_importance,
+        coordinate_previous_ref_latents=state.coordinate_previous_ref_latents,
+    )
+
+
+def update_coordinate_weighting_state(
+    state: SpatialWeightingState,
+    *,
+    coordinate_importance: torch.Tensor,
+    previous_ref_latents: torch.Tensor,
+) -> SpatialWeightingState:
+    return SpatialWeightingState(
+        memory=state.memory,
+        probabilities=state.probabilities,
+        last_scores=state.last_scores,
+        coordinate_importance=coordinate_importance.detach().cpu().to(torch.float64),
+        coordinate_previous_ref_latents=previous_ref_latents.detach().cpu().to(torch.float64),
+    )
 
 
 def weighting_diagnostics(state: SpatialWeightingState) -> dict[str, float]:
@@ -229,6 +262,114 @@ def richness_from_patches(
         "ras/richness_top_eigenvalue": float(eigenvalues[-1].detach().cpu().item()),
     }
     return richness, metadata
+
+
+def _normalize_coordinate_importance(weights: torch.Tensor, *, delta: float) -> torch.Tensor:
+    weights = weights.detach().to(torch.float64).clamp_min(0)
+    mean = weights.mean().clamp_min(delta)
+    weights = weights / mean
+    return weights.clamp_min(delta)
+
+
+def _coordinate_importance_from_covariance(
+    latents: torch.Tensor,
+    *,
+    delta: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    latents64 = latents.detach().to(torch.float64)
+    centered = latents64 - latents64.mean(dim=0, keepdim=True)
+    covariance = centered.T @ centered / max(latents64.shape[0] - 1, 1)
+    covariance = (covariance + covariance.T) / 2
+    eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+    eigenvalues = eigenvalues.clamp_min(0)
+    weights = _normalize_coordinate_importance(eigenvalues / eigenvalues.sum().clamp_min(delta), delta=delta)
+    metadata = {
+        "coord/importance_min": float(weights.min().item()),
+        "coord/importance_max": float(weights.max().item()),
+        "coord/importance_std": float(weights.std(unbiased=False).item()),
+        "coord/covariance_top_eigenvalue": float(eigenvalues[-1].item()),
+        "coord/covariance_trace": float(eigenvalues.sum().item()),
+    }
+    return weights, eigenvectors, metadata
+
+
+def _coordinate_importance_from_transformation(
+    source_latents: torch.Tensor,
+    target_latents: torch.Tensor,
+    *,
+    delta: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    source64 = source_latents.detach().to(torch.float64)
+    target64 = target_latents.detach().to(torch.float64)
+    source_centered = source64 - source64.mean(dim=0, keepdim=True)
+    target_centered = target64 - target64.mean(dim=0, keepdim=True)
+    dim = source64.shape[1]
+    eye = torch.eye(dim, dtype=source64.dtype, device=source64.device)
+    denom = max(source64.shape[0] - 1, 1)
+    source_cov = source_centered.T @ source_centered / denom
+    target_cov = target_centered.T @ target_centered / denom
+    cross_cov = target_centered.T @ source_centered / denom
+    source_eigs, source_basis = torch.linalg.eigh((source_cov + source_cov.T) / 2)
+    target_eigs, target_basis = torch.linalg.eigh((target_cov + target_cov.T) / 2)
+    source_inv_sqrt = (
+        source_basis
+        @ torch.diag(source_eigs.clamp_min(delta).rsqrt())
+        @ source_basis.T
+    )
+    target_inv_sqrt = (
+        target_basis
+        @ torch.diag(target_eigs.clamp_min(delta).rsqrt())
+        @ target_basis.T
+    )
+    operator = target_inv_sqrt @ cross_cov @ source_inv_sqrt
+    operator = torch.nan_to_num(operator, nan=0.0, posinf=0.0, neginf=0.0)
+    _, singular_values, vh = torch.linalg.svd(operator + delta * eye, full_matrices=False)
+    singular_values = singular_values.clamp(max=1.0)
+    weights = _normalize_coordinate_importance((1.0 - singular_values.abs()).clamp_min(0), delta=delta)
+    basis = vh.T
+    metadata = {
+        "coord/importance_min": float(weights.min().item()),
+        "coord/importance_max": float(weights.max().item()),
+        "coord/importance_std": float(weights.std(unbiased=False).item()),
+        "coord/transform_singular_min": float(singular_values.min().item()),
+        "coord/transform_singular_max": float(singular_values.max().item()),
+    }
+    return weights, basis, metadata
+
+
+def _coordinate_importance_from_dynamics(
+    latents: torch.Tensor,
+    state: SpatialWeightingState,
+    *,
+    ema_beta: float,
+    delta: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    latents64 = latents.detach().to(torch.float64)
+    dim = latents64.shape[1]
+    basis = torch.eye(dim, dtype=latents64.dtype, device=latents64.device)
+    previous = state.coordinate_previous_ref_latents
+    if previous is None or previous.shape != latents64.shape:
+        instantaneous = torch.ones(dim, dtype=latents64.dtype, device=latents64.device)
+        cold_start = 1.0
+    else:
+        previous = previous.to(device=latents64.device, dtype=latents64.dtype)
+        instantaneous = (latents64 - previous).abs().mean(dim=0)
+        cold_start = 0.0
+    old = state.coordinate_importance
+    if old is None or old.shape != instantaneous.shape:
+        weights_raw = instantaneous
+    else:
+        old = old.to(device=latents64.device, dtype=latents64.dtype)
+        weights_raw = (1.0 - ema_beta) * old + ema_beta * instantaneous
+    weights = _normalize_coordinate_importance(weights_raw, delta=delta)
+    metadata = {
+        "coord/importance_min": float(weights.min().item()),
+        "coord/importance_max": float(weights.max().item()),
+        "coord/importance_std": float(weights.std(unbiased=False).item()),
+        "coord/dynamics_cold_start": cold_start,
+        "coord/dynamics_delta_mean": float(instantaneous.mean().item()),
+    }
+    return weights, basis, metadata
 
 
 def _encoder_parameters(core: SpatialIJEPACore) -> tuple[torch.nn.Parameter, ...]:
@@ -377,3 +518,130 @@ def score_frames_by_ras(
         "ras/negative_fraction": float((scores < 0).to(torch.float64).mean().item()),
     }
     return scores, metadata
+
+
+def score_frames_by_coordinate_importance(
+    core: SpatialIJEPACore,
+    train_patches: torch.Tensor,
+    *,
+    ref_indices: torch.Tensor,
+    state: SpatialWeightingState,
+    grid: int,
+    mask_config: MaskConfig,
+    batch_size: int,
+    seed: int,
+    device: torch.device,
+    coordinate_importance: CoordinateImportanceMethod,
+    coordinate_ema_beta: float,
+    coordinate_delta: float,
+    transform_pair_patches: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, dict[str, float], torch.Tensor, torch.Tensor]:
+    if batch_size <= 0:
+        raise ValueError("score batch_size must be positive")
+    context_was_training = core.context_encoder.training
+    predictor_was_training = core.predictor.training
+    target_was_training = core.target_encoder.training
+    core.context_encoder.eval()
+    core.predictor.eval()
+    core.target_encoder.eval()
+
+    parameters = _encoder_parameters(core)
+    if not parameters:
+        raise ValueError("coordinate weighting requires trainable context encoder parameters")
+
+    scores = torch.empty(train_patches.shape[0], dtype=torch.float64)
+    mask_generator = torch.Generator().manual_seed(derive_seed(seed, "weighting-coord-masks"))
+    try:
+        ref_patches = train_patches[ref_indices].to(device)
+        ref_latents = core.context_encoder(ref_patches).mean(dim=1)
+        if coordinate_importance == "covariance":
+            coord_weights, basis, coord_metadata = _coordinate_importance_from_covariance(
+                ref_latents,
+                delta=coordinate_delta,
+            )
+        elif coordinate_importance == "transformation":
+            if transform_pair_patches is None:
+                raise ValueError("transformation coordinate importance requires paired patches")
+            source_patches, target_patches = transform_pair_patches
+            source_latents = core.context_encoder(source_patches.to(device)).mean(dim=1)
+            target_latents = core.context_encoder(target_patches.to(device)).mean(dim=1)
+            coord_weights, basis, coord_metadata = _coordinate_importance_from_transformation(
+                source_latents,
+                target_latents,
+                delta=coordinate_delta,
+            )
+        elif coordinate_importance == "dynamics":
+            coord_weights, basis, coord_metadata = _coordinate_importance_from_dynamics(
+                ref_latents,
+                state,
+                ema_beta=coordinate_ema_beta,
+                delta=coordinate_delta,
+            )
+        else:
+            raise ValueError(f"unknown coordinate importance: {coordinate_importance!r}")
+
+        projected_ref_mean = (ref_latents.to(torch.float64) @ basis.to(device)).mean(dim=0)
+        coordinate_gradients: list[tuple[torch.Tensor | None, ...]] = []
+        for coordinate in projected_ref_mean:
+            coordinate_gradients.append(
+                torch.autograd.grad(coordinate, parameters, retain_graph=True, allow_unused=True)
+            )
+        coord_weights = coord_weights.to(device=device, dtype=torch.float64)
+        coord_grad_norm = torch.sqrt(
+            sum(
+                sum(
+                    torch.zeros((), dtype=torch.float64, device=device)
+                    if gradient is None
+                    else gradient.detach().to(torch.float64).square().sum()
+                    for gradient in gradients
+                )
+                for gradients in coordinate_gradients
+            )
+        )
+
+        for indices in torch.arange(train_patches.shape[0]).split(batch_size):
+            batch = train_patches[indices].to(device)
+            context_masks, target_masks = sample_masks(grid, grid, mask_config, mask_generator)
+            batch_scores = torch.empty(batch.shape[0], dtype=torch.float64)
+            for local_index in range(batch.shape[0]):
+                sample = batch[local_index : local_index + 1]
+                sample_loss = torch.zeros((), device=device)
+                for context_mask in context_masks:
+                    for target_mask in target_masks:
+                        sample_loss = (
+                            sample_loss
+                            + spatial_ijepa_per_sample_loss(
+                                core, sample, context_mask.to(device), target_mask.to(device)
+                            ).mean()
+                        )
+                sample_loss = sample_loss / (len(context_masks) * len(target_masks))
+                loss_gradients = torch.autograd.grad(
+                    sample_loss,
+                    parameters,
+                    retain_graph=False,
+                    allow_unused=True,
+                )
+                impacts = torch.empty(coord_weights.shape[0], dtype=torch.float64, device=device)
+                for coordinate_index, gradients in enumerate(coordinate_gradients):
+                    impacts[coordinate_index] = -_dot_gradients(
+                        loss_gradients,
+                        tuple(
+                            torch.zeros_like(parameter) if gradient is None else gradient.detach()
+                            for gradient, parameter in zip(gradients, parameters, strict=True)
+                        ),
+                    ).to(torch.float64)
+                batch_scores[local_index] = float(
+                    (coord_weights * impacts.abs()).sum().detach().cpu().item()
+                )
+            scores[indices] = batch_scores
+    finally:
+        core.context_encoder.train(context_was_training)
+        core.predictor.train(predictor_was_training)
+        core.target_encoder.train(target_was_training)
+
+    metadata = {
+        **coord_metadata,
+        "coord/grad_coordinate_norm": float(coord_grad_norm.detach().cpu().item()),
+        "coord/score_positive_fraction": float((scores > 0).to(torch.float64).mean().item()),
+    }
+    return scores, metadata, coord_weights.detach().cpu(), ref_latents.detach().cpu()
