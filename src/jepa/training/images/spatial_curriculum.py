@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -18,6 +19,7 @@ from jepa.training.images.ijepa_spatial import (
 
 SpatialWeightingMethod = Literal["uniform", "loss", "ras", "coord"]
 SpatialRichnessFunctional = Literal["logdet", "rbar", "pr"]
+RASScoreGranularity = Literal["sample", "batch"]
 CoordinateImportanceMethod = Literal["covariance", "transformation", "dynamics"]
 
 
@@ -35,6 +37,7 @@ class SpatialWeightingConfig:
     richness_delta: float = 1.0e-4
     richness_trace_target: float = 1.0
     richness_trace_beta: float = 0.01
+    ras_score_granularity: RASScoreGranularity = "sample"
     coordinate_importance: CoordinateImportanceMethod = "covariance"
     coordinate_ema_beta: float = 0.1
     coordinate_delta: float = 1.0e-6
@@ -85,6 +88,8 @@ def _validate_config(config: SpatialWeightingConfig) -> None:
         raise ValueError("richness_trace_target must be positive")
     if config.richness_trace_beta < 0:
         raise ValueError("richness_trace_beta must be non-negative")
+    if config.ras_score_granularity not in {"sample", "batch"}:
+        raise ValueError(f"unknown RAS score granularity: {config.ras_score_granularity!r}")
     if config.coordinate_importance not in {"covariance", "transformation", "dynamics"}:
         raise ValueError(f"unknown coordinate importance: {config.coordinate_importance!r}")
     if not 0 <= config.coordinate_ema_beta <= 1:
@@ -454,9 +459,12 @@ def score_frames_by_ras(
     richness_delta: float,
     richness_trace_target: float,
     richness_trace_beta: float,
+    score_granularity: RASScoreGranularity = "sample",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if batch_size <= 0:
         raise ValueError("score batch_size must be positive")
+    if score_granularity not in {"sample", "batch"}:
+        raise ValueError(f"unknown RAS score granularity: {score_granularity!r}")
     context_was_training = core.context_encoder.training
     predictor_was_training = core.predictor.training
     target_was_training = core.target_encoder.training
@@ -489,9 +497,12 @@ def score_frames_by_ras(
             )
         )
 
-        for indices in torch.arange(train_images.shape[0], device=train_images.device).split(
-            batch_size
-        ):
+        score_order = torch.randperm(
+            train_images.shape[0],
+            generator=torch.Generator().manual_seed(derive_seed(seed, "weighting-ras-order")),
+        ).to(train_images.device)
+        score_groups = score_order.split(batch_size)
+        for indices in score_groups:
             batch = train_images[indices].to(device)
             context_masks, target_masks = sample_masks(
                 grid,
@@ -500,31 +511,58 @@ def score_frames_by_ras(
                 mask_generator,
                 batch_size=batch.shape[0],
             )
-            batch_scores = torch.empty(batch.shape[0], dtype=torch.float64)
-            for local_index in range(batch.shape[0]):
-                sample = batch[local_index : local_index + 1]
-                sample_loss = torch.zeros((), device=device)
-                sample_context_masks = [
-                    mask[local_index : local_index + 1] for mask in context_masks
-                ]
-                sample_target_masks = [
-                    mask[local_index : local_index + 1] for mask in target_masks
-                ]
-                sample_loss = spatial_ijepa_per_sample_loss(
+            if score_granularity == "batch":
+                group_loss = spatial_ijepa_per_sample_loss(
                     core,
-                    sample,
-                    sample_context_masks,
-                    sample_target_masks,
+                    batch,
+                    context_masks,
+                    target_masks,
                 ).mean()
                 loss_gradients = torch.autograd.grad(
-                    sample_loss,
+                    group_loss,
                     parameters,
                     retain_graph=False,
                     allow_unused=True,
                 )
-                batch_scores[local_index] = float(
-                    (-_dot_gradients(loss_gradients, richness_gradients)).detach().cpu().item()
+                group_score = float(
+                    (-_dot_gradients(loss_gradients, richness_gradients))
+                    .detach()
+                    .cpu()
+                    .item()
                 )
+                batch_scores = torch.full(
+                    (batch.shape[0],),
+                    group_score,
+                    dtype=torch.float64,
+                )
+            else:
+                batch_scores = torch.empty(batch.shape[0], dtype=torch.float64)
+                for local_index in range(batch.shape[0]):
+                    sample = batch[local_index : local_index + 1]
+                    sample_context_masks = [
+                        mask[local_index : local_index + 1] for mask in context_masks
+                    ]
+                    sample_target_masks = [
+                        mask[local_index : local_index + 1] for mask in target_masks
+                    ]
+                    sample_loss = spatial_ijepa_per_sample_loss(
+                        core,
+                        sample,
+                        sample_context_masks,
+                        sample_target_masks,
+                    ).mean()
+                    loss_gradients = torch.autograd.grad(
+                        sample_loss,
+                        parameters,
+                        retain_graph=False,
+                        allow_unused=True,
+                    )
+                    batch_scores[local_index] = float(
+                        (-_dot_gradients(loss_gradients, richness_gradients))
+                        .detach()
+                        .cpu()
+                        .item()
+                    )
             scores[indices.detach().cpu()] = batch_scores
     finally:
         core.context_encoder.train(context_was_training)
@@ -536,6 +574,8 @@ def score_frames_by_ras(
         "ras/grad_richness_norm": float(grad_norm.detach().cpu().item()),
         "ras/positive_fraction": float((scores > 0).to(torch.float64).mean().item()),
         "ras/negative_fraction": float((scores < 0).to(torch.float64).mean().item()),
+        "ras/score_granularity_batch": float(score_granularity == "batch"),
+        "ras/score_groups": float(math.ceil(train_images.shape[0] / batch_size)),
     }
     return scores, metadata
 

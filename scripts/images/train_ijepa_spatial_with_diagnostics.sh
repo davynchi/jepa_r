@@ -108,8 +108,11 @@ fi
 "$PYTHON_BIN" "${DIAGNOSTICS_ARGS[@]}" > "$DIAGNOSTICS_LOG" 2>&1 &
 DIAGNOSTICS_PID=$!
 
-wait "$TRAIN_PID"
-TRAIN_STATUS=$?
+if wait "$TRAIN_PID"; then
+  TRAIN_STATUS=0
+else
+  TRAIN_STATUS=$?
+fi
 cleanup
 if [[ "$TRAIN_STATUS" -eq 0 ]]; then
   "$PYTHON_BIN" "${DIAGNOSTICS_ARGS[@]}" --once >> "$DIAGNOSTICS_LOG" 2>&1

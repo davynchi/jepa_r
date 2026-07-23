@@ -169,6 +169,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--weighting-richness-trace-target", type=float, default=1.0)
     parser.add_argument("--weighting-richness-trace-beta", type=float, default=0.01)
     parser.add_argument(
+        "--ras-score-granularity",
+        choices=("sample", "batch"),
+        default="sample",
+        help="Batch mode assigns one gradient-alignment score per shuffled scoring batch.",
+    )
+    parser.add_argument(
         "--coordinate-importance",
         choices=("covariance", "transformation", "dynamics"),
         default="covariance",
@@ -501,6 +507,7 @@ def main() -> None:
         richness_delta=args.weighting_richness_delta,
         richness_trace_target=args.weighting_richness_trace_target,
         richness_trace_beta=args.weighting_richness_trace_beta,
+        ras_score_granularity=args.ras_score_granularity,
         coordinate_importance=args.coordinate_importance,
         coordinate_ema_beta=args.coordinate_ema_beta,
         coordinate_delta=args.coordinate_delta,
@@ -584,6 +591,7 @@ def main() -> None:
                     "richness_delta": weighting_config.richness_delta,
                     "richness_trace_target": weighting_config.richness_trace_target,
                     "richness_trace_beta": weighting_config.richness_trace_beta,
+                    "ras_score_granularity": weighting_config.ras_score_granularity,
                     "coordinate_importance": weighting_config.coordinate_importance,
                     "coordinate_ema_beta": weighting_config.coordinate_ema_beta,
                     "coordinate_delta": weighting_config.coordinate_delta,
@@ -862,6 +870,7 @@ def main() -> None:
                         richness_delta=weighting_config.richness_delta,
                         richness_trace_target=weighting_config.richness_trace_target,
                         richness_trace_beta=weighting_config.richness_trace_beta,
+                        score_granularity=weighting_config.ras_score_granularity,
                     )
                 elif weighting_config.method == "coord":
                     (

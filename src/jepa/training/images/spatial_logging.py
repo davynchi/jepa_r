@@ -48,6 +48,8 @@ _TENSORBOARD_SCALARS = {
     "ras/grad_richness_norm",
     "ras/positive_fraction",
     "ras/negative_fraction",
+    "ras/score_granularity_batch",
+    "ras/score_groups",
     "coord/importance_min",
     "coord/importance_max",
     "coord/importance_std",
