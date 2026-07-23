@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+import torch
+from torch import nn
+
+from jepa.training.images.ijepa_spatial import (
+    MaskConfig,
+    SpatialIJEPACore,
+    build_spatial_ijepa_core,
+)
+from jepa.training.images.spatial_curriculum import (
+    richness_from_images,
+    score_frames_by_ras,
+)
+
+
+class _PatchMeanEncoder(nn.Module):
+    def __init__(self, *, patch_size: int, embed_dim: int) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.projection = nn.Linear(3, embed_dim, bias=False)
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        masks: list[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        patches = images.unfold(2, self.patch_size, self.patch_size).unfold(
+            3, self.patch_size, self.patch_size
+        )
+        patches = patches.mean(dim=(-1, -2)).permute(0, 2, 3, 1).flatten(1, 2)
+        encoded = self.projection(patches)
+        if masks is None:
+            return encoded
+        return torch.cat(
+            [
+                torch.gather(
+                    encoded,
+                    dim=1,
+                    index=mask.to(encoded.device).unsqueeze(-1).expand(-1, -1, encoded.shape[-1]),
+                )
+                for mask in masks
+            ],
+            dim=0,
+        )
+
+
+def _fake_core() -> SpatialIJEPACore:
+    encoder = _PatchMeanEncoder(patch_size=2, embed_dim=3)
+    return SpatialIJEPACore(
+        context_encoder=encoder,
+        predictor=nn.Identity(),
+        target_encoder=encoder,
+        policy=None,  # type: ignore[arg-type]
+        model_name="vit_tiny",
+        image_size=16,
+        patch_size=2,
+        embed_dim=3,
+    )
+
+
+def _mask_config() -> MaskConfig:
+    return MaskConfig(
+        enc_mask_scale=(0.5, 0.7),
+        pred_mask_scale=(0.1, 0.2),
+        num_enc_masks=1,
+        num_pred_masks=1,
+        min_keep=0,
+    )
+
+
+def test_predictive_barlow_prefers_spatially_stable_signal_to_pixel_noise() -> None:
+    generator = torch.Generator().manual_seed(11)
+    sample_colors = torch.randn(32, 3, 1, 1, generator=generator)
+    stable_images = sample_colors.expand(-1, -1, 16, 16).clone()
+    noisy_images = torch.randn(32, 3, 16, 16, generator=generator)
+    core = _fake_core()
+
+    stable_richness, stable_metadata = richness_from_images(
+        core,
+        stable_images,
+        functional="predictive-barlow",
+        delta=1.0e-4,
+        trace_target=1.0,
+        trace_beta=0.0,
+        grid=8,
+        mask_config=_mask_config(),
+        mask_seed=7,
+        predictive_redundancy_weight=0.0,
+    )
+    noisy_richness, noisy_metadata = richness_from_images(
+        core,
+        noisy_images,
+        functional="predictive-barlow",
+        delta=1.0e-4,
+        trace_target=1.0,
+        trace_beta=0.0,
+        grid=8,
+        mask_config=_mask_config(),
+        mask_seed=7,
+        predictive_redundancy_weight=0.0,
+    )
+
+    assert stable_richness > noisy_richness
+    assert stable_metadata["ras/predictive_diag_mean"] > 0.99
+    assert stable_metadata["ras/predictive_diag_mean"] > (
+        noisy_metadata["ras/predictive_diag_mean"] + 0.1
+    )
+    stable_richness.backward()
+    assert core.context_encoder.projection.weight.grad is not None
+    assert torch.isfinite(core.context_encoder.projection.weight.grad).all()
+
+
+def test_predictive_barlow_runs_through_batch_ras() -> None:
+    core = build_spatial_ijepa_core(
+        "vit_tiny",
+        image_size=16,
+        patch_size=4,
+        predictor_embed_dim=24,
+        predictor_depth=1,
+    )
+    images = torch.randn(4, 3, 16, 16)
+    scores, metadata = score_frames_by_ras(
+        core,
+        images,
+        ref_indices=torch.arange(4),
+        grid=4,
+        mask_config=_mask_config(),
+        batch_size=2,
+        seed=17,
+        device=torch.device("cpu"),
+        richness_functional="predictive-barlow",
+        richness_delta=1.0e-4,
+        richness_trace_target=1.0,
+        richness_trace_beta=0.0,
+        predictive_redundancy_weight=0.005,
+        score_granularity="batch",
+    )
+
+    assert scores.shape == (4,)
+    assert torch.isfinite(scores).all()
+    assert torch.isfinite(torch.tensor(metadata["ras/grad_richness_norm"]))
+    assert "ras/predictive_invariance_loss" in metadata

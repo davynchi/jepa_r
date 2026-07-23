@@ -24,7 +24,7 @@ SpatialWeightingMethod = Literal[
     "coord",
     "ras-thompson",
 ]
-SpatialRichnessFunctional = Literal["logdet", "rbar", "pr"]
+SpatialRichnessFunctional = Literal["logdet", "rbar", "pr", "predictive-barlow"]
 RASScoreGranularity = Literal["sample", "batch"]
 RASAlignment = Literal["dot", "cosine"]
 CoordinateImportanceMethod = Literal["covariance", "transformation", "dynamics"]
@@ -48,6 +48,7 @@ class SpatialWeightingConfig:
     richness_delta: float = 1.0e-4
     richness_trace_target: float = 1.0
     richness_trace_beta: float = 0.01
+    predictive_redundancy_weight: float = 0.005
     ras_score_granularity: RASScoreGranularity = "sample"
     ras_alignment: RASAlignment = "dot"
     coordinate_importance: CoordinateImportanceMethod = "covariance"
@@ -107,12 +108,14 @@ def _validate_config(config: SpatialWeightingConfig) -> None:
         raise ValueError("ref_size must be positive")
     if config.richness_delta <= 0:
         raise ValueError("richness_delta must be positive")
-    if config.richness_functional not in {"logdet", "rbar", "pr"}:
+    if config.richness_functional not in {"logdet", "rbar", "pr", "predictive-barlow"}:
         raise ValueError(f"unknown richness functional: {config.richness_functional!r}")
     if config.richness_trace_target <= 0:
         raise ValueError("richness_trace_target must be positive")
     if config.richness_trace_beta < 0:
         raise ValueError("richness_trace_beta must be non-negative")
+    if config.predictive_redundancy_weight < 0:
+        raise ValueError("predictive_redundancy_weight must be non-negative")
     if config.ras_score_granularity not in {"sample", "batch"}:
         raise ValueError(f"unknown RAS score granularity: {config.ras_score_granularity!r}")
     if config.ras_alignment not in {"dot", "cosine"}:
@@ -296,6 +299,10 @@ def richness_from_images(
     delta: float,
     trace_target: float,
     trace_beta: float,
+    grid: int | None = None,
+    mask_config: MaskConfig | None = None,
+    mask_seed: int | None = None,
+    predictive_redundancy_weight: float = 0.005,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if delta <= 0:
         raise ValueError("delta must be positive")
@@ -303,6 +310,23 @@ def richness_from_images(
         raise ValueError("trace_target must be positive")
     if trace_beta < 0:
         raise ValueError("trace_beta must be non-negative")
+    if predictive_redundancy_weight < 0:
+        raise ValueError("predictive_redundancy_weight must be non-negative")
+    if functional == "predictive-barlow":
+        if grid is None or mask_config is None or mask_seed is None:
+            raise ValueError(
+                "predictive-barlow richness requires grid, mask_config, and mask_seed"
+            )
+        return _predictive_barlow_richness(
+            core,
+            images,
+            grid=grid,
+            mask_config=mask_config,
+            mask_seed=mask_seed,
+            delta=delta,
+            redundancy_weight=predictive_redundancy_weight,
+        )
+
     covariance, _ = _latent_covariance_from_images(core, images)
     trace = torch.trace(covariance)
     eye = torch.eye(covariance.shape[0], dtype=covariance.dtype, device=covariance.device)
@@ -335,6 +359,73 @@ def richness_from_images(
         "ras/richness_top_eigenvalue": float(eigenvalues[-1].detach().cpu().item()),
     }
     return richness, metadata
+
+
+def _masked_pooled_latents(
+    core: SpatialIJEPACore,
+    images: torch.Tensor,
+    masks: list[torch.Tensor],
+) -> torch.Tensor:
+    encoded = core.context_encoder(images, masks)
+    num_masks = len(masks)
+    batch_size = images.shape[0]
+    if encoded.shape[0] != num_masks * batch_size:
+        raise RuntimeError("masked encoder output has an unexpected batch dimension")
+    return encoded.reshape(num_masks, batch_size, encoded.shape[1], encoded.shape[2]).mean(
+        dim=(0, 2)
+    )
+
+
+def _predictive_barlow_richness(
+    core: SpatialIJEPACore,
+    images: torch.Tensor,
+    *,
+    grid: int,
+    mask_config: MaskConfig,
+    mask_seed: int,
+    delta: float,
+    redundancy_weight: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if images.shape[0] < 2:
+        raise ValueError("predictive-barlow richness requires at least two reference images")
+
+    first_generator = torch.Generator().manual_seed(derive_seed(mask_seed, "view-1"))
+    second_generator = torch.Generator().manual_seed(derive_seed(mask_seed, "view-2"))
+    first_masks, _ = sample_masks(
+        grid,
+        grid,
+        mask_config,
+        first_generator,
+        batch_size=images.shape[0],
+    )
+    second_masks, _ = sample_masks(
+        grid,
+        grid,
+        mask_config,
+        second_generator,
+        batch_size=images.shape[0],
+    )
+    first = _masked_pooled_latents(core, images, first_masks).float()
+    second = _masked_pooled_latents(core, images, second_masks).float()
+    first = (first - first.mean(dim=0)) / torch.sqrt(
+        first.var(dim=0, unbiased=False) + delta
+    )
+    second = (second - second.mean(dim=0)) / torch.sqrt(
+        second.var(dim=0, unbiased=False) + delta
+    )
+    cross_correlation = first.T @ second / images.shape[0]
+    diagonal = torch.diagonal(cross_correlation)
+    invariance_loss = (diagonal - 1.0).square().sum()
+    off_diagonal = cross_correlation - torch.diag_embed(diagonal)
+    redundancy_loss = off_diagonal.square().sum()
+    richness = -(invariance_loss + redundancy_weight * redundancy_loss)
+    return richness, {
+        "ras/richness_value": float(richness.detach().cpu().item()),
+        "ras/predictive_diag_mean": float(diagonal.detach().mean().cpu().item()),
+        "ras/predictive_diag_min": float(diagonal.detach().min().cpu().item()),
+        "ras/predictive_invariance_loss": float(invariance_loss.detach().cpu().item()),
+        "ras/predictive_redundancy_loss": float(redundancy_loss.detach().cpu().item()),
+    }
 
 
 def _normalize_coordinate_importance(weights: torch.Tensor, *, delta: float) -> torch.Tensor:
@@ -550,8 +641,10 @@ def score_frames_by_ras(
     richness_delta: float,
     richness_trace_target: float,
     richness_trace_beta: float,
+    predictive_redundancy_weight: float = 0.005,
     score_granularity: RASScoreGranularity = "sample",
     alignment: RASAlignment = "dot",
+    use_bfloat16: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if batch_size <= 0:
         raise ValueError("score batch_size must be positive")
@@ -574,14 +667,23 @@ def score_frames_by_ras(
     mask_generator = torch.Generator().manual_seed(derive_seed(seed, "weighting-ras-masks"))
     try:
         ref_images = train_images[ref_indices.to(train_images.device)].to(device)
-        richness, richness_metadata = richness_from_images(
-            core,
-            ref_images,
-            functional=richness_functional,
-            delta=richness_delta,
-            trace_target=richness_trace_target,
-            trace_beta=richness_trace_beta,
-        )
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=use_bfloat16 and device.type == "cuda",
+        ):
+            richness, richness_metadata = richness_from_images(
+                core,
+                ref_images,
+                functional=richness_functional,
+                delta=richness_delta,
+                trace_target=richness_trace_target,
+                trace_beta=richness_trace_beta,
+                grid=grid,
+                mask_config=mask_config,
+                mask_seed=derive_seed(seed, "weighting-ras-richness-masks"),
+                predictive_redundancy_weight=predictive_redundancy_weight,
+            )
         richness_gradients_raw = torch.autograd.grad(richness, parameters, retain_graph=False)
         richness_gradients = tuple(gradient.detach() for gradient in richness_gradients_raw)
         grad_norm_squared = torch.zeros((), dtype=torch.float64, device=device)
@@ -607,12 +709,17 @@ def score_frames_by_ras(
                 batch_size=batch.shape[0],
             )
             if score_granularity == "batch":
-                group_loss = spatial_ijepa_per_sample_loss(
-                    core,
-                    batch,
-                    context_masks,
-                    target_masks,
-                ).mean()
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=use_bfloat16 and device.type == "cuda",
+                ):
+                    group_loss = spatial_ijepa_per_sample_loss(
+                        core,
+                        batch,
+                        context_masks,
+                        target_masks,
+                    ).mean()
                 loss_gradients = torch.autograd.grad(
                     group_loss,
                     parameters,
@@ -642,12 +749,17 @@ def score_frames_by_ras(
                     sample_target_masks = [
                         mask[local_index : local_index + 1] for mask in target_masks
                     ]
-                    sample_loss = spatial_ijepa_per_sample_loss(
-                        core,
-                        sample,
-                        sample_context_masks,
-                        sample_target_masks,
-                    ).mean()
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=torch.bfloat16,
+                        enabled=use_bfloat16 and device.type == "cuda",
+                    ):
+                        sample_loss = spatial_ijepa_per_sample_loss(
+                            core,
+                            sample,
+                            sample_context_masks,
+                            sample_target_masks,
+                        ).mean()
                     loss_gradients = torch.autograd.grad(
                         sample_loss,
                         parameters,

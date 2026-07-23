@@ -214,13 +214,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--weighting-ref-size", type=int, default=1024)
     parser.add_argument(
         "--weighting-richness",
-        choices=("logdet", "rbar", "pr"),
+        choices=("logdet", "rbar", "pr", "predictive-barlow"),
         default="logdet",
         help="Richness functional used by --weighting-method ras",
     )
     parser.add_argument("--weighting-richness-delta", type=float, default=1.0e-4)
     parser.add_argument("--weighting-richness-trace-target", type=float, default=1.0)
     parser.add_argument("--weighting-richness-trace-beta", type=float, default=0.01)
+    parser.add_argument(
+        "--weighting-predictive-redundancy-weight",
+        type=float,
+        default=0.005,
+        help="Off-diagonal cross-correlation penalty for predictive-barlow richness",
+    )
     parser.add_argument(
         "--ras-score-granularity",
         choices=("sample", "batch"),
@@ -300,6 +306,15 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--weighting-score-clip must be non-negative")
     if not 0 <= args.weighting_target_ess_fraction <= 1:
         raise ValueError("--weighting-target-ess-fraction must be in [0, 1]")
+    if args.weighting_predictive_redundancy_weight < 0:
+        raise ValueError("--weighting-predictive-redundancy-weight must be non-negative")
+    if (
+        args.weighting_method == "ras-thompson"
+        and args.weighting_richness == "predictive-barlow"
+    ):
+        raise ValueError(
+            "predictive-barlow currently supports periodic --weighting-method ras only"
+        )
     if args.mask_loader_workers < 0:
         raise ValueError("--mask-loader-workers must be non-negative")
     if args.mask_prefetch_factor <= 0:
@@ -572,6 +587,7 @@ def main() -> None:
         richness_delta=args.weighting_richness_delta,
         richness_trace_target=args.weighting_richness_trace_target,
         richness_trace_beta=args.weighting_richness_trace_beta,
+        predictive_redundancy_weight=args.weighting_predictive_redundancy_weight,
         ras_score_granularity=args.ras_score_granularity,
         ras_alignment=args.ras_alignment,
         coordinate_importance=args.coordinate_importance,
@@ -684,6 +700,9 @@ def main() -> None:
                     "richness_delta": weighting_config.richness_delta,
                     "richness_trace_target": weighting_config.richness_trace_target,
                     "richness_trace_beta": weighting_config.richness_trace_beta,
+                    "predictive_redundancy_weight": (
+                        weighting_config.predictive_redundancy_weight
+                    ),
                     "ras_score_granularity": weighting_config.ras_score_granularity,
                     "ras_alignment": weighting_config.ras_alignment,
                     "coordinate_importance": weighting_config.coordinate_importance,
@@ -878,6 +897,7 @@ def main() -> None:
             checkpoint,
             num_frames=n,
         )
+        weighting_ref_indices = weighting_ref_indices[: weighting_config.ref_size]
         if bandit_sampler is not None:
             assert bandit_cache is not None
             assert bandit_reward_normalizer is not None
@@ -1175,8 +1195,12 @@ def main() -> None:
                         richness_delta=weighting_config.richness_delta,
                         richness_trace_target=weighting_config.richness_trace_target,
                         richness_trace_beta=weighting_config.richness_trace_beta,
+                        predictive_redundancy_weight=(
+                            weighting_config.predictive_redundancy_weight
+                        ),
                         score_granularity=weighting_config.ras_score_granularity,
                         alignment=weighting_config.ras_alignment,
+                        use_bfloat16=use_bfloat16,
                     )
                 elif weighting_config.method == "coord":
                     (
