@@ -19,6 +19,8 @@ from legacy.ijepa_spatial import (
 SpatialWeightingMethod = Literal["uniform", "loss", "ras", "coord"]
 SpatialRichnessFunctional = Literal["logdet", "rbar", "pr"]
 CoordinateImportanceMethod = Literal["covariance", "transformation", "dynamics"]
+ScoreNormalization = Literal["zscore", "robust"]
+RASAlignment = Literal["dot", "cosine"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,12 +31,16 @@ class SpatialWeightingConfig:
     temperature: float = 1.0
     replay_beta: float = 1.0
     uniform_mix: float = 0.05
+    score_normalization: ScoreNormalization = "zscore"
+    score_clip: float = 0.0
+    target_ess_fraction: float = 0.0
     score_batch_size: int = 0
     ref_size: int = 1024
     richness_functional: SpatialRichnessFunctional = "logdet"
     richness_delta: float = 1.0e-4
     richness_trace_target: float = 1.0
     richness_trace_beta: float = 0.01
+    ras_alignment: RASAlignment = "dot"
     coordinate_importance: CoordinateImportanceMethod = "covariance"
     coordinate_ema_beta: float = 0.1
     coordinate_delta: float = 1.0e-6
@@ -47,6 +53,7 @@ class SpatialWeightingState:
     last_scores: torch.Tensor
     coordinate_importance: torch.Tensor | None = None
     coordinate_previous_ref_latents: torch.Tensor | None = None
+    sampling_temperature: float = 1.0
 
 
 def init_spatial_weighting(num_frames: int) -> SpatialWeightingState:
@@ -73,6 +80,12 @@ def _validate_config(config: SpatialWeightingConfig) -> None:
         raise ValueError("replay_beta must be in [0, 1]")
     if not 0 <= config.uniform_mix < 1:
         raise ValueError("uniform_mix must be in [0, 1)")
+    if config.score_normalization not in {"zscore", "robust"}:
+        raise ValueError(f"unknown score normalization: {config.score_normalization!r}")
+    if config.score_clip < 0:
+        raise ValueError("score_clip must be non-negative")
+    if not 0 <= config.target_ess_fraction <= 1:
+        raise ValueError("target_ess_fraction must be in [0, 1]")
     if config.score_batch_size < 0:
         raise ValueError("score_batch_size must be non-negative")
     if config.ref_size <= 0:
@@ -85,6 +98,8 @@ def _validate_config(config: SpatialWeightingConfig) -> None:
         raise ValueError("richness_trace_target must be positive")
     if config.richness_trace_beta < 0:
         raise ValueError("richness_trace_beta must be non-negative")
+    if config.ras_alignment not in {"dot", "cosine"}:
+        raise ValueError(f"unknown RAS alignment: {config.ras_alignment!r}")
     if config.coordinate_importance not in {"covariance", "transformation", "dynamics"}:
         raise ValueError(f"unknown coordinate importance: {config.coordinate_importance!r}")
     if not 0 <= config.coordinate_ema_beta <= 1:
@@ -132,25 +147,63 @@ def update_spatial_weights(
     if not torch.isfinite(scores64).all():
         raise ValueError("spatial weighting scores must be finite")
 
-    std = scores64.std(unbiased=False)
-    normalized = scores64 - scores64.mean()
-    if std > 0:
-        normalized = normalized / std
+    if config.score_normalization == "robust":
+        center = scores64.median()
+        normalized = scores64 - center
+        scale = 1.4826 * normalized.abs().median()
+        if scale <= torch.finfo(scores64.dtype).eps:
+            scale = scores64.std(unbiased=False)
+    else:
+        normalized = scores64 - scores64.mean()
+        scale = scores64.std(unbiased=False)
+    if scale > 0:
+        normalized = normalized / scale
     else:
         normalized.zero_()
+    if config.score_clip > 0:
+        normalized = normalized.clamp(-config.score_clip, config.score_clip)
 
     memory = (1.0 - config.replay_beta) * state.memory + config.replay_beta * normalized
-    probabilities = torch.softmax(memory / config.temperature, dim=0)
-    if config.uniform_mix > 0:
-        uniform = torch.full_like(probabilities, 1.0 / probabilities.numel())
-        probabilities = (1.0 - config.uniform_mix) * probabilities + config.uniform_mix * uniform
-    probabilities = probabilities / probabilities.sum()
+
+    def probabilities_at_temperature(temperature: float) -> torch.Tensor:
+        values = torch.softmax(memory / temperature, dim=0)
+        if config.uniform_mix > 0:
+            uniform = torch.full_like(values, 1.0 / values.numel())
+            values = (1.0 - config.uniform_mix) * values + config.uniform_mix * uniform
+        return values / values.sum()
+
+    probabilities = probabilities_at_temperature(config.temperature)
+    sampling_temperature = config.temperature
+    if config.target_ess_fraction > 0:
+        target_ess = config.target_ess_fraction * probabilities.numel()
+
+        def effective_sample_size(values: torch.Tensor) -> float:
+            return float((1.0 / values.square().sum()).item())
+
+        if effective_sample_size(probabilities) < target_ess:
+            lower = config.temperature
+            upper = lower
+            for _ in range(60):
+                upper *= 2.0
+                candidate = probabilities_at_temperature(upper)
+                if effective_sample_size(candidate) >= target_ess:
+                    break
+            for _ in range(50):
+                middle = 0.5 * (lower + upper)
+                candidate = probabilities_at_temperature(middle)
+                if effective_sample_size(candidate) < target_ess:
+                    lower = middle
+                else:
+                    upper = middle
+            probabilities = probabilities_at_temperature(upper)
+            sampling_temperature = upper
     return SpatialWeightingState(
         memory=memory,
         probabilities=probabilities,
         last_scores=scores64,
         coordinate_importance=state.coordinate_importance,
         coordinate_previous_ref_latents=state.coordinate_previous_ref_latents,
+        sampling_temperature=sampling_temperature,
     )
 
 
@@ -166,6 +219,7 @@ def update_coordinate_weighting_state(
         last_scores=state.last_scores,
         coordinate_importance=coordinate_importance.detach().cpu().to(torch.float64),
         coordinate_previous_ref_latents=previous_ref_latents.detach().cpu().to(torch.float64),
+        sampling_temperature=state.sampling_temperature,
     )
 
 
@@ -190,6 +244,7 @@ def weighting_diagnostics(state: SpatialWeightingState) -> dict[str, float]:
         "weighting/prob_min": float(probabilities.min().item()),
         "weighting/prob_max": float(probabilities.max().item()),
         "weighting/effective_sample_size": float((1.0 / (probabilities.square().sum())).item()),
+        "weighting/sampling_temperature": state.sampling_temperature,
         "weighting/top_1pct_mass": top_mass(0.01),
         "weighting/top_5pct_mass": top_mass(0.05),
         "weighting/top_10pct_mass": top_mass(0.10),
@@ -393,6 +448,34 @@ def _dot_gradients(
     return total
 
 
+def _gradient_norm(
+    gradients: tuple[torch.Tensor | None, ...], *, device: torch.device
+) -> torch.Tensor:
+    norm_squared = torch.zeros((), dtype=torch.float64, device=device)
+    for gradient in gradients:
+        if gradient is not None:
+            norm_squared = norm_squared + gradient.detach().to(torch.float64).square().sum()
+    return torch.sqrt(norm_squared)
+
+
+def _ras_gradient_score(
+    loss_gradients: tuple[torch.Tensor | None, ...],
+    richness_gradients: tuple[torch.Tensor, ...],
+    *,
+    alignment: RASAlignment,
+    richness_gradient_norm: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    loss_gradient_norm = _gradient_norm(loss_gradients, device=richness_gradient_norm.device)
+    score = -_dot_gradients(loss_gradients, richness_gradients).to(torch.float64)
+    if alignment == "cosine":
+        denominator = loss_gradient_norm * richness_gradient_norm
+        if denominator <= torch.finfo(torch.float64).eps:
+            score = torch.zeros_like(score)
+        else:
+            score = score / denominator
+    return score, loss_gradient_norm
+
+
 def score_frames_by_loss(
     core: SpatialIJEPACore,
     train_patches: torch.Tensor,
@@ -450,9 +533,12 @@ def score_frames_by_ras(
     richness_delta: float,
     richness_trace_target: float,
     richness_trace_beta: float,
+    alignment: RASAlignment = "dot",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if batch_size <= 0:
         raise ValueError("score batch_size must be positive")
+    if alignment not in {"dot", "cosine"}:
+        raise ValueError(f"unknown RAS alignment: {alignment!r}")
     context_was_training = core.context_encoder.training
     predictor_was_training = core.predictor.training
     target_was_training = core.target_encoder.training
@@ -485,6 +571,7 @@ def score_frames_by_ras(
             )
         )
 
+        loss_gradient_norms: list[float] = []
         for indices in torch.arange(train_patches.shape[0], device=train_patches.device).split(
             batch_size
         ):
@@ -509,9 +596,14 @@ def score_frames_by_ras(
                     retain_graph=False,
                     allow_unused=True,
                 )
-                batch_scores[local_index] = float(
-                    (-_dot_gradients(loss_gradients, richness_gradients)).detach().cpu().item()
+                sample_score, loss_gradient_norm = _ras_gradient_score(
+                    loss_gradients,
+                    richness_gradients,
+                    alignment=alignment,
+                    richness_gradient_norm=grad_norm,
                 )
+                batch_scores[local_index] = float(sample_score.detach().cpu().item())
+                loss_gradient_norms.append(float(loss_gradient_norm.detach().cpu().item()))
             scores[indices.detach().cpu()] = batch_scores
     finally:
         core.context_encoder.train(context_was_training)
@@ -523,6 +615,11 @@ def score_frames_by_ras(
         "ras/grad_richness_norm": float(grad_norm.detach().cpu().item()),
         "ras/positive_fraction": float((scores > 0).to(torch.float64).mean().item()),
         "ras/negative_fraction": float((scores < 0).to(torch.float64).mean().item()),
+        "ras/alignment_cosine": float(alignment == "cosine"),
+        "ras/loss_gradient_norm_mean": float(
+            torch.tensor(loss_gradient_norms, dtype=torch.float64).mean().item()
+        ),
+        "ras/loss_gradient_norm_max": float(max(loss_gradient_norms)),
     }
     return scores, metadata
 

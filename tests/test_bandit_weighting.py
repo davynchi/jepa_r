@@ -120,3 +120,6 @@ def test_batch_ras_reuses_existing_parameter_gradients() -> None:
     )
     reward = batch_ras_from_parameter_gradients((parameter,), snapshot)
     assert torch.allclose(reward, torch.tensor(-2.0))
+    cosine_reward = batch_ras_from_parameter_gradients((parameter,), snapshot, alignment="cosine")
+    expected = torch.tensor(-2.0 / (20.0 * 10.0) ** 0.5)
+    assert torch.allclose(cosine_reward, expected)

@@ -141,6 +141,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--weighting-replay-beta", type=float, default=1.0)
     parser.add_argument("--weighting-uniform-mix", type=float, default=0.05)
     parser.add_argument(
+        "--weighting-score-normalization",
+        choices=("zscore", "robust"),
+        default="zscore",
+    )
+    parser.add_argument(
+        "--weighting-score-clip",
+        type=float,
+        default=0.0,
+        help="Clip normalized scores symmetrically; 0 disables clipping",
+    )
+    parser.add_argument(
+        "--weighting-target-ess-fraction",
+        type=float,
+        default=0.0,
+        help="Raise sampling temperature to keep ESS at this fraction of the dataset",
+    )
+    parser.add_argument(
         "--weighting-score-batch-size",
         type=int,
         default=0,
@@ -156,6 +173,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--weighting-richness-delta", type=float, default=1.0e-4)
     parser.add_argument("--weighting-richness-trace-target", type=float, default=1.0)
     parser.add_argument("--weighting-richness-trace-beta", type=float, default=0.01)
+    parser.add_argument(
+        "--ras-alignment",
+        choices=("dot", "cosine"),
+        default="dot",
+        help="Use raw gradient alignment or normalize both gradients to unit norm",
+    )
     parser.add_argument(
         "--coordinate-importance",
         choices=("covariance", "transformation", "dynamics"),
@@ -207,6 +230,7 @@ def _weighting_checkpoint_state(
         "weighting_memory": weighting_state.memory,
         "weighting_probabilities": weighting_state.probabilities,
         "weighting_last_scores": weighting_state.last_scores,
+        "weighting_sampling_temperature": weighting_state.sampling_temperature,
         "weighting_ref_indices": ref_indices,
         "coordinate_importance": weighting_state.coordinate_importance,
         "coordinate_previous_ref_latents": weighting_state.coordinate_previous_ref_latents,
@@ -303,6 +327,7 @@ def _restore_weighting_state(
         last_scores=last_scores.detach().cpu().to(torch.float64),
         coordinate_importance=coordinate_importance,
         coordinate_previous_ref_latents=coordinate_previous_ref_latents,
+        sampling_temperature=float(extra_state.get("weighting_sampling_temperature", 1.0)),
     )
     return state, ref_indices.detach().cpu().to(torch.long)
 
@@ -356,6 +381,10 @@ def _encode_patches_pooled(
 
 def main() -> None:
     args = _parse_args()
+    if args.weighting_score_clip < 0:
+        raise ValueError("--weighting-score-clip must be non-negative")
+    if not 0 <= args.weighting_target_ess_fraction <= 1:
+        raise ValueError("--weighting-target-ess-fraction must be in [0, 1]")
     run_name = args.run_name or _default_run_name(args.seed)
     run_dir = Path(args.output_root).expanduser().resolve() / run_name
     checkpoint_dir = run_dir / "network"
@@ -375,12 +404,16 @@ def main() -> None:
         temperature=args.weighting_temperature,
         replay_beta=args.weighting_replay_beta,
         uniform_mix=args.weighting_uniform_mix,
+        score_normalization=args.weighting_score_normalization,
+        score_clip=args.weighting_score_clip,
+        target_ess_fraction=args.weighting_target_ess_fraction,
         score_batch_size=args.weighting_score_batch_size,
         ref_size=args.weighting_ref_size,
         richness_functional=args.weighting_richness,
         richness_delta=args.weighting_richness_delta,
         richness_trace_target=args.weighting_richness_trace_target,
         richness_trace_beta=args.weighting_richness_trace_beta,
+        ras_alignment=args.ras_alignment,
         coordinate_importance=args.coordinate_importance,
         coordinate_ema_beta=args.coordinate_ema_beta,
         coordinate_delta=args.coordinate_delta,
@@ -430,12 +463,16 @@ def main() -> None:
                     "temperature": weighting_config.temperature,
                     "replay_beta": weighting_config.replay_beta,
                     "uniform_mix": weighting_config.uniform_mix,
+                    "score_normalization": weighting_config.score_normalization,
+                    "score_clip": weighting_config.score_clip,
+                    "target_ess_fraction": weighting_config.target_ess_fraction,
                     "score_batch_size": weighting_config.score_batch_size,
                     "ref_size": weighting_config.ref_size,
                     "richness_functional": weighting_config.richness_functional,
                     "richness_delta": weighting_config.richness_delta,
                     "richness_trace_target": weighting_config.richness_trace_target,
                     "richness_trace_beta": weighting_config.richness_trace_beta,
+                    "ras_alignment": weighting_config.ras_alignment,
                     "coordinate_importance": weighting_config.coordinate_importance,
                     "coordinate_ema_beta": weighting_config.coordinate_ema_beta,
                     "coordinate_delta": weighting_config.coordinate_delta,
@@ -700,6 +737,7 @@ def main() -> None:
                         richness_delta=weighting_config.richness_delta,
                         richness_trace_target=weighting_config.richness_trace_target,
                         richness_trace_beta=weighting_config.richness_trace_beta,
+                        alignment=weighting_config.ras_alignment,
                     )
                 elif weighting_config.method == "coord":
                     (
@@ -737,6 +775,9 @@ def main() -> None:
                     event="weighting_update",
                     scalars={
                         **weighting_diagnostics(weighting_state),
+                        "weighting/target_effective_sample_size": (
+                            weighting_config.target_ess_fraction * n
+                        ),
                         **score_metadata,
                         **_corruption_diagnostics(
                             weighting_state,

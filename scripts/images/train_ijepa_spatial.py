@@ -26,6 +26,10 @@ from jepa.configs.images.shapes3d import (  # noqa: E402
     load_shapes3d_config,
     shapes3d_config_to_dict,
 )
+from jepa.data.images.mini_webvision import (  # noqa: E402
+    MiniWebVisionDataConfig,
+    build_mini_webvision_static_dataset_splits,
+)
 from jepa.data.images.shapes3d import (  # noqa: E402
     build_shapes3d_counterfactual_pairs,
     build_shapes3d_static_dataset_splits,
@@ -127,8 +131,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--bfloat16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--crop-scale", type=float, nargs=2, default=(0.3, 1.0))
     parser.add_argument("--horizontal-flip-prob", type=float, default=0.0)
-    parser.add_argument("--dataset", choices=("shapes3d", "tiny-imagenet"), default="shapes3d")
+    parser.add_argument(
+        "--dataset",
+        choices=("shapes3d", "tiny-imagenet", "mini-webvision"),
+        default="shapes3d",
+    )
     parser.add_argument("--tiny-imagenet-root", default="data/tiny-imagenet-200")
+    parser.add_argument("--mini-webvision-root", default="data/mini-webvision")
     parser.add_argument("--num-train-samples", type=int, default=16000)
     parser.add_argument("--num-val-samples", type=int, default=1000)
     parser.add_argument("--num-test-samples", type=int, default=1000)
@@ -163,6 +172,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--weighting-replay-beta", type=float, default=1.0)
     parser.add_argument("--weighting-uniform-mix", type=float, default=0.05)
     parser.add_argument(
+        "--weighting-score-normalization",
+        choices=("zscore", "robust"),
+        default="zscore",
+    )
+    parser.add_argument(
+        "--weighting-score-clip",
+        type=float,
+        default=0.0,
+        help="Clip normalized scores symmetrically; 0 disables clipping",
+    )
+    parser.add_argument(
+        "--weighting-target-ess-fraction",
+        type=float,
+        default=0.0,
+        help="Raise sampling temperature to keep ESS at this fraction of the dataset",
+    )
+    parser.add_argument(
         "--weighting-score-batch-size",
         type=int,
         default=0,
@@ -183,6 +209,12 @@ def _parse_args() -> argparse.Namespace:
         choices=("sample", "batch"),
         default="sample",
         help="Batch mode assigns one gradient-alignment score per shuffled scoring batch.",
+    )
+    parser.add_argument(
+        "--ras-alignment",
+        choices=("dot", "cosine"),
+        default="dot",
+        help="Use raw gradient alignment or normalize both gradients to unit norm",
     )
     parser.add_argument(
         "--coordinate-importance",
@@ -247,6 +279,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--bandit-richness-refresh-steps must be positive")
     if not 0 <= args.bandit_reward_normalization_decay < 1:
         raise ValueError("--bandit-reward-normalization-decay must be in [0, 1)")
+    if args.weighting_score_clip < 0:
+        raise ValueError("--weighting-score-clip must be non-negative")
+    if not 0 <= args.weighting_target_ess_fraction <= 1:
+        raise ValueError("--weighting-target-ess-fraction must be in [0, 1]")
 
 
 def _random_resized_crop_batch(
@@ -407,6 +443,7 @@ def _weighting_checkpoint_state(
         "weighting_memory": weighting_state.memory,
         "weighting_probabilities": weighting_state.probabilities,
         "weighting_last_scores": weighting_state.last_scores,
+        "weighting_sampling_temperature": weighting_state.sampling_temperature,
         "weighting_ref_indices": ref_indices,
         "coordinate_importance": weighting_state.coordinate_importance,
         "coordinate_previous_ref_latents": weighting_state.coordinate_previous_ref_latents,
@@ -469,6 +506,7 @@ def _restore_weighting_state(
         last_scores=last_scores.detach().cpu().to(torch.float64),
         coordinate_importance=coordinate_importance,
         coordinate_previous_ref_latents=coordinate_previous_ref_latents,
+        sampling_temperature=float(extra_state.get("weighting_sampling_temperature", 1.0)),
     )
     return state, ref_indices.detach().cpu().to(torch.long)
 
@@ -572,6 +610,9 @@ def main() -> None:
         temperature=args.weighting_temperature,
         replay_beta=args.weighting_replay_beta,
         uniform_mix=args.weighting_uniform_mix,
+        score_normalization=args.weighting_score_normalization,
+        score_clip=args.weighting_score_clip,
+        target_ess_fraction=args.weighting_target_ess_fraction,
         score_batch_size=args.weighting_score_batch_size,
         ref_size=args.weighting_ref_size,
         richness_functional=args.weighting_richness,
@@ -579,6 +620,7 @@ def main() -> None:
         richness_trace_target=args.weighting_richness_trace_target,
         richness_trace_beta=args.weighting_richness_trace_beta,
         ras_score_granularity=args.ras_score_granularity,
+        ras_alignment=args.ras_alignment,
         coordinate_importance=args.coordinate_importance,
         coordinate_ema_beta=args.coordinate_ema_beta,
         coordinate_delta=args.coordinate_delta,
@@ -607,6 +649,26 @@ def main() -> None:
         config_payload = {
             "tiny_imagenet": {
                 "data": asdict(tiny_config),
+                "classes": [
+                    {"index": index, "wnid": wnid, "name": name}
+                    for index, (wnid, name) in enumerate(
+                        zip(datasets.train.wnids, datasets.train.class_names, strict=True)
+                    )
+                ],
+            }
+        }
+    elif args.dataset == "mini-webvision":
+        mini_webvision_config = MiniWebVisionDataConfig(
+            root=args.mini_webvision_root,
+            image_size=args.image_size,
+            num_train_samples=args.num_train_samples,
+            num_val_samples=args.num_val_samples,
+            num_test_samples=args.num_test_samples,
+        )
+        datasets = build_mini_webvision_static_dataset_splits(mini_webvision_config)
+        config_payload = {
+            "mini_webvision": {
+                "data": asdict(mini_webvision_config),
                 "classes": [
                     {"index": index, "wnid": wnid, "name": name}
                     for index, (wnid, name) in enumerate(
@@ -656,6 +718,9 @@ def main() -> None:
                     "temperature": weighting_config.temperature,
                     "replay_beta": weighting_config.replay_beta,
                     "uniform_mix": weighting_config.uniform_mix,
+                    "score_normalization": weighting_config.score_normalization,
+                    "score_clip": weighting_config.score_clip,
+                    "target_ess_fraction": weighting_config.target_ess_fraction,
                     "score_batch_size": weighting_config.score_batch_size,
                     "ref_size": weighting_config.ref_size,
                     "richness_functional": weighting_config.richness_functional,
@@ -663,6 +728,7 @@ def main() -> None:
                     "richness_trace_target": weighting_config.richness_trace_target,
                     "richness_trace_beta": weighting_config.richness_trace_beta,
                     "ras_score_granularity": weighting_config.ras_score_granularity,
+                    "ras_alignment": weighting_config.ras_alignment,
                     "coordinate_importance": weighting_config.coordinate_importance,
                     "coordinate_ema_beta": weighting_config.coordinate_ema_beta,
                     "coordinate_delta": weighting_config.coordinate_delta,
@@ -852,6 +918,7 @@ def main() -> None:
                     coordinate_previous_ref_latents=(
                         weighting_state.coordinate_previous_ref_latents
                     ),
+                    sampling_temperature=weighting_state.sampling_temperature,
                 )
                 logger.log(
                     step=global_step,
@@ -946,7 +1013,9 @@ def main() -> None:
                     assert richness_snapshot is not None
                     raw_reward = float(
                         batch_ras_from_parameter_gradients(
-                            bandit_encoder_parameters, richness_snapshot
+                            bandit_encoder_parameters,
+                            richness_snapshot,
+                            alignment=weighting_config.ras_alignment,
                         ).item()
                     )
                     contexts_for_bandit = F.layer_norm(
@@ -1105,6 +1174,7 @@ def main() -> None:
                         richness_trace_target=weighting_config.richness_trace_target,
                         richness_trace_beta=weighting_config.richness_trace_beta,
                         score_granularity=weighting_config.ras_score_granularity,
+                        alignment=weighting_config.ras_alignment,
                     )
                 elif weighting_config.method == "coord":
                     (
@@ -1140,7 +1210,13 @@ def main() -> None:
                     step=global_step,
                     epoch=epoch,
                     event="weighting_update",
-                    scalars={**weighting_diagnostics(weighting_state), **score_metadata},
+                    scalars={
+                        **weighting_diagnostics(weighting_state),
+                        "weighting/target_effective_sample_size": (
+                            weighting_config.target_ess_fraction * n
+                        ),
+                        **score_metadata,
+                    },
                     histograms={
                         "hist/weighting_scores": weighting_state.last_scores,
                         "hist/weighting_probabilities": weighting_state.probabilities,

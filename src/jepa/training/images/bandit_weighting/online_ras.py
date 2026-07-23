@@ -8,6 +8,7 @@ import torch
 
 from jepa.training.images.ijepa_spatial import SpatialIJEPACore
 from jepa.training.images.spatial_curriculum import (
+    RASAlignment,
     SpatialRichnessFunctional,
     richness_from_images,
 )
@@ -78,15 +79,30 @@ def capture_richness_gradient(
 def batch_ras_from_parameter_gradients(
     parameters: tuple[torch.nn.Parameter, ...],
     snapshot: RichnessGradientSnapshot,
+    *,
+    alignment: RASAlignment = "dot",
 ) -> torch.Tensor:
     """Return ``-<grad R, grad loss>`` from an already completed train backward."""
+    if alignment not in {"dot", "cosine"}:
+        raise ValueError(f"unknown RAS alignment: {alignment!r}")
     if len(parameters) != len(snapshot.gradients):
         raise ValueError("parameter list does not match richness gradient snapshot")
     dot = torch.zeros((), device=snapshot.gradients[0].device, dtype=torch.float32)
+    loss_norm_squared = torch.zeros_like(dot)
+    richness_norm_squared = torch.zeros_like(dot)
     for parameter, richness_gradient in zip(parameters, snapshot.gradients, strict=True):
+        richness_norm_squared = richness_norm_squared + richness_gradient.float().square().sum()
         if parameter.grad is None:
             continue
         if parameter.grad.shape != richness_gradient.shape:
             raise ValueError("parameter gradient shape changed after richness capture")
-        dot = dot + torch.sum(parameter.grad.detach().float() * richness_gradient.float())
-    return -dot
+        loss_gradient = parameter.grad.detach().float()
+        dot = dot + torch.sum(loss_gradient * richness_gradient.float())
+        loss_norm_squared = loss_norm_squared + loss_gradient.square().sum()
+    score = -dot
+    if alignment == "cosine":
+        denominator = torch.sqrt(loss_norm_squared * richness_norm_squared)
+        if denominator <= torch.finfo(denominator.dtype).eps:
+            return torch.zeros_like(score)
+        score = score / denominator
+    return score
