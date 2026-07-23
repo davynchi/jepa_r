@@ -27,7 +27,7 @@ from jepa.models.patches import patchify  # noqa: E402
 from jepa.training.images.ijepa_spatial import (  # noqa: E402
     MaskConfig,
     build_spatial_ijepa_core,
-    encode_frames_pooled,
+    encode_frames_pooled_batched,
     load_spatial_checkpoint,
     sample_masks,
     spatial_ijepa_loss,
@@ -69,12 +69,12 @@ def _resolve_run_dir(value: str) -> Path:
     return path.resolve()
 
 
-def _held_out_loss(core, test_patches, grid, mask_config, device) -> float:
+def _held_out_loss(core, test_samples, grid, mask_config, device) -> float:
     mask_generator = torch.Generator().manual_seed(derive_seed(0, "tiny-test-masks"))
     total_loss = 0.0
     total_examples = 0
     with torch.no_grad():
-        for batch in test_patches.split(BATCH_SIZE):
+        for batch in test_samples.split(BATCH_SIZE):
             batch = batch.to(device)
             context_masks, target_masks = sample_masks(grid, grid, mask_config, mask_generator)
             loss = torch.zeros((), device=device)
@@ -157,8 +157,18 @@ def main() -> None:
                     core.target_encoder.to(device).eval()
 
                     test_loss = _held_out_loss(core, test_patches, grid, mask_config, device)
-                    train_z = encode_frames_pooled(core, train_frames, patch_size=PATCH_SIZE).cpu()
-                    test_z = encode_frames_pooled(core, test_frames, patch_size=PATCH_SIZE).cpu()
+                    train_z = encode_frames_pooled_batched(
+                        core,
+                        train_frames,
+                        patch_size=PATCH_SIZE,
+                        batch_size=BATCH_SIZE,
+                    ).cpu()
+                    test_z = encode_frames_pooled_batched(
+                        core,
+                        test_frames,
+                        patch_size=PATCH_SIZE,
+                        batch_size=BATCH_SIZE,
+                    ).cpu()
                     spectrum = compute_latent_spectrum(test_z)
 
                     classifier = fit_entity_classifier(

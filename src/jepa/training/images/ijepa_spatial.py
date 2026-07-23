@@ -213,6 +213,12 @@ def build_spatial_ijepa_core(
     return SpatialIJEPACore(encoder, predictor, target_encoder, policy)
 
 
+def encode_samples_pooled(core: SpatialIJEPACore, samples: torch.Tensor) -> torch.Tensor:
+    """Encode patch tensors and mean-pool their patch tokens."""
+    tokens = core.context_encoder(samples)
+    return tokens.mean(dim=1)
+
+
 def spatial_ijepa_per_sample_loss(
     core: SpatialIJEPACore,
     patches: torch.Tensor,
@@ -261,7 +267,25 @@ def encode_frames_pooled(
     core.context_encoder.eval()
     device = next(core.context_encoder.parameters()).device
     patches = patchify(frames, patch_size).to(device)
-    return core.context_encoder(patches).mean(dim=-2)
+    return encode_samples_pooled(core, patches)
+
+
+@torch.no_grad()
+def encode_frames_pooled_batched(
+    core: SpatialIJEPACore,
+    frames: torch.Tensor,
+    *,
+    patch_size: int,
+    batch_size: int,
+) -> torch.Tensor:
+    """Memory-bounded frame-level encoding for large diagnostic splits."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    chunks = [
+        encode_frames_pooled(core, batch, patch_size=patch_size).detach().cpu()
+        for batch in frames.split(batch_size)
+    ]
+    return torch.cat(chunks, dim=0)
 
 
 def save_spatial_checkpoint(

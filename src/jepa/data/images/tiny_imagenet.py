@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -171,7 +172,7 @@ class TinyImageNetStaticImageDataset(Dataset):
             self.entities = torch.tensor([label for _, label in selected], dtype=torch.long)
             self.images = torch.stack([_read_image(path) for path in self.paths])
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = cache_path.with_suffix(".pt.tmp")
+            tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
             torch.save({"entities": self.entities, "images": self.images}, tmp_path)
             tmp_path.replace(cache_path)
         self.observations = self.images.reshape(len(selected), -1)

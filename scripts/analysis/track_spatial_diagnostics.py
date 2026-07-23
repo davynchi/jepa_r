@@ -63,6 +63,7 @@ from jepa.training.images.ijepa_spatial import (  # noqa: E402
     MaskConfig,
     build_spatial_ijepa_core,
     encode_frames_pooled,
+    encode_frames_pooled_batched,
     load_spatial_checkpoint,
     sample_masks,
     spatial_ijepa_loss,
@@ -109,13 +110,13 @@ def _context_class_labels(contexts: torch.Tensor, factor_index: int) -> torch.Te
     return (contexts[:, factor_index] * (size - 1)).round().long()
 
 
-def _held_out_loss(core, test_patches, grid, mask_config, device) -> float:
+def _held_out_loss(core, test_samples, grid, mask_config, device) -> float:
     # Fixed mask seed so the number is comparable across checkpoints.
     mask_generator = torch.Generator().manual_seed(derive_seed(0, "test-masks"))
     total, batches = 0.0, 0
     with torch.no_grad():
-        for indices in torch.arange(test_patches.shape[0]).split(BATCH_SIZE):
-            batch = test_patches[indices].to(device)
+        for indices in torch.arange(test_samples.shape[0]).split(BATCH_SIZE):
+            batch = test_samples[indices].to(device)
             context_masks, target_masks = sample_masks(grid, grid, mask_config, mask_generator)
             loss = torch.zeros((), device=device)
             for context_mask in context_masks:
@@ -206,8 +207,18 @@ def main() -> None:
 
                     test_loss = _held_out_loss(core, test_patches, grid, mask_config, device)
 
-                    train_z = encode_frames_pooled(core, train_frames, patch_size=PATCH_SIZE).cpu()
-                    test_z = encode_frames_pooled(core, test_frames, patch_size=PATCH_SIZE).cpu()
+                    train_z = encode_frames_pooled_batched(
+                        core,
+                        train_frames,
+                        patch_size=PATCH_SIZE,
+                        batch_size=BATCH_SIZE,
+                    ).cpu()
+                    test_z = encode_frames_pooled_batched(
+                        core,
+                        test_frames,
+                        patch_size=PATCH_SIZE,
+                        batch_size=BATCH_SIZE,
+                    ).cpu()
                     spectrum = compute_latent_spectrum(test_z)
 
                     classifier = fit_entity_classifier(

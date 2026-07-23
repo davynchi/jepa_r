@@ -11,6 +11,7 @@ from jepa.configs.base import derive_seed
 from jepa.training.images.ijepa_spatial import (
     MaskConfig,
     SpatialIJEPACore,
+    encode_samples_pooled,
     sample_masks,
     spatial_ijepa_per_sample_loss,
 )
@@ -209,7 +210,7 @@ def _latent_covariance_from_patches(
     core: SpatialIJEPACore,
     patches: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    latents = core.context_encoder(patches).mean(dim=1).to(torch.float64)
+    latents = encode_samples_pooled(core, patches).to(torch.float64)
     centered = latents - latents.mean(dim=0, keepdim=True)
     covariance = centered.T @ centered / max(latents.shape[0] - 1, 1)
     return (covariance + covariance.T) / 2, latents
@@ -557,7 +558,7 @@ def score_frames_by_coordinate_importance(
     mask_generator = torch.Generator().manual_seed(derive_seed(seed, "weighting-coord-masks"))
     try:
         ref_patches = train_patches[ref_indices.to(train_patches.device)].to(device)
-        ref_latents = core.context_encoder(ref_patches).mean(dim=1)
+        ref_latents = encode_samples_pooled(core, ref_patches)
         if coordinate_importance == "covariance":
             coord_weights, basis, coord_metadata = _coordinate_importance_from_covariance(
                 ref_latents,
@@ -567,8 +568,8 @@ def score_frames_by_coordinate_importance(
             if transform_pair_patches is None:
                 raise ValueError("transformation coordinate importance requires paired patches")
             source_patches, target_patches = transform_pair_patches
-            source_latents = core.context_encoder(source_patches.to(device)).mean(dim=1)
-            target_latents = core.context_encoder(target_patches.to(device)).mean(dim=1)
+            source_latents = encode_samples_pooled(core, source_patches.to(device))
+            target_latents = encode_samples_pooled(core, target_patches.to(device))
             coord_weights, basis, coord_metadata = _coordinate_importance_from_transformation(
                 source_latents,
                 target_latents,

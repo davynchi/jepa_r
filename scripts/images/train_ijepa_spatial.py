@@ -40,7 +40,8 @@ from jepa.training.core import ema_update  # noqa: E402
 from jepa.training.images.ijepa_spatial import (  # noqa: E402
     MaskConfig,
     build_spatial_ijepa_core,
-    encode_frames_pooled,
+    encode_frames_pooled_batched,
+    encode_samples_pooled,
     load_spatial_checkpoint,
     sample_masks,
     save_spatial_checkpoint,
@@ -234,7 +235,7 @@ def _restore_weighting_state(
 @torch.no_grad()
 def _evaluate_spatial_loss(
     core,
-    patches: torch.Tensor,
+    samples: torch.Tensor,
     *,
     grid: int,
     mask_config: MaskConfig,
@@ -248,7 +249,7 @@ def _evaluate_spatial_loss(
     generator = torch.Generator().manual_seed(seed)
     total_loss = 0.0
     total_examples = 0
-    for batch in patches.split(batch_size):
+    for batch in samples.split(batch_size):
         batch = batch.to(device)
         context_masks, target_masks = sample_masks(grid, grid, mask_config, generator)
         loss = torch.zeros((), device=device)
@@ -266,15 +267,15 @@ def _evaluate_spatial_loss(
 @torch.no_grad()
 def _encode_patches_pooled(
     core,
-    patches: torch.Tensor,
+    samples: torch.Tensor,
     *,
     batch_size: int,
     device: torch.device,
 ) -> torch.Tensor:
     core.context_encoder.eval()
     encoded = []
-    for batch in patches.split(batch_size):
-        encoded.append(core.context_encoder(batch.to(device)).mean(dim=-2).detach().cpu())
+    for batch in samples.split(batch_size):
+        encoded.append(encode_samples_pooled(core, batch.to(device)).detach().cpu())
     return torch.cat(encoded, dim=0)
 
 
@@ -647,7 +648,12 @@ def main() -> None:
                         device=device,
                     )
                 else:
-                    test_z = encode_frames_pooled(core, test_frames, patch_size=PATCH_SIZE)
+                    test_z = encode_frames_pooled_batched(
+                        core,
+                        test_frames,
+                        patch_size=PATCH_SIZE,
+                        batch_size=args.batch_size,
+                    )
                 spectrum = compute_latent_spectrum(test_z.reshape(-1, PATCH_LATENT_DIM))
                 scalars = {
                     "eval/test_loss": test_loss,
