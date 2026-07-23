@@ -8,7 +8,6 @@ tensorboard --logdir outputs/ijepa_spatial
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
 from dataclasses import asdict
@@ -62,6 +61,11 @@ from jepa.training.images.ijepa_spatial import (  # noqa: E402
     save_spatial_checkpoint,
     spatial_ijepa_loss,
     spatial_ijepa_loss_with_context,
+)
+from jepa.training.images.mask_loader import (  # noqa: E402
+    FileImageMaskLoader,
+    IndexMaskLoader,
+    apply_prepared_crop,
 )
 from jepa.training.images.spatial_curriculum import (  # noqa: E402
     SpatialWeightingConfig,
@@ -151,6 +155,19 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--log-every-steps", type=int, default=LOG_EVERY_STEPS)
     parser.add_argument("--no-tensorboard", action="store_true")
+    parser.add_argument(
+        "--mask-loader-workers",
+        type=int,
+        default=10,
+        help="Worker processes that prefetch per-image masks; 0 runs masking synchronously",
+    )
+    parser.add_argument("--mask-prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--mask-min-keep",
+        type=int,
+        default=0,
+        help="Minimum kept tokens per mask; 0 selects 4 for 8x8 and 10 for larger grids",
+    )
     parser.add_argument(
         "--resident-device-data",
         action="store_true",
@@ -283,76 +300,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--weighting-score-clip must be non-negative")
     if not 0 <= args.weighting_target_ess_fraction <= 1:
         raise ValueError("--weighting-target-ess-fraction must be in [0, 1]")
-
-
-def _random_resized_crop_batch(
-    images: torch.Tensor,
-    *,
-    output_size: int,
-    scale: tuple[float, float],
-    horizontal_flip_probability: float,
-    generator: torch.Generator,
-) -> torch.Tensor:
-    """Batched tensor implementation of upstream RandomResizedCrop and flip."""
-    batch_size, channels, source_h, source_w = images.shape
-    area = source_h * source_w
-    crop_h = torch.full((batch_size,), source_h, dtype=torch.long)
-    crop_w = torch.full((batch_size,), source_w, dtype=torch.long)
-    valid = torch.zeros(batch_size, dtype=torch.bool)
-    for _ in range(10):
-        target_area = area * (
-            scale[0] + torch.rand(batch_size, generator=generator) * (scale[1] - scale[0])
-        )
-        log_ratio = math.log(3 / 4) + torch.rand(batch_size, generator=generator) * (
-            math.log(4 / 3) - math.log(3 / 4)
-        )
-        ratio = log_ratio.exp()
-        proposed_w = (target_area * ratio).sqrt().round().to(torch.long)
-        proposed_h = (target_area / ratio).sqrt().round().to(torch.long)
-        accepted = (
-            ~valid
-            & (proposed_h > 0)
-            & (proposed_h <= source_h)
-            & (proposed_w > 0)
-            & (proposed_w <= source_w)
-        )
-        crop_h[accepted] = proposed_h[accepted]
-        crop_w[accepted] = proposed_w[accepted]
-        valid |= accepted
-        if bool(valid.all()):
-            break
-
-    top_random = torch.rand(batch_size, generator=generator)
-    left_random = torch.rand(batch_size, generator=generator)
-    top = (top_random * (source_h - crop_h + 1)).floor()
-    left = (left_random * (source_w - crop_w + 1)).floor()
-    theta = torch.zeros((batch_size, 2, 3), dtype=torch.float32, device=images.device)
-    theta[:, 0, 0] = crop_w.to(device=images.device, dtype=torch.float32) / source_w
-    theta[:, 1, 1] = crop_h.to(device=images.device, dtype=torch.float32) / source_h
-    theta[:, 0, 2] = (
-        2.0 * (left.to(device=images.device) + crop_w.to(device=images.device) / 2.0) / source_w
-        - 1.0
-    )
-    theta[:, 1, 2] = (
-        2.0 * (top.to(device=images.device) + crop_h.to(device=images.device) / 2.0) / source_h
-        - 1.0
-    )
-    grid = F.affine_grid(
-        theta,
-        size=(batch_size, channels, output_size, output_size),
-        align_corners=False,
-    )
-    crops = F.grid_sample(
-        images,
-        grid,
-        mode="bilinear",
-        padding_mode="border",
-        align_corners=False,
-    )
-    flip = (torch.rand(batch_size, generator=generator) < horizontal_flip_probability).to(
-        images.device
-    )
-    return torch.where(flip[:, None, None, None], crops.flip(-1), crops)
+    if args.mask_loader_workers < 0:
+        raise ValueError("--mask-loader-workers must be non-negative")
+    if args.mask_prefetch_factor <= 0:
+        raise ValueError("--mask-prefetch-factor must be positive")
+    if args.mask_min_keep < 0:
+        raise ValueError("--mask-min-keep must be non-negative")
 
 
 def _init_upstream_optimizer(
@@ -664,6 +617,7 @@ def main() -> None:
             num_train_samples=args.num_train_samples,
             num_val_samples=args.num_val_samples,
             num_test_samples=args.num_test_samples,
+            file_backed=True,
         )
         datasets = build_mini_webvision_static_dataset_splits(mini_webvision_config)
         config_payload = {
@@ -701,6 +655,9 @@ def main() -> None:
                 "bfloat16": args.bfloat16,
                 "crop_scale": list(args.crop_scale),
                 "horizontal_flip_probability": args.horizontal_flip_prob,
+                "mask_loader_workers": args.mask_loader_workers,
+                "mask_prefetch_factor": args.mask_prefetch_factor,
+                "mask_min_keep": args.mask_min_keep,
                 "batch_size": args.batch_size,
                 "epochs": args.epochs,
                 "seed": args.seed,
@@ -746,9 +703,17 @@ def main() -> None:
         }
     )
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
-    train_images = normalize_ijepa_images(datasets.train.images, inplace=True)
-    test_images = normalize_ijepa_images(datasets.test.images, inplace=True)
+    train_paths = list(datasets.train.paths) if args.dataset == "mini-webvision" else None
+    if args.dataset == "mini-webvision":
+        train_images = datasets.train.images
+        test_images = datasets.test.images
+    else:
+        train_images = normalize_ijepa_images(datasets.train.images, inplace=True)
+        test_images = normalize_ijepa_images(datasets.test.images, inplace=True)
     transform_pair_images: tuple[torch.Tensor, torch.Tensor] | None = None
     if (
         weighting_config.method == "coord"
@@ -775,6 +740,8 @@ def main() -> None:
         )
     grid = args.image_size // args.patch_size
     num_patches = grid * grid
+    if args.resident_device_data and args.dataset == "mini-webvision":
+        raise ValueError("--resident-device-data is not supported for file-backed Mini-WebVision")
     if args.resident_device_data:
         train_images = train_images.to(device)
         test_images = test_images.to(device)
@@ -801,10 +768,41 @@ def main() -> None:
     core.context_encoder.to(device)
     core.predictor.to(device)
     core.target_encoder.to(device)
-    mask_config = MaskConfig()
+    mask_min_keep = args.mask_min_keep or (10 if grid >= 16 else 4)
+    mask_config = MaskConfig(min_keep=mask_min_keep)
 
     n = train_images.shape[0]
     iterations_per_epoch = max(n // args.batch_size, 1)
+    num_draws_per_epoch = (
+        n if n < args.batch_size else iterations_per_epoch * args.batch_size
+    )
+    if train_paths is None:
+        mask_loader = IndexMaskLoader(
+            num_draws=num_draws_per_epoch,
+            batch_size=args.batch_size,
+            grid=grid,
+            mask_config=mask_config,
+            source_size=tuple(train_images.shape[-2:]),
+            crop_scale=tuple(args.crop_scale),
+            horizontal_flip_probability=args.horizontal_flip_prob,
+            num_workers=args.mask_loader_workers,
+            prefetch_factor=args.mask_prefetch_factor,
+            pin_memory=device.type == "cuda",
+        )
+    else:
+        mask_loader = FileImageMaskLoader(
+            train_paths,
+            num_draws=num_draws_per_epoch,
+            batch_size=args.batch_size,
+            image_size=args.image_size,
+            patch_size=args.patch_size,
+            mask_config=mask_config,
+            crop_scale=tuple(args.crop_scale),
+            horizontal_flip_probability=args.horizontal_flip_prob,
+            num_workers=args.mask_loader_workers,
+            prefetch_factor=args.mask_prefetch_factor,
+            pin_memory=device.type == "cuda",
+        )
     optimizer, lr_scheduler, wd_scheduler = _init_upstream_optimizer(
         core,
         iterations_per_epoch=iterations_per_epoch,
@@ -900,7 +898,6 @@ def main() -> None:
             core.context_encoder.train()
             core.predictor.train()
             core.target_encoder.train()
-            num_draws = n if n < args.batch_size else iterations_per_epoch * args.batch_size
             if bandit_sampler is not None and epoch > weighting_config.warmup_epochs:
                 assert bandit_cache is not None
                 policy_generator = torch.Generator().manual_seed(
@@ -937,42 +934,46 @@ def main() -> None:
             if weighting_config.method != "uniform" and epoch > weighting_config.warmup_epochs:
                 order = sample_frame_indices(
                     weighting_state,
-                    num_draws=num_draws,
+                    num_draws=num_draws_per_epoch,
                     seed=derive_seed(args.seed, "weighted-order", epoch),
                 )
             else:
                 order = torch.randperm(
                     n,
                     generator=torch.Generator().manual_seed(derive_seed(args.seed, "order", epoch)),
-                )[:num_draws]
-            if args.resident_device_data:
-                order = order.to(device)
-            batch_chunks = order.split(args.batch_size)
-            mask_generator = torch.Generator().manual_seed(derive_seed(args.seed, "masks", epoch))
-            transform_generator = torch.Generator().manual_seed(
-                derive_seed(args.seed, "transforms", epoch)
+                )[:num_draws_per_epoch]
+            mask_batches = mask_loader.iter_epoch(
+                order,
+                seed=derive_seed(args.seed, "masks", epoch),
             )
             epoch_loss, batches = 0.0, 0
             epoch_bandit_rewards: list[float] = []
             epoch_bandit_prediction_errors: list[float] = []
             epoch_start = time.time()
-            for indices in batch_chunks:
+            for prepared_batch in mask_batches:
                 global_step += 1
-                batch = train_images[indices].to(device)
-                batch = _random_resized_crop_batch(
-                    batch,
-                    output_size=args.image_size,
-                    scale=tuple(args.crop_scale),
-                    horizontal_flip_probability=args.horizontal_flip_prob,
-                    generator=transform_generator,
-                )
-                context_masks, target_masks = sample_masks(
-                    grid,
-                    grid,
-                    mask_config,
-                    mask_generator,
-                    batch_size=batch.shape[0],
-                )
+                indices = prepared_batch.indices
+                context_masks = prepared_batch.context_masks
+                target_masks = prepared_batch.target_masks
+                if prepared_batch.images is not None:
+                    batch = prepared_batch.images.to(device, non_blocking=True)
+                else:
+                    if prepared_batch.crop_theta is None:
+                        raise RuntimeError("resident batch is missing crop geometry")
+                    if prepared_batch.horizontal_flip is None:
+                        raise RuntimeError("resident batch is missing horizontal flip flags")
+                    gather_indices = (
+                        indices.to(device, non_blocking=True)
+                        if args.resident_device_data
+                        else indices
+                    )
+                    batch = train_images[gather_indices].to(device, non_blocking=True)
+                    batch = apply_prepared_crop(
+                        batch,
+                        theta=prepared_batch.crop_theta,
+                        horizontal_flip=prepared_batch.horizontal_flip,
+                        output_size=args.image_size,
+                    )
                 current_lr = lr_scheduler.step()
                 current_wd = wd_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1068,7 +1069,8 @@ def main() -> None:
                             "train/lr": current_lr,
                             "train/weight_decay": current_wd,
                             "train/ema_momentum": momentum,
-                            "train/epoch_fraction": epoch + batches / max(len(batch_chunks), 1),
+                            "train/epoch_fraction": epoch
+                            + batches / max(iterations_per_epoch, 1),
                             **bandit_scalars,
                         },
                     )
