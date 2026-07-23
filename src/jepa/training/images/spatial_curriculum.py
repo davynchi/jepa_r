@@ -17,7 +17,13 @@ from jepa.training.images.ijepa_spatial import (
     spatial_ijepa_per_sample_loss,
 )
 
-SpatialWeightingMethod = Literal["uniform", "loss", "ras", "coord"]
+SpatialWeightingMethod = Literal[
+    "uniform",
+    "loss",
+    "ras",
+    "coord",
+    "ras-thompson",
+]
 SpatialRichnessFunctional = Literal["logdet", "rbar", "pr"]
 RASScoreGranularity = Literal["sample", "batch"]
 CoordinateImportanceMethod = Literal["covariance", "transformation", "dynamics"]
@@ -64,7 +70,13 @@ def init_spatial_weighting(num_frames: int) -> SpatialWeightingState:
 
 
 def _validate_config(config: SpatialWeightingConfig) -> None:
-    if config.method not in {"uniform", "loss", "ras", "coord"}:
+    if config.method not in {
+        "uniform",
+        "loss",
+        "ras",
+        "coord",
+        "ras-thompson",
+    }:
         raise ValueError(f"unknown spatial weighting method: {config.method!r}")
     if config.warmup_epochs < 0:
         raise ValueError("warmup_epochs must be non-negative")
@@ -101,7 +113,7 @@ def _validate_config(config: SpatialWeightingConfig) -> None:
 def should_update_weights(epoch: int, config: SpatialWeightingConfig) -> bool:
     _validate_config(config)
     return (
-        config.method != "uniform"
+        config.method in {"loss", "ras", "coord"}
         and epoch >= config.warmup_epochs
         and epoch % config.update_every_epochs == 0
     )
@@ -320,14 +332,10 @@ def _coordinate_importance_from_transformation(
     source_eigs, source_basis = torch.linalg.eigh((source_cov + source_cov.T) / 2)
     target_eigs, target_basis = torch.linalg.eigh((target_cov + target_cov.T) / 2)
     source_inv_sqrt = (
-        source_basis
-        @ torch.diag(source_eigs.clamp_min(delta).rsqrt())
-        @ source_basis.T
+        source_basis @ torch.diag(source_eigs.clamp_min(delta).rsqrt()) @ source_basis.T
     )
     target_inv_sqrt = (
-        target_basis
-        @ torch.diag(target_eigs.clamp_min(delta).rsqrt())
-        @ target_basis.T
+        target_basis @ torch.diag(target_eigs.clamp_min(delta).rsqrt()) @ target_basis.T
     )
     operator = target_inv_sqrt @ cross_cov @ source_inv_sqrt
     operator = torch.nan_to_num(operator, nan=0.0, posinf=0.0, neginf=0.0)
@@ -490,12 +498,12 @@ def score_frames_by_ras(
         )
         richness_gradients_raw = torch.autograd.grad(richness, parameters, retain_graph=False)
         richness_gradients = tuple(gradient.detach() for gradient in richness_gradients_raw)
-        grad_norm = torch.sqrt(
-            sum(
-                gradient.detach().to(torch.float64).square().sum()
-                for gradient in richness_gradients
+        grad_norm_squared = torch.zeros((), dtype=torch.float64, device=device)
+        for gradient in richness_gradients:
+            grad_norm_squared = (
+                grad_norm_squared + gradient.detach().to(torch.float64).square().sum()
             )
-        )
+        grad_norm = torch.sqrt(grad_norm_squared)
 
         score_order = torch.randperm(
             train_images.shape[0],
@@ -525,10 +533,7 @@ def score_frames_by_ras(
                     allow_unused=True,
                 )
                 group_score = float(
-                    (-_dot_gradients(loss_gradients, richness_gradients))
-                    .detach()
-                    .cpu()
-                    .item()
+                    (-_dot_gradients(loss_gradients, richness_gradients)).detach().cpu().item()
                 )
                 batch_scores = torch.full(
                     (batch.shape[0],),
@@ -558,10 +563,7 @@ def score_frames_by_ras(
                         allow_unused=True,
                     )
                     batch_scores[local_index] = float(
-                        (-_dot_gradients(loss_gradients, richness_gradients))
-                        .detach()
-                        .cpu()
-                        .item()
+                        (-_dot_gradients(loss_gradients, richness_gradients)).detach().cpu().item()
                     )
             scores[indices.detach().cpu()] = batch_scores
     finally:
@@ -647,17 +649,14 @@ def score_frames_by_coordinate_importance(
                 torch.autograd.grad(coordinate, parameters, retain_graph=True, allow_unused=True)
             )
         coord_weights = coord_weights.to(device=device, dtype=torch.float64)
-        coord_grad_norm = torch.sqrt(
-            sum(
-                sum(
-                    torch.zeros((), dtype=torch.float64, device=device)
-                    if gradient is None
-                    else gradient.detach().to(torch.float64).square().sum()
-                    for gradient in gradients
-                )
-                for gradients in coordinate_gradients
-            )
-        )
+        coord_grad_norm_squared = torch.zeros((), dtype=torch.float64, device=device)
+        for gradients in coordinate_gradients:
+            for gradient in gradients:
+                if gradient is not None:
+                    coord_grad_norm_squared = (
+                        coord_grad_norm_squared + gradient.detach().to(torch.float64).square().sum()
+                    )
+        coord_grad_norm = torch.sqrt(coord_grad_norm_squared)
 
         for indices in torch.arange(train_images.shape[0], device=train_images.device).split(
             batch_size
@@ -677,9 +676,7 @@ def score_frames_by_coordinate_importance(
                 sample_context_masks = [
                     mask[local_index : local_index + 1] for mask in context_masks
                 ]
-                sample_target_masks = [
-                    mask[local_index : local_index + 1] for mask in target_masks
-                ]
+                sample_target_masks = [mask[local_index : local_index + 1] for mask in target_masks]
                 sample_loss = spatial_ijepa_per_sample_loss(
                     core,
                     sample,

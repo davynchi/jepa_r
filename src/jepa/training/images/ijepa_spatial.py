@@ -114,9 +114,7 @@ def sample_masks(
     pred_size = _sample_block_size(
         grid_h, grid_w, config.pred_mask_scale, config.aspect_ratio, generator
     )
-    enc_size = _sample_block_size(
-        grid_h, grid_w, config.enc_mask_scale, (1.0, 1.0), generator
-    )
+    enc_size = _sample_block_size(grid_h, grid_w, config.enc_mask_scale, (1.0, 1.0), generator)
 
     targets_by_image: list[list[torch.Tensor]] = []
     contexts_by_image: list[list[torch.Tensor]] = []
@@ -248,9 +246,7 @@ def _masks_to_device(masks: list[torch.Tensor], device: torch.device) -> list[to
     return [mask.to(device=device, dtype=torch.long, non_blocking=True) for mask in masks]
 
 
-def normalize_ijepa_images(
-    images: torch.Tensor, *, inplace: bool = False
-) -> torch.Tensor:
+def normalize_ijepa_images(images: torch.Tensor, *, inplace: bool = False) -> torch.Tensor:
     """Apply the ImageNet normalization used by upstream I-JEPA transforms."""
     mean = images.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
     std = images.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
@@ -266,6 +262,19 @@ def spatial_ijepa_per_sample_loss(
     target_masks: list[torch.Tensor] | torch.Tensor,
 ) -> torch.Tensor:
     """Return the upstream I-JEPA loss reduced to one value per input image."""
+    losses, _ = spatial_ijepa_per_sample_loss_with_context(
+        core, images, context_masks, target_masks
+    )
+    return losses
+
+
+def spatial_ijepa_per_sample_loss_with_context(
+    core: SpatialIJEPACore,
+    images: torch.Tensor,
+    context_masks: list[torch.Tensor] | torch.Tensor,
+    target_masks: list[torch.Tensor] | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-image loss and pooled masked-context representations."""
     if isinstance(context_masks, torch.Tensor):
         context_masks = [context_masks]
     if isinstance(target_masks, torch.Tensor):
@@ -284,11 +293,15 @@ def spatial_ijepa_per_sample_loss(
         target = target.detach()
 
     context = core.context_encoder(images, context_masks)
+    pooled_context = context.reshape(
+        len(context_masks), batch_size, context.shape[-2], context.shape[-1]
+    ).mean(dim=(0, 2))
     prediction = core.predictor(context, context_masks, target_masks)
     per_element = F.smooth_l1_loss(prediction, target, reduction="none")
-    return per_element.reshape(
-        len(target_masks), len(context_masks), batch_size, -1
-    ).mean(dim=(0, 1, 3))
+    losses = per_element.reshape(len(target_masks), len(context_masks), batch_size, -1).mean(
+        dim=(0, 1, 3)
+    )
+    return losses, pooled_context
 
 
 def spatial_ijepa_loss(
@@ -298,6 +311,18 @@ def spatial_ijepa_loss(
     target_masks: list[torch.Tensor] | torch.Tensor,
 ) -> torch.Tensor:
     return spatial_ijepa_per_sample_loss(core, images, context_masks, target_masks).mean()
+
+
+def spatial_ijepa_loss_with_context(
+    core: SpatialIJEPACore,
+    images: torch.Tensor,
+    context_masks: list[torch.Tensor] | torch.Tensor,
+    target_masks: list[torch.Tensor] | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    losses, contexts = spatial_ijepa_per_sample_loss_with_context(
+        core, images, context_masks, target_masks
+    )
+    return losses.mean(), contexts
 
 
 def encode_samples_pooled(core: SpatialIJEPACore, images: torch.Tensor) -> torch.Tensor:

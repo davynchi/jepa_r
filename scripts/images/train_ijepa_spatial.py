@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Train upstream-style I-JEPA with project datasets and sample weighting.
 
-    CUDA_VISIBLE_DEVICES=1 python scripts/images/train_ijepa_spatial.py --run-name uniform_seed0
-    tensorboard --logdir outputs/ijepa_spatial
+CUDA_VISIBLE_DEVICES=1 python scripts/images/train_ijepa_spatial.py --run-name uniform_seed0
+tensorboard --logdir outputs/ijepa_spatial
 """
 
 from __future__ import annotations
@@ -34,6 +34,15 @@ from jepa.data.images.tiny_imagenet import (  # noqa: E402
     TinyImageNetDataConfig,
     build_tiny_imagenet_static_dataset_splits,
 )
+from jepa.training.images.bandit_weighting import (  # noqa: E402
+    DiscountedLinearThompsonSampler,
+    DiscountedRewardNormalizer,
+    LatentContextCache,
+    LinearThompsonConfig,
+    RichnessGradientSnapshot,
+    batch_ras_from_parameter_gradients,
+    capture_richness_gradient,
+)
 from jepa.training.images.ijepa_schedulers import (  # noqa: E402
     CosineWDSchedule,
     WarmupCosineSchedule,
@@ -48,6 +57,7 @@ from jepa.training.images.ijepa_spatial import (  # noqa: E402
     sample_masks,
     save_spatial_checkpoint,
     spatial_ijepa_loss,
+    spatial_ijepa_loss_with_context,
 )
 from jepa.training.images.spatial_curriculum import (  # noqa: E402
     SpatialWeightingConfig,
@@ -144,7 +154,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--weighting-method",
-        choices=("uniform", "loss", "ras", "coord"),
+        choices=("uniform", "loss", "ras", "coord", "ras-thompson"),
         default="uniform",
     )
     parser.add_argument("--weighting-warmup-epochs", type=int, default=0)
@@ -182,6 +192,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--coordinate-ema-beta", type=float, default=0.1)
     parser.add_argument("--coordinate-delta", type=float, default=1.0e-6)
+    parser.add_argument("--bandit-discount", type=float, default=0.999)
+    parser.add_argument("--bandit-prior-precision", type=float, default=1.0)
+    parser.add_argument("--bandit-observation-noise", type=float, default=1.0)
+    parser.add_argument("--bandit-exploration-scale", type=float, default=1.0)
+    parser.add_argument("--bandit-context-ema-beta", type=float, default=0.1)
+    parser.add_argument("--bandit-reward-normalization-decay", type=float, default=0.99)
+    parser.add_argument("--bandit-richness-refresh-steps", type=int, default=500)
     return parser.parse_args()
 
 
@@ -213,9 +230,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--image-size must be divisible by --patch-size")
     if args.predictor_embed_dim <= 0 or args.predictor_depth <= 0:
         raise ValueError("predictor dimensions must be positive")
-    if args.predictor_embed_dim % {"vit_tiny": 3, "vit_small": 6, "vit_base": 12, "vit_large": 16}[
-        args.model_name
-    ]:
+    if (
+        args.predictor_embed_dim
+        % {"vit_tiny": 3, "vit_small": 6, "vit_base": 12, "vit_large": 16}[args.model_name]
+    ):
         raise ValueError("--predictor-embed-dim must be divisible by the encoder head count")
     if not 0.0 <= args.horizontal_flip_prob <= 1.0:
         raise ValueError("--horizontal-flip-prob must be in [0, 1]")
@@ -225,6 +243,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("EMA schedule must satisfy 0 <= start <= end <= 1")
     if args.warmup_epochs < 0:
         raise ValueError("--warmup-epochs must be non-negative")
+    if args.bandit_richness_refresh_steps <= 0:
+        raise ValueError("--bandit-richness-refresh-steps must be positive")
+    if not 0 <= args.bandit_reward_normalization_decay < 1:
+        raise ValueError("--bandit-reward-normalization-decay must be in [0, 1)")
 
 
 def _random_resized_crop_batch(
@@ -243,8 +265,7 @@ def _random_resized_crop_batch(
     valid = torch.zeros(batch_size, dtype=torch.bool)
     for _ in range(10):
         target_area = area * (
-            scale[0]
-            + torch.rand(batch_size, generator=generator) * (scale[1] - scale[0])
+            scale[0] + torch.rand(batch_size, generator=generator) * (scale[1] - scale[0])
         )
         log_ratio = math.log(3 / 4) + torch.rand(batch_size, generator=generator) * (
             math.log(4 / 3) - math.log(3 / 4)
@@ -273,15 +294,11 @@ def _random_resized_crop_batch(
     theta[:, 0, 0] = crop_w.to(device=images.device, dtype=torch.float32) / source_w
     theta[:, 1, 1] = crop_h.to(device=images.device, dtype=torch.float32) / source_h
     theta[:, 0, 2] = (
-        2.0
-        * (left.to(device=images.device) + crop_w.to(device=images.device) / 2.0)
-        / source_w
+        2.0 * (left.to(device=images.device) + crop_w.to(device=images.device) / 2.0) / source_w
         - 1.0
     )
     theta[:, 1, 2] = (
-        2.0
-        * (top.to(device=images.device) + crop_h.to(device=images.device) / 2.0)
-        / source_h
+        2.0 * (top.to(device=images.device) + crop_h.to(device=images.device) / 2.0) / source_h
         - 1.0
     )
     grid = F.affine_grid(
@@ -296,9 +313,9 @@ def _random_resized_crop_batch(
         padding_mode="border",
         align_corners=False,
     )
-    flip = (
-        torch.rand(batch_size, generator=generator) < horizontal_flip_probability
-    ).to(images.device)
+    flip = (torch.rand(batch_size, generator=generator) < horizontal_flip_probability).to(
+        images.device
+    )
     return torch.where(flip[:, None, None, None], crops.flip(-1), crops)
 
 
@@ -380,6 +397,11 @@ def _weighting_checkpoint_state(
     weighting_state: SpatialWeightingState,
     ref_indices: torch.Tensor,
     scaler=None,
+    *,
+    bandit_sampler: DiscountedLinearThompsonSampler | None = None,
+    bandit_cache: LatentContextCache | None = None,
+    bandit_reward_normalizer: DiscountedRewardNormalizer | None = None,
+    richness_snapshot: RichnessGradientSnapshot | None = None,
 ) -> dict[str, object]:
     state: dict[str, object] = {
         "weighting_memory": weighting_state.memory,
@@ -391,6 +413,18 @@ def _weighting_checkpoint_state(
     }
     if scaler is not None and scaler.is_enabled():
         state["amp_scaler"] = scaler.state_dict()
+    if bandit_sampler is not None:
+        state["bandit_sampler"] = bandit_sampler.state_dict()
+    if bandit_cache is not None:
+        state["bandit_cache"] = bandit_cache.state_dict()
+    if bandit_reward_normalizer is not None:
+        state["bandit_reward_normalizer"] = bandit_reward_normalizer.state_dict()
+    if richness_snapshot is not None:
+        state["bandit_richness_snapshot"] = {
+            "gradients": tuple(gradient.detach().cpu() for gradient in richness_snapshot.gradients),
+            "metadata": richness_snapshot.metadata,
+            "step": richness_snapshot.step,
+        }
     return state
 
 
@@ -437,6 +471,43 @@ def _restore_weighting_state(
         coordinate_previous_ref_latents=coordinate_previous_ref_latents,
     )
     return state, ref_indices.detach().cpu().to(torch.long)
+
+
+def _restore_bandit_state(
+    checkpoint: dict[str, object],
+    *,
+    sampler: DiscountedLinearThompsonSampler,
+    cache: LatentContextCache,
+    reward_normalizer: DiscountedRewardNormalizer,
+    device: torch.device,
+) -> RichnessGradientSnapshot | None:
+    extra_state = checkpoint.get("extra_state")
+    if not isinstance(extra_state, dict):
+        raise ValueError("resume checkpoint is missing bandit extra_state")
+    sampler_state = extra_state.get("bandit_sampler")
+    cache_state = extra_state.get("bandit_cache")
+    normalizer_state = extra_state.get("bandit_reward_normalizer")
+    if not isinstance(sampler_state, dict):
+        raise ValueError("resume checkpoint has incomplete bandit sampler state")
+    if not isinstance(cache_state, dict):
+        raise ValueError("resume checkpoint has incomplete bandit cache state")
+    if not isinstance(normalizer_state, dict):
+        raise ValueError("resume checkpoint has incomplete bandit state")
+    sampler.load_state_dict(sampler_state)
+    cache.load_state_dict(cache_state)
+    reward_normalizer.load_state_dict(normalizer_state)
+    snapshot_state = extra_state.get("bandit_richness_snapshot")
+    if not isinstance(snapshot_state, dict):
+        return None
+    gradients = snapshot_state.get("gradients")
+    metadata = snapshot_state.get("metadata")
+    if not isinstance(gradients, tuple | list) or not isinstance(metadata, dict):
+        raise ValueError("resume checkpoint has invalid richness snapshot")
+    return RichnessGradientSnapshot(
+        gradients=tuple(torch.as_tensor(value).to(device) for value in gradients),
+        metadata={str(key): float(value) for key, value in metadata.items()},
+        step=int(snapshot_state["step"]),
+    )
 
 
 @torch.no_grad()
@@ -595,6 +666,15 @@ def main() -> None:
                     "coordinate_importance": weighting_config.coordinate_importance,
                     "coordinate_ema_beta": weighting_config.coordinate_ema_beta,
                     "coordinate_delta": weighting_config.coordinate_delta,
+                    "bandit": {
+                        "discount": args.bandit_discount,
+                        "prior_precision": args.bandit_prior_precision,
+                        "observation_noise": args.bandit_observation_noise,
+                        "exploration_scale": args.bandit_exploration_scale,
+                        "context_ema_beta": args.bandit_context_ema_beta,
+                        "reward_normalization_decay": args.bandit_reward_normalization_decay,
+                        "richness_refresh_steps": args.bandit_richness_refresh_steps,
+                    },
                 },
             },
         }
@@ -680,6 +760,30 @@ def main() -> None:
         ref_size=weighting_config.ref_size,
         seed=derive_seed(args.seed, "weighting-ref"),
     )
+    bandit_sampler: DiscountedLinearThompsonSampler | None = None
+    bandit_cache: LatentContextCache | None = None
+    bandit_reward_normalizer: DiscountedRewardNormalizer | None = None
+    bandit_encoder_parameters: tuple[torch.nn.Parameter, ...] = ()
+    richness_snapshot: RichnessGradientSnapshot | None = None
+    if weighting_config.method == "ras-thompson":
+        bandit_sampler = DiscountedLinearThompsonSampler(
+            LinearThompsonConfig(
+                context_dim=core.embed_dim,
+                prior_precision=args.bandit_prior_precision,
+                observation_noise=args.bandit_observation_noise,
+                discount=args.bandit_discount,
+                exploration_scale=args.bandit_exploration_scale,
+                temperature=weighting_config.temperature,
+                uniform_mix=weighting_config.uniform_mix,
+            )
+        )
+        bandit_cache = LatentContextCache(n, core.embed_dim, ema_beta=args.bandit_context_ema_beta)
+        bandit_reward_normalizer = DiscountedRewardNormalizer(
+            decay=args.bandit_reward_normalization_decay
+        )
+        bandit_encoder_parameters = tuple(
+            parameter for parameter in core.context_encoder.parameters() if parameter.requires_grad
+        )
     start_epoch = 1
     if args.resume_from is not None:
         checkpoint_path = Path(args.resume_from).expanduser().resolve()
@@ -710,6 +814,16 @@ def main() -> None:
             checkpoint,
             num_frames=n,
         )
+        if bandit_sampler is not None:
+            assert bandit_cache is not None
+            assert bandit_reward_normalizer is not None
+            richness_snapshot = _restore_bandit_state(
+                checkpoint,
+                sampler=bandit_sampler,
+                cache=bandit_cache,
+                reward_normalizer=bandit_reward_normalizer,
+                device=device,
+            )
         start_epoch = completed_epoch + 1
         print(
             f"resumed_from={checkpoint_path} start_epoch={start_epoch} global_step={global_step}",
@@ -720,11 +834,39 @@ def main() -> None:
             core.context_encoder.train()
             core.predictor.train()
             core.target_encoder.train()
-            num_draws = (
-                n
-                if n < args.batch_size
-                else iterations_per_epoch * args.batch_size
-            )
+            num_draws = n if n < args.batch_size else iterations_per_epoch * args.batch_size
+            if bandit_sampler is not None and epoch > weighting_config.warmup_epochs:
+                assert bandit_cache is not None
+                policy_generator = torch.Generator().manual_seed(
+                    derive_seed(args.seed, "bandit-policy", epoch)
+                )
+                policy_scores, policy_probabilities = bandit_sampler.draw_policy(
+                    bandit_cache.contexts,
+                    generator=policy_generator,
+                )
+                weighting_state = SpatialWeightingState(
+                    memory=weighting_state.memory,
+                    probabilities=policy_probabilities.detach().cpu().to(torch.float64),
+                    last_scores=policy_scores.detach().cpu().to(torch.float64),
+                    coordinate_importance=weighting_state.coordinate_importance,
+                    coordinate_previous_ref_latents=(
+                        weighting_state.coordinate_previous_ref_latents
+                    ),
+                )
+                logger.log(
+                    step=global_step,
+                    epoch=epoch,
+                    event="bandit_policy",
+                    scalars={
+                        **weighting_diagnostics(weighting_state),
+                        **bandit_sampler.diagnostics(),
+                        "bandit/cache_coverage": bandit_cache.coverage,
+                    },
+                    histograms={
+                        "hist/weighting_scores": weighting_state.last_scores,
+                        "hist/weighting_probabilities": weighting_state.probabilities,
+                    },
+                )
             if weighting_config.method != "uniform" and epoch > weighting_config.warmup_epochs:
                 order = sample_frame_indices(
                     weighting_state,
@@ -744,6 +886,8 @@ def main() -> None:
                 derive_seed(args.seed, "transforms", epoch)
             )
             epoch_loss, batches = 0.0, 0
+            epoch_bandit_rewards: list[float] = []
+            epoch_bandit_prediction_errors: list[float] = []
             epoch_start = time.time()
             for indices in batch_chunks:
                 global_step += 1
@@ -765,18 +909,73 @@ def main() -> None:
                 current_lr = lr_scheduler.step()
                 current_wd = wd_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                if bandit_sampler is not None and (
+                    richness_snapshot is None
+                    or global_step - richness_snapshot.step >= args.bandit_richness_refresh_steps
+                ):
+                    reference_images = train_images[weighting_ref_indices].to(device)
+                    richness_snapshot = capture_richness_gradient(
+                        core,
+                        reference_images,
+                        functional=weighting_config.richness_functional,
+                        delta=weighting_config.richness_delta,
+                        trace_target=weighting_config.richness_trace_target,
+                        trace_beta=weighting_config.richness_trace_beta,
+                        step=global_step,
+                    )
                 with torch.autocast(
                     device_type=device.type,
                     dtype=torch.bfloat16,
                     enabled=use_bfloat16,
                 ):
-                    loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
+                    if bandit_sampler is not None:
+                        loss, batch_contexts = spatial_ijepa_loss_with_context(
+                            core, batch, context_masks, target_masks
+                        )
+                    else:
+                        loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
                 if use_bfloat16:
                     scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
+                bandit_scalars: dict[str, float] = {}
+                if bandit_sampler is not None:
+                    assert bandit_cache is not None
+                    assert bandit_reward_normalizer is not None
+                    assert richness_snapshot is not None
+                    raw_reward = float(
+                        batch_ras_from_parameter_gradients(
+                            bandit_encoder_parameters, richness_snapshot
+                        ).item()
+                    )
+                    contexts_for_bandit = F.layer_norm(
+                        batch_contexts.detach().float(),
+                        (batch_contexts.shape[-1],),
+                    ).cpu()
+                    normalized_reward = bandit_reward_normalizer.update(raw_reward)
+                    predicted_reward = bandit_sampler.predict_batch_reward(contexts_for_bandit)
+                    bandit_sampler.update_batch(contexts_for_bandit, normalized_reward)
+                    bandit_cache.update(
+                        indices.detach().cpu(),
+                        contexts_for_bandit,
+                        step=global_step,
+                    )
+                    prediction_error = normalized_reward - predicted_reward
+                    epoch_bandit_rewards.append(normalized_reward)
+                    epoch_bandit_prediction_errors.append(prediction_error)
+                    bandit_scalars = {
+                        "bandit/raw_reward": raw_reward,
+                        "bandit/normalized_reward": normalized_reward,
+                        "bandit/predicted_reward": predicted_reward,
+                        "bandit/prediction_error": prediction_error,
+                        "bandit/cache_coverage": bandit_cache.coverage,
+                        **richness_snapshot.metadata,
+                    }
+                if use_bfloat16:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    loss.backward()
                     optimizer.step()
                 momentum = _ema_momentum(
                     global_step - 1,
@@ -801,6 +1000,7 @@ def main() -> None:
                             "train/weight_decay": current_wd,
                             "train/ema_momentum": momentum,
                             "train/epoch_fraction": epoch + batches / max(len(batch_chunks), 1),
+                            **bandit_scalars,
                         },
                     )
                 if (
@@ -815,7 +1015,13 @@ def main() -> None:
                         optimizer=optimizer,
                         metadata=metadata,
                         extra_state=_weighting_checkpoint_state(
-                            weighting_state, weighting_ref_indices, scaler
+                            weighting_state,
+                            weighting_ref_indices,
+                            scaler,
+                            bandit_sampler=bandit_sampler,
+                            bandit_cache=bandit_cache,
+                            bandit_reward_normalizer=bandit_reward_normalizer,
+                            richness_snapshot=richness_snapshot,
                         ),
                     )
                     save_spatial_checkpoint(
@@ -826,7 +1032,13 @@ def main() -> None:
                         optimizer=optimizer,
                         metadata=metadata,
                         extra_state=_weighting_checkpoint_state(
-                            weighting_state, weighting_ref_indices, scaler
+                            weighting_state,
+                            weighting_ref_indices,
+                            scaler,
+                            bandit_sampler=bandit_sampler,
+                            bandit_cache=bandit_cache,
+                            bandit_reward_normalizer=bandit_reward_normalizer,
+                            richness_snapshot=richness_snapshot,
                         ),
                     )
 
@@ -840,9 +1052,31 @@ def main() -> None:
                     "train/epoch_seconds": time.time() - epoch_start,
                     "train/batches_per_epoch": batches,
                     "train/elapsed_seconds": time.time() - start,
+                    **(
+                        {
+                            "bandit/reward_mean": float(
+                                torch.tensor(epoch_bandit_rewards).mean().item()
+                            ),
+                            "bandit/reward_std": float(
+                                torch.tensor(epoch_bandit_rewards).std(unbiased=False).item()
+                            ),
+                            "bandit/prediction_rmse": float(
+                                torch.tensor(epoch_bandit_prediction_errors)
+                                .square()
+                                .mean()
+                                .sqrt()
+                                .item()
+                            ),
+                            **bandit_sampler.diagnostics(),
+                            "bandit/cache_coverage": bandit_cache.coverage,
+                        }
+                        if bandit_sampler is not None
+                        and bandit_cache is not None
+                        and epoch_bandit_rewards
+                        else {}
+                    ),
                 },
             )
-
             if should_update_weights(epoch, weighting_config):
                 score_batch_size = weighting_config.score_batch_size or args.batch_size
                 if weighting_config.method == "loss":
@@ -963,7 +1197,9 @@ def main() -> None:
                     f"elapsed={time.time() - start:.0f}s",
                     flush=True,
                 )
-            if epoch % args.checkpoint_every_epochs == 0 or epoch == args.epochs:
+            if (
+                args.checkpoint_every_epochs > 0 and epoch % args.checkpoint_every_epochs == 0
+            ) or epoch == args.epochs:
                 save_spatial_checkpoint(
                     checkpoint_dir / f"epoch_{epoch:04d}.pt",
                     core,
@@ -972,7 +1208,13 @@ def main() -> None:
                     optimizer=optimizer,
                     metadata=metadata,
                     extra_state=_weighting_checkpoint_state(
-                        weighting_state, weighting_ref_indices, scaler
+                        weighting_state,
+                        weighting_ref_indices,
+                        scaler,
+                        bandit_sampler=bandit_sampler,
+                        bandit_cache=bandit_cache,
+                        bandit_reward_normalizer=bandit_reward_normalizer,
+                        richness_snapshot=richness_snapshot,
                     ),
                 )
                 save_spatial_checkpoint(
@@ -983,7 +1225,13 @@ def main() -> None:
                     optimizer=optimizer,
                     metadata=metadata,
                     extra_state=_weighting_checkpoint_state(
-                        weighting_state, weighting_ref_indices, scaler
+                        weighting_state,
+                        weighting_ref_indices,
+                        scaler,
+                        bandit_sampler=bandit_sampler,
+                        bandit_cache=bandit_cache,
+                        bandit_reward_normalizer=bandit_reward_normalizer,
+                        richness_snapshot=richness_snapshot,
                     ),
                 )
     finally:
