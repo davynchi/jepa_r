@@ -8,7 +8,7 @@ from typing import Literal
 import torch
 
 from jepa.configs.base import derive_seed
-from jepa.training.images.ijepa_spatial import (
+from jepa.training.images.legacy_ijepa_spatial import (
     MaskConfig,
     SpatialIJEPACore,
     encode_samples_pooled,
@@ -283,7 +283,10 @@ def _coordinate_importance_from_covariance(
     covariance = (covariance + covariance.T) / 2
     eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
     eigenvalues = eigenvalues.clamp_min(0)
-    weights = _normalize_coordinate_importance(eigenvalues / eigenvalues.sum().clamp_min(delta), delta=delta)
+    weights = _normalize_coordinate_importance(
+        eigenvalues / eigenvalues.sum().clamp_min(delta),
+        delta=delta,
+    )
     metadata = {
         "coord/importance_min": float(weights.min().item()),
         "coord/importance_max": float(weights.max().item()),
@@ -326,7 +329,10 @@ def _coordinate_importance_from_transformation(
     operator = torch.nan_to_num(operator, nan=0.0, posinf=0.0, neginf=0.0)
     _, singular_values, vh = torch.linalg.svd(operator + delta * eye, full_matrices=False)
     singular_values = singular_values.clamp(max=1.0)
-    weights = _normalize_coordinate_importance((1.0 - singular_values.abs()).clamp_min(0), delta=delta)
+    weights = _normalize_coordinate_importance(
+        (1.0 - singular_values.abs()).clamp_min(0),
+        delta=delta,
+    )
     basis = vh.T
     metadata = {
         "coord/importance_min": float(weights.min().item()),

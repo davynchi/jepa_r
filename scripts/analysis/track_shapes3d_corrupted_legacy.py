@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch one spatial I-JEPA run directory and compute held-out diagnostics.
+"""Watch a legacy corrupted-Shapes3D run and compute clean held-out diagnostics.
 
 The training script only reports train loss and effective_rank, which is not
 enough to tell "learned something" from "found a cheap low-rank solution". Per
@@ -59,7 +59,7 @@ from jepa.data.images.shapes3d import (  # noqa: E402
     build_shapes3d_static_dataset_splits,
 )
 from jepa.models.patches import patchify  # noqa: E402
-from jepa.training.images.ijepa_spatial import (  # noqa: E402
+from jepa.training.images.legacy_ijepa_spatial import (  # noqa: E402
     MaskConfig,
     build_spatial_ijepa_core,
     encode_frames_pooled,
@@ -70,7 +70,9 @@ from jepa.training.images.ijepa_spatial import (  # noqa: E402
 )
 from jepa.training.images.spatial_logging import SpatialRunLogger  # noqa: E402
 
-DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[2] / "outputs" / "ijepa_spatial"
+DEFAULT_OUTPUT_ROOT = (
+    Path(__file__).resolve().parents[2] / "outputs" / "shapes3d_corrupted_legacy"
+)
 PATCH_SIZE = 8
 PATCH_LATENT_DIM = 16
 BATCH_SIZE = 128
@@ -132,7 +134,7 @@ def _held_out_loss(core, test_samples, grid, mask_config, device) -> float:
 def main() -> None:
     args = _parse_args()
     run_dir = _resolve_run_dir(args.run_dir)
-    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir = run_dir / "network"
     records_path = run_dir / "metrics" / "diagnostics.json"
     logger = SpatialRunLogger(run_dir, enable_tensorboard=not args.no_tensorboard)
 
