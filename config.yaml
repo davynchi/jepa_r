@@ -8,6 +8,10 @@ cmd: >
   --batch-size 32
   --device cuda
   --dataset shapes3d
+  --model-name vit_tiny
+  --patch-size 8
+  --predictor-depth 2
+  --warmup-epochs 0
   --num-train-samples 256
   --num-val-samples 64
   --num-test-samples 64

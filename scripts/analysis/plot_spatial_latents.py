@@ -45,13 +45,11 @@ from jepa.configs.images.shapes3d import (  # noqa: E402
 )
 from jepa.data.images.shapes3d import build_shapes3d_dataset_splits  # noqa: E402
 from jepa.training.images.ijepa_spatial import (  # noqa: E402
-    build_spatial_ijepa_core,
+    build_spatial_ijepa_core_from_metadata,
     encode_frames_pooled,
     load_spatial_checkpoint,
+    normalize_ijepa_images,
 )
-
-PATCH_SIZE = 8
-PATCH_LATENT_DIM = 16
 
 
 def _pca_2d(z: torch.Tensor, reference: torch.Tensor) -> np.ndarray:
@@ -106,19 +104,21 @@ def main() -> None:
 
     checkpoint = load_spatial_checkpoint(args.checkpoint)
     epoch = checkpoint["epoch"]
-    core = build_spatial_ijepa_core(
-        "cnn",
-        patch_dim=3 * PATCH_SIZE * PATCH_SIZE,
-        patch_latent_dim=PATCH_LATENT_DIM,
-        num_patches=(64 // PATCH_SIZE) ** 2,
-    )
+    metadata = checkpoint.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("checkpoint is missing model metadata")
+    core = build_spatial_ijepa_core_from_metadata(metadata)
     core.context_encoder.load_state_dict(checkpoint["context_encoder"])
     core.predictor.load_state_dict(checkpoint["predictor"])
     core.target_encoder.load_state_dict(checkpoint["target_encoder"])
     core.context_encoder.eval()
 
-    train_z = encode_frames_pooled(core, train_frames, patch_size=PATCH_SIZE).cpu()
-    test_z = encode_frames_pooled(core, test_frames, patch_size=PATCH_SIZE).cpu()
+    train_z = encode_frames_pooled(
+        core, normalize_ijepa_images(train_frames), patch_size=core.patch_size
+    ).cpu()
+    test_z = encode_frames_pooled(
+        core, normalize_ijepa_images(test_frames), patch_size=core.patch_size
+    ).cpu()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     names = list(SHAPES3D_ENTITY_NAMES)

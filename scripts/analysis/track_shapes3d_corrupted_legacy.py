@@ -58,19 +58,21 @@ from jepa.data.images.shapes3d import (  # noqa: E402
     build_shapes3d_counterfactual_pairs,
     build_shapes3d_static_dataset_splits,
 )
+from jepa.models.patches import patchify  # noqa: E402
 from jepa.training.images.ijepa_spatial import (  # noqa: E402
     MaskConfig,
-    build_spatial_ijepa_core_from_metadata,
+    build_spatial_ijepa_core,
     encode_frames_pooled,
     encode_frames_pooled_batched,
     load_spatial_checkpoint,
-    normalize_ijepa_images,
     sample_masks,
     spatial_ijepa_loss,
 )
 from jepa.training.images.spatial_logging import SpatialRunLogger  # noqa: E402
 
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[2] / "outputs" / "ijepa_spatial"
+PATCH_SIZE = 8
+PATCH_LATENT_DIM = 16
 BATCH_SIZE = 128
 POLL_SECONDS = 15
 
@@ -115,15 +117,14 @@ def _held_out_loss(core, test_samples, grid, mask_config, device) -> float:
     with torch.no_grad():
         for indices in torch.arange(test_samples.shape[0]).split(BATCH_SIZE):
             batch = test_samples[indices].to(device)
-            context_masks, target_masks = sample_masks(
-                grid,
-                grid,
-                mask_config,
-                mask_generator,
-                batch_size=batch.shape[0],
-            )
-            loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
-            total += loss.item()
+            context_masks, target_masks = sample_masks(grid, grid, mask_config, mask_generator)
+            loss = torch.zeros((), device=device)
+            for context_mask in context_masks:
+                for target_mask in target_masks:
+                    loss = loss + spatial_ijepa_loss(
+                        core, batch, context_mask.to(device), target_mask.to(device)
+                    )
+            total += (loss / (len(context_masks) * len(target_masks))).item()
             batches += 1
     return total / batches
 
@@ -131,7 +132,7 @@ def _held_out_loss(core, test_samples, grid, mask_config, device) -> float:
 def main() -> None:
     args = _parse_args()
     run_dir = _resolve_run_dir(args.run_dir)
-    checkpoint_dir = run_dir / "network"
+    checkpoint_dir = run_dir / "checkpoints"
     records_path = run_dir / "metrics" / "diagnostics.json"
     logger = SpatialRunLogger(run_dir, enable_tensorboard=not args.no_tensorboard)
 
@@ -139,9 +140,7 @@ def main() -> None:
     if not run_config_path.exists():
         raise FileNotFoundError(f"missing run config: {run_config_path}")
     run_config = json.loads(run_config_path.read_text())
-    spatial_config = run_config["spatial"]
-    patch_size = int(spatial_config["patch_size"])
-    image_size = int(spatial_config.get("image_size", 64))
+    architecture = run_config.get("spatial", {}).get("architecture", "cnn")
     config = shapes3d_config_from_dict(run_config["config"])
     datasets = build_shapes3d_static_dataset_splits(config.data)
     if args.device == "auto":
@@ -149,16 +148,22 @@ def main() -> None:
     else:
         device = torch.device(args.device)
 
-    train_frames = normalize_ijepa_images(datasets.train.images)
-    test_frames = normalize_ijepa_images(datasets.test.images)
+    train_frames = datasets.train.images
+    test_frames = datasets.test.images
     train_entity = datasets.train.entities
     test_entity = datasets.test.entities
     num_entities = config.data.num_entities
     train_context = datasets.train.contexts
     test_context = datasets.test.contexts
 
-    grid = image_size // patch_size
+    test_patches = patchify(test_frames, PATCH_SIZE)
+    grid = 64 // PATCH_SIZE
+    num_patches = test_patches.shape[1]
+    patch_dim = test_patches.shape[2]
     mask_config = MaskConfig()
+    # rank(S_B) = num_entities - 1; any k beyond that is a zero-eigenvalue
+    # noise direction that inflates D_same and drags Q_E toward 1
+    k_entity = max_useful_subspace_dim(num_entities, PATCH_LATENT_DIM)
 
     source = datasets.train.source
     counterfactual = build_shapes3d_counterfactual_pairs(
@@ -166,18 +171,6 @@ def main() -> None:
         source,
         num_pairs=config.evaluation.counterfactual_pairs,
         seed=config.data.counterfactual_seed,
-    )
-    counterfactual_same_1 = normalize_ijepa_images(
-        counterfactual.same_entity_x1, inplace=True
-    )
-    counterfactual_same_2 = normalize_ijepa_images(
-        counterfactual.same_entity_x2, inplace=True
-    )
-    counterfactual_diff_1 = normalize_ijepa_images(
-        counterfactual.diff_entity_x1, inplace=True
-    )
-    counterfactual_diff_2 = normalize_ijepa_images(
-        counterfactual.diff_entity_x2, inplace=True
     )
     ridge = config.evaluation.probe_ridge
     covariance_epsilon = config.evaluation.covariance_epsilon
@@ -199,10 +192,12 @@ def main() -> None:
                         continue
                     seen.add(path.name)
                     checkpoint = load_spatial_checkpoint(path)
-                    metadata = checkpoint.get("metadata")
-                    if not isinstance(metadata, dict):
-                        raise ValueError(f"checkpoint has no model metadata: {path}")
-                    core = build_spatial_ijepa_core_from_metadata(metadata)
+                    core = build_spatial_ijepa_core(
+                        architecture,
+                        patch_dim=patch_dim,
+                        patch_latent_dim=PATCH_LATENT_DIM,
+                        num_patches=num_patches,
+                    )
                     core.context_encoder.load_state_dict(checkpoint["context_encoder"])
                     core.predictor.load_state_dict(checkpoint["predictor"])
                     core.target_encoder.load_state_dict(checkpoint["target_encoder"])
@@ -210,23 +205,21 @@ def main() -> None:
                     core.predictor.to(device).eval()
                     core.target_encoder.to(device).eval()
 
-                    test_loss = _held_out_loss(core, test_frames, grid, mask_config, device)
+                    test_loss = _held_out_loss(core, test_patches, grid, mask_config, device)
 
                     train_z = encode_frames_pooled_batched(
                         core,
                         train_frames,
-                        patch_size=patch_size,
+                        patch_size=PATCH_SIZE,
                         batch_size=BATCH_SIZE,
                     ).cpu()
                     test_z = encode_frames_pooled_batched(
                         core,
                         test_frames,
-                        patch_size=patch_size,
+                        patch_size=PATCH_SIZE,
                         batch_size=BATCH_SIZE,
                     ).cpu()
                     spectrum = compute_latent_spectrum(test_z)
-                    # rank(S_B) = num_entities - 1; larger k adds null directions.
-                    k_entity = max_useful_subspace_dim(num_entities, core.embed_dim)
 
                     classifier = fit_entity_classifier(
                         train_z, train_entity, num_entities, ridge=ridge
@@ -252,24 +245,16 @@ def main() -> None:
 
                     with torch.no_grad():
                         same_1 = encode_frames_pooled(
-                            core,
-                            counterfactual_same_1,
-                            patch_size=patch_size,
+                            core, counterfactual.same_entity_x1, patch_size=PATCH_SIZE
                         ).cpu()
                         same_2 = encode_frames_pooled(
-                            core,
-                            counterfactual_same_2,
-                            patch_size=patch_size,
+                            core, counterfactual.same_entity_x2, patch_size=PATCH_SIZE
                         ).cpu()
                         diff_1 = encode_frames_pooled(
-                            core,
-                            counterfactual_diff_1,
-                            patch_size=patch_size,
+                            core, counterfactual.diff_entity_x1, patch_size=PATCH_SIZE
                         ).cpu()
                         diff_2 = encode_frames_pooled(
-                            core,
-                            counterfactual_diff_2,
-                            patch_size=patch_size,
+                            core, counterfactual.diff_entity_x2, patch_size=PATCH_SIZE
                         ).cpu()
                     raw_inv = counterfactual_invariance(
                         project(same_1, projection),

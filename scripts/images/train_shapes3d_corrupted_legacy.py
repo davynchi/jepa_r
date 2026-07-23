@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Train upstream-style I-JEPA with project datasets and sample weighting.
+"""Train the CNN I-JEPA-style spatial model on Shapes3D frames and watch for
+representational collapse (the failure mode that killed every earlier
+whole-frame variant). Purely spatial: no temporal pairing at all, so this does
+not depend on the frames being related in time.
 
     CUDA_VISIBLE_DEVICES=1 python scripts/images/train_ijepa_spatial.py --run-name uniform_seed0
     tensorboard --logdir outputs/ijepa_spatial
@@ -8,7 +11,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
 from dataclasses import asdict
@@ -18,7 +20,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402
 
 from jepa.analysis.subspace import compute_latent_spectrum  # noqa: E402
 from jepa.configs.base import derive_seed  # noqa: E402
@@ -34,17 +35,14 @@ from jepa.data.images.tiny_imagenet import (  # noqa: E402
     TinyImageNetDataConfig,
     build_tiny_imagenet_static_dataset_splits,
 )
-from jepa.training.images.ijepa_schedulers import (  # noqa: E402
-    CosineWDSchedule,
-    WarmupCosineSchedule,
-)
+from jepa.models.patches import patchify  # noqa: E402
+from jepa.training.core import ema_update  # noqa: E402
 from jepa.training.images.ijepa_spatial import (  # noqa: E402
     MaskConfig,
     build_spatial_ijepa_core,
     encode_frames_pooled_batched,
     encode_samples_pooled,
     load_spatial_checkpoint,
-    normalize_ijepa_images,
     sample_masks,
     save_spatial_checkpoint,
     spatial_ijepa_loss,
@@ -54,8 +52,8 @@ from jepa.training.images.spatial_curriculum import (  # noqa: E402
     SpatialWeightingState,
     init_spatial_weighting,
     sample_frame_indices,
-    score_frames_by_coordinate_importance,
     score_frames_by_loss,
+    score_frames_by_coordinate_importance,
     score_frames_by_ras,
     select_reference_indices,
     should_update_weights,
@@ -68,16 +66,11 @@ from jepa.training.images.spatial_logging import (  # noqa: E402
     eigenvalue_scalars,
 )
 
-MODEL_NAME = "vit_tiny"
-IMAGE_SIZE = 64
+ARCHITECTURE = "cnn"
 PATCH_SIZE = 8
+PATCH_LATENT_DIM = 16
 LR = 0.001
-START_LR = 0.0002
-FINAL_LR = 0.000001
-WEIGHT_DECAY = 0.04
-FINAL_WEIGHT_DECAY = 0.4
-EMA_START = 0.996
-EMA_END = 1.0
+EMA_DECAY = 0.99
 BATCH_SIZE = 128
 TOTAL_EPOCHS = 1500
 SEED = 0
@@ -94,29 +87,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default=str(OUTPUT_ROOT))
     parser.add_argument("--epochs", type=int, default=TOTAL_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--lr", type=float, default=LR, help="Peak/reference learning rate")
-    parser.add_argument("--start-lr", type=float, default=START_LR)
-    parser.add_argument("--final-lr", type=float, default=FINAL_LR)
-    parser.add_argument("--warmup-epochs", type=int, default=40)
-    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
-    parser.add_argument("--final-weight-decay", type=float, default=FINAL_WEIGHT_DECAY)
-    parser.add_argument("--ipe-scale", type=float, default=1.0)
-    parser.add_argument("--ema-start", type=float, default=EMA_START)
-    parser.add_argument("--ema-end", type=float, default=EMA_END)
+    parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
-        "--model-name",
-        choices=("vit_tiny", "vit_small", "vit_base", "vit_large"),
-        default=MODEL_NAME,
+        "--architecture",
+        choices=("cnn", "resnet"),
+        default=ARCHITECTURE,
+        help="Patch encoder architecture. resnet is randomly initialized, not pretrained.",
     )
-    parser.add_argument("--image-size", type=int, default=IMAGE_SIZE)
-    parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
-    parser.add_argument("--predictor-embed-dim", type=int, default=192)
-    parser.add_argument("--predictor-depth", type=int, default=6)
-    parser.add_argument("--bfloat16", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--crop-scale", type=float, nargs=2, default=(0.3, 1.0))
-    parser.add_argument("--horizontal-flip-prob", type=float, default=0.0)
     parser.add_argument("--dataset", choices=("shapes3d", "tiny-imagenet"), default="shapes3d")
     parser.add_argument("--tiny-imagenet-root", default="data/tiny-imagenet-200")
     parser.add_argument("--num-train-samples", type=int, default=16000)
@@ -135,7 +114,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resident-device-data",
         action="store_true",
-        help="Keep image tensors on the training device to reduce CPU/GPU transfer overhead",
+        help="Keep patch tensors on the training device to reduce CPU/GPU transfer overhead",
     )
     parser.add_argument(
         "--resume-from",
@@ -180,202 +159,27 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _default_run_name(seed: int) -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")  # noqa: UP017
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"spatial_ijepa_seed{seed}_{stamp}"
 
 
 def _checkpoint_metadata(args: argparse.Namespace, run_dir: Path) -> dict[str, object]:
     return {
-        "model_family": "upstream_ijepa",
-        "model_name": args.model_name,
-        "image_size": args.image_size,
-        "patch_size": args.patch_size,
-        "embed_dim": None,
-        "predictor_embed_dim": args.predictor_embed_dim,
-        "predictor_depth": args.predictor_depth,
-        "ema": [args.ema_start, args.ema_end],
+        "architecture": args.architecture,
+        "patch_size": PATCH_SIZE,
+        "patch_latent_dim": PATCH_LATENT_DIM,
+        "ema_decay": EMA_DECAY,
         "run_dir": str(run_dir),
         "dataset": args.dataset,
-        "data_source": f"{args.dataset}_images",
+        "data_source": f"static_{args.dataset}_images",
     }
-
-
-def _validate_args(args: argparse.Namespace) -> None:
-    if args.image_size <= 0 or args.patch_size <= 0:
-        raise ValueError("image and patch sizes must be positive")
-    if args.image_size % args.patch_size:
-        raise ValueError("--image-size must be divisible by --patch-size")
-    if args.predictor_embed_dim <= 0 or args.predictor_depth <= 0:
-        raise ValueError("predictor dimensions must be positive")
-    if args.predictor_embed_dim % {"vit_tiny": 3, "vit_small": 6, "vit_base": 12, "vit_large": 16}[
-        args.model_name
-    ]:
-        raise ValueError("--predictor-embed-dim must be divisible by the encoder head count")
-    if not 0.0 <= args.horizontal_flip_prob <= 1.0:
-        raise ValueError("--horizontal-flip-prob must be in [0, 1]")
-    if len(args.crop_scale) != 2 or not 0 < args.crop_scale[0] <= args.crop_scale[1] <= 1:
-        raise ValueError("--crop-scale must satisfy 0 < min <= max <= 1")
-    if not 0 <= args.ema_start <= args.ema_end <= 1:
-        raise ValueError("EMA schedule must satisfy 0 <= start <= end <= 1")
-    if args.warmup_epochs < 0:
-        raise ValueError("--warmup-epochs must be non-negative")
-
-
-def _random_resized_crop_batch(
-    images: torch.Tensor,
-    *,
-    output_size: int,
-    scale: tuple[float, float],
-    horizontal_flip_probability: float,
-    generator: torch.Generator,
-) -> torch.Tensor:
-    """Batched tensor implementation of upstream RandomResizedCrop and flip."""
-    batch_size, channels, source_h, source_w = images.shape
-    area = source_h * source_w
-    crop_h = torch.full((batch_size,), source_h, dtype=torch.long)
-    crop_w = torch.full((batch_size,), source_w, dtype=torch.long)
-    valid = torch.zeros(batch_size, dtype=torch.bool)
-    for _ in range(10):
-        target_area = area * (
-            scale[0]
-            + torch.rand(batch_size, generator=generator) * (scale[1] - scale[0])
-        )
-        log_ratio = math.log(3 / 4) + torch.rand(batch_size, generator=generator) * (
-            math.log(4 / 3) - math.log(3 / 4)
-        )
-        ratio = log_ratio.exp()
-        proposed_w = (target_area * ratio).sqrt().round().to(torch.long)
-        proposed_h = (target_area / ratio).sqrt().round().to(torch.long)
-        accepted = (
-            ~valid
-            & (proposed_h > 0)
-            & (proposed_h <= source_h)
-            & (proposed_w > 0)
-            & (proposed_w <= source_w)
-        )
-        crop_h[accepted] = proposed_h[accepted]
-        crop_w[accepted] = proposed_w[accepted]
-        valid |= accepted
-        if bool(valid.all()):
-            break
-
-    top_random = torch.rand(batch_size, generator=generator)
-    left_random = torch.rand(batch_size, generator=generator)
-    top = (top_random * (source_h - crop_h + 1)).floor()
-    left = (left_random * (source_w - crop_w + 1)).floor()
-    theta = torch.zeros((batch_size, 2, 3), dtype=torch.float32, device=images.device)
-    theta[:, 0, 0] = crop_w.to(device=images.device, dtype=torch.float32) / source_w
-    theta[:, 1, 1] = crop_h.to(device=images.device, dtype=torch.float32) / source_h
-    theta[:, 0, 2] = (
-        2.0
-        * (left.to(device=images.device) + crop_w.to(device=images.device) / 2.0)
-        / source_w
-        - 1.0
-    )
-    theta[:, 1, 2] = (
-        2.0
-        * (top.to(device=images.device) + crop_h.to(device=images.device) / 2.0)
-        / source_h
-        - 1.0
-    )
-    grid = F.affine_grid(
-        theta,
-        size=(batch_size, channels, output_size, output_size),
-        align_corners=False,
-    )
-    crops = F.grid_sample(
-        images,
-        grid,
-        mode="bilinear",
-        padding_mode="border",
-        align_corners=False,
-    )
-    flip = (
-        torch.rand(batch_size, generator=generator) < horizontal_flip_probability
-    ).to(images.device)
-    return torch.where(flip[:, None, None, None], crops.flip(-1), crops)
-
-
-def _init_upstream_optimizer(
-    core,
-    *,
-    iterations_per_epoch: int,
-    args: argparse.Namespace,
-) -> tuple[torch.optim.Optimizer, WarmupCosineSchedule, CosineWDSchedule]:
-    param_groups = [
-        {
-            "params": [
-                p
-                for name, p in core.context_encoder.named_parameters()
-                if "bias" not in name and len(p.shape) != 1
-            ]
-        },
-        {
-            "params": [
-                p
-                for name, p in core.predictor.named_parameters()
-                if "bias" not in name and len(p.shape) != 1
-            ]
-        },
-        {
-            "params": [
-                p
-                for name, p in core.context_encoder.named_parameters()
-                if "bias" in name or len(p.shape) == 1
-            ],
-            "WD_exclude": True,
-            "weight_decay": 0,
-        },
-        {
-            "params": [
-                p
-                for name, p in core.predictor.named_parameters()
-                if "bias" in name or len(p.shape) == 1
-            ],
-            "WD_exclude": True,
-            "weight_decay": 0,
-        },
-    ]
-    optimizer = torch.optim.AdamW(param_groups)
-    total_steps = int(args.ipe_scale * args.epochs * iterations_per_epoch)
-    lr_scheduler = WarmupCosineSchedule(
-        optimizer,
-        warmup_steps=args.warmup_epochs * iterations_per_epoch,
-        start_lr=args.start_lr,
-        ref_lr=args.lr,
-        final_lr=args.final_lr,
-        T_max=total_steps,
-    )
-    wd_scheduler = CosineWDSchedule(
-        optimizer,
-        ref_wd=args.weight_decay,
-        final_wd=args.final_weight_decay,
-        T_max=total_steps,
-    )
-    return optimizer, lr_scheduler, wd_scheduler
-
-
-def _ema_momentum(step: int, *, total_steps: int, start: float, end: float) -> float:
-    progress = min(max(step, 0), total_steps) / max(total_steps, 1)
-    return start + progress * (end - start)
-
-
-@torch.no_grad()
-def _ema_update(target: torch.nn.Module, online: torch.nn.Module, momentum: float) -> None:
-    for target_parameter, online_parameter in zip(
-        target.parameters(), online.parameters(), strict=True
-    ):
-        target_parameter.data.mul_(momentum).add_(
-            online_parameter.detach().data, alpha=1.0 - momentum
-        )
 
 
 def _weighting_checkpoint_state(
     weighting_state: SpatialWeightingState,
     ref_indices: torch.Tensor,
-    scaler=None,
 ) -> dict[str, object]:
-    state: dict[str, object] = {
+    return {
         "weighting_memory": weighting_state.memory,
         "weighting_probabilities": weighting_state.probabilities,
         "weighting_last_scores": weighting_state.last_scores,
@@ -383,9 +187,6 @@ def _weighting_checkpoint_state(
         "coordinate_importance": weighting_state.coordinate_importance,
         "coordinate_previous_ref_latents": weighting_state.coordinate_previous_ref_latents,
     }
-    if scaler is not None and scaler.is_enabled():
-        state["amp_scaler"] = scaler.state_dict()
-    return state
 
 
 def _restore_weighting_state(
@@ -417,9 +218,7 @@ def _restore_weighting_state(
     else:
         coordinate_importance = None
     if isinstance(coordinate_previous_ref_latents, torch.Tensor):
-        coordinate_previous_ref_latents = (
-            coordinate_previous_ref_latents.detach().cpu().to(torch.float64)
-        )
+        coordinate_previous_ref_latents = coordinate_previous_ref_latents.detach().cpu().to(torch.float64)
     else:
         coordinate_previous_ref_latents = None
 
@@ -452,21 +251,21 @@ def _evaluate_spatial_loss(
     total_examples = 0
     for batch in samples.split(batch_size):
         batch = batch.to(device)
-        context_masks, target_masks = sample_masks(
-            grid,
-            grid,
-            mask_config,
-            generator,
-            batch_size=batch.shape[0],
-        )
-        loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
+        context_masks, target_masks = sample_masks(grid, grid, mask_config, generator)
+        loss = torch.zeros((), device=device)
+        for context_mask in context_masks:
+            for target_mask in target_masks:
+                loss = loss + spatial_ijepa_loss(
+                    core, batch, context_mask.to(device), target_mask.to(device)
+                )
+        loss = loss / (len(context_masks) * len(target_masks))
         total_loss += float(loss.item()) * batch.shape[0]
         total_examples += batch.shape[0]
     return total_loss / total_examples
 
 
 @torch.no_grad()
-def _encode_images_pooled(
+def _encode_patches_pooled(
     core,
     samples: torch.Tensor,
     *,
@@ -482,10 +281,9 @@ def _encode_images_pooled(
 
 def main() -> None:
     args = _parse_args()
-    _validate_args(args)
     run_name = args.run_name or _default_run_name(args.seed)
     run_dir = Path(args.output_root).expanduser().resolve() / run_name
-    checkpoint_dir = run_dir / "network"
+    checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=args.resume_from is not None)
     logger = SpatialRunLogger(run_dir, enable_tensorboard=not args.no_tensorboard)
     weighting_config = SpatialWeightingConfig(
@@ -544,28 +342,16 @@ def main() -> None:
         {
             **config_payload,
             "spatial": {
-                "model_family": "upstream_ijepa",
-                "model_name": args.model_name,
-                "image_size": args.image_size,
-                "patch_size": args.patch_size,
-                "predictor_embed_dim": args.predictor_embed_dim,
-                "predictor_depth": args.predictor_depth,
+                "architecture": args.architecture,
+                "patch_size": PATCH_SIZE,
+                "patch_latent_dim": PATCH_LATENT_DIM,
                 "learning_rate": args.lr,
-                "start_learning_rate": args.start_lr,
-                "final_learning_rate": args.final_lr,
-                "warmup_epochs": args.warmup_epochs,
-                "weight_decay": args.weight_decay,
-                "final_weight_decay": args.final_weight_decay,
-                "ipe_scale": args.ipe_scale,
-                "ema": [args.ema_start, args.ema_end],
-                "bfloat16": args.bfloat16,
-                "crop_scale": list(args.crop_scale),
-                "horizontal_flip_probability": args.horizontal_flip_prob,
+                "ema_decay": EMA_DECAY,
                 "batch_size": args.batch_size,
                 "epochs": args.epochs,
                 "seed": args.seed,
                 "dataset": args.dataset,
-                "data_source": f"{args.dataset}_images",
+                "data_source": f"static_{args.dataset}_images",
                 "eval_every_epochs": args.eval_every_epochs,
                 "checkpoint_every_epochs": args.checkpoint_every_epochs,
                 "checkpoint_every_steps": args.checkpoint_every_steps,
@@ -593,13 +379,12 @@ def main() -> None:
     )
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
 
-    train_images = normalize_ijepa_images(datasets.train.images, inplace=True)
-    test_images = normalize_ijepa_images(datasets.test.images, inplace=True)
-    transform_pair_images: tuple[torch.Tensor, torch.Tensor] | None = None
-    if (
-        weighting_config.method == "coord"
-        and weighting_config.coordinate_importance == "transformation"
-    ):
+    train_frames = datasets.train.images
+    test_frames = datasets.test.images
+    train_patches = patchify(train_frames, PATCH_SIZE)
+    test_patches = patchify(test_frames, PATCH_SIZE)
+    transform_pair_patches: tuple[torch.Tensor, torch.Tensor] | None = None
+    if weighting_config.method == "coord" and weighting_config.coordinate_importance == "transformation":
         if args.dataset != "shapes3d":
             raise ValueError("transformation coordinate importance is currently Shapes3D-only")
         pairs = build_shapes3d_counterfactual_pairs(
@@ -608,64 +393,47 @@ def main() -> None:
             num_pairs=weighting_config.ref_size,
             seed=derive_seed(args.seed, "coordinate-transform-pairs"),
         )
-        transform_pair_images = (
-            normalize_ijepa_images(pairs.same_entity_x1, inplace=True),
-            normalize_ijepa_images(pairs.same_entity_x2, inplace=True),
+        transform_pair_patches = (
+            patchify(pairs.same_entity_x1, PATCH_SIZE),
+            patchify(pairs.same_entity_x2, PATCH_SIZE),
         )
-        del pairs
-    del datasets
-    if train_images.shape[-2:] != (args.image_size, args.image_size):
-        raise ValueError(
-            f"dataset images are {tuple(train_images.shape[-2:])}, "
-            f"but --image-size is {args.image_size}"
-        )
-    grid = args.image_size // args.patch_size
-    num_patches = grid * grid
+    grid = 64 // PATCH_SIZE
+    num_patches = train_patches.shape[1]
+    patch_dim = train_patches.shape[2]
     if args.resident_device_data:
-        train_images = train_images.to(device)
-        test_images = test_images.to(device)
-        if transform_pair_images is not None:
-            transform_pair_images = (
-                transform_pair_images[0].to(device),
-                transform_pair_images[1].to(device),
+        train_patches = train_patches.to(device)
+        test_patches = test_patches.to(device)
+        if transform_pair_patches is not None:
+            transform_pair_patches = (
+                transform_pair_patches[0].to(device),
+                transform_pair_patches[1].to(device),
             )
     print(
         f"run_dir={run_dir}\n"
-        f"dataset={args.dataset} model={args.model_name} device={device} "
-        f"train_images={train_images.shape[0]} num_patches={num_patches}",
+        f"dataset={args.dataset} architecture={args.architecture} device={device} "
+        f"train_images={train_frames.shape[0]} "
+        f"num_patches={num_patches} patch_dim={patch_dim}",
         flush=True,
     )
 
     torch.manual_seed(args.seed)
     core = build_spatial_ijepa_core(
-        args.model_name,
-        image_size=args.image_size,
-        patch_size=args.patch_size,
-        predictor_embed_dim=args.predictor_embed_dim,
-        predictor_depth=args.predictor_depth,
+        args.architecture,
+        patch_dim=patch_dim,
+        patch_latent_dim=PATCH_LATENT_DIM,
+        num_patches=num_patches,
     )
     core.context_encoder.to(device)
     core.predictor.to(device)
     core.target_encoder.to(device)
+    params = list(core.context_encoder.parameters()) + list(core.predictor.parameters())
+    optimizer = torch.optim.Adam(params, lr=args.lr)
     mask_config = MaskConfig()
 
-    n = train_images.shape[0]
-    iterations_per_epoch = max(n // args.batch_size, 1)
-    optimizer, lr_scheduler, wd_scheduler = _init_upstream_optimizer(
-        core,
-        iterations_per_epoch=iterations_per_epoch,
-        args=args,
-    )
-    total_schedule_steps = int(args.ipe_scale * args.epochs * iterations_per_epoch)
-    use_bfloat16 = args.bfloat16 and device.type == "cuda"
-    try:
-        scaler = torch.amp.GradScaler("cuda", enabled=use_bfloat16)
-    except (AttributeError, TypeError):  # PyTorch versions used by older DataSphere images.
-        scaler = torch.cuda.amp.GradScaler(enabled=use_bfloat16)
+    n = train_patches.shape[0]
     start = time.time()
     global_step = 0
     metadata = _checkpoint_metadata(args, run_dir)
-    metadata["embed_dim"] = core.embed_dim
     weighting_state = init_spatial_weighting(n)
     weighting_ref_indices = select_reference_indices(
         n,
@@ -691,13 +459,6 @@ def main() -> None:
         global_step = int(
             checkpoint.get("global_step") or completed_epoch * max(n // args.batch_size, 1)
         )
-        lr_scheduler._step = float(global_step)
-        wd_scheduler._step = float(global_step)
-        checkpoint_extra = checkpoint.get("extra_state")
-        if isinstance(checkpoint_extra, dict) and isinstance(
-            checkpoint_extra.get("amp_scaler"), dict
-        ):
-            scaler.load_state_dict(checkpoint_extra["amp_scaler"])
         weighting_state, weighting_ref_indices = _restore_weighting_state(
             checkpoint,
             num_frames=n,
@@ -711,73 +472,40 @@ def main() -> None:
         for epoch in range(start_epoch, args.epochs + 1):
             core.context_encoder.train()
             core.predictor.train()
-            core.target_encoder.train()
-            num_draws = (
-                n
-                if n < args.batch_size
-                else iterations_per_epoch * args.batch_size
-            )
             if weighting_config.method != "uniform" and epoch > weighting_config.warmup_epochs:
                 order = sample_frame_indices(
                     weighting_state,
-                    num_draws=num_draws,
+                    num_draws=n,
                     seed=derive_seed(args.seed, "weighted-order", epoch),
                 )
             else:
                 order = torch.randperm(
                     n,
                     generator=torch.Generator().manual_seed(derive_seed(args.seed, "order", epoch)),
-                )[:num_draws]
+                )
             if args.resident_device_data:
                 order = order.to(device)
             batch_chunks = order.split(args.batch_size)
             mask_generator = torch.Generator().manual_seed(derive_seed(args.seed, "masks", epoch))
-            transform_generator = torch.Generator().manual_seed(
-                derive_seed(args.seed, "transforms", epoch)
-            )
             epoch_loss, batches = 0.0, 0
             epoch_start = time.time()
             for indices in batch_chunks:
                 global_step += 1
-                batch = train_images[indices].to(device)
-                batch = _random_resized_crop_batch(
-                    batch,
-                    output_size=args.image_size,
-                    scale=tuple(args.crop_scale),
-                    horizontal_flip_probability=args.horizontal_flip_prob,
-                    generator=transform_generator,
-                )
-                context_masks, target_masks = sample_masks(
-                    grid,
-                    grid,
-                    mask_config,
-                    mask_generator,
-                    batch_size=batch.shape[0],
-                )
-                current_lr = lr_scheduler.step()
-                current_wd = wd_scheduler.step()
+                batch = train_patches[indices].to(device)
+                context_masks, target_masks = sample_masks(grid, grid, mask_config, mask_generator)
                 optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(
-                    device_type=device.type,
-                    dtype=torch.bfloat16,
-                    enabled=use_bfloat16,
-                ):
-                    loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
-                if use_bfloat16:
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    optimizer.step()
-                momentum = _ema_momentum(
-                    global_step - 1,
-                    total_steps=total_schedule_steps,
-                    start=args.ema_start,
-                    end=args.ema_end,
-                )
+                # Upstream averages the loss over every (context, target) mask pair.
+                loss = torch.zeros((), device=device)
+                for context_mask in context_masks:
+                    for target_mask in target_masks:
+                        loss = loss + spatial_ijepa_loss(
+                            core, batch, context_mask.to(device), target_mask.to(device)
+                        )
+                loss = loss / (len(context_masks) * len(target_masks))
+                loss.backward()
+                optimizer.step()
                 if core.policy.ema_enabled:
-                    _ema_update(core.target_encoder, core.context_encoder, momentum)
+                    ema_update(core.target_encoder, core.context_encoder, EMA_DECAY)
                 loss_value = loss.item()
                 epoch_loss += loss_value
                 batches += 1
@@ -789,9 +517,7 @@ def main() -> None:
                         event="train_step",
                         scalars={
                             "train/loss": loss_value,
-                            "train/lr": current_lr,
-                            "train/weight_decay": current_wd,
-                            "train/ema_momentum": momentum,
+                            "train/lr": args.lr,
                             "train/epoch_fraction": epoch + batches / max(len(batch_chunks), 1),
                         },
                     )
@@ -807,7 +533,7 @@ def main() -> None:
                         optimizer=optimizer,
                         metadata=metadata,
                         extra_state=_weighting_checkpoint_state(
-                            weighting_state, weighting_ref_indices, scaler
+                            weighting_state, weighting_ref_indices
                         ),
                     )
                     save_spatial_checkpoint(
@@ -818,7 +544,7 @@ def main() -> None:
                         optimizer=optimizer,
                         metadata=metadata,
                         extra_state=_weighting_checkpoint_state(
-                            weighting_state, weighting_ref_indices, scaler
+                            weighting_state, weighting_ref_indices
                         ),
                     )
 
@@ -840,7 +566,7 @@ def main() -> None:
                 if weighting_config.method == "loss":
                     scores = score_frames_by_loss(
                         core,
-                        train_images,
+                        train_patches,
                         grid=grid,
                         mask_config=mask_config,
                         batch_size=score_batch_size,
@@ -851,7 +577,7 @@ def main() -> None:
                 elif weighting_config.method == "ras":
                     scores, score_metadata = score_frames_by_ras(
                         core,
-                        train_images,
+                        train_patches,
                         ref_indices=weighting_ref_indices,
                         grid=grid,
                         mask_config=mask_config,
@@ -871,7 +597,7 @@ def main() -> None:
                         coordinate_previous_ref_latents,
                     ) = score_frames_by_coordinate_importance(
                         core,
-                        train_images,
+                        train_patches,
                         ref_indices=weighting_ref_indices,
                         state=weighting_state,
                         grid=grid,
@@ -882,7 +608,7 @@ def main() -> None:
                         coordinate_importance=weighting_config.coordinate_importance,
                         coordinate_ema_beta=weighting_config.coordinate_ema_beta,
                         coordinate_delta=weighting_config.coordinate_delta,
-                        transform_pair_images=transform_pair_images,
+                        transform_pair_patches=transform_pair_patches,
                     )
                 else:
                     raise ValueError(f"unsupported weighting method: {weighting_config.method}")
@@ -907,7 +633,7 @@ def main() -> None:
             if epoch % args.eval_every_epochs == 0 or epoch == 1:
                 test_loss = _evaluate_spatial_loss(
                     core,
-                    test_images,
+                    test_patches,
                     grid=grid,
                     mask_config=mask_config,
                     batch_size=args.batch_size,
@@ -915,20 +641,20 @@ def main() -> None:
                     device=device,
                 )
                 if args.resident_device_data:
-                    test_z = _encode_images_pooled(
+                    test_z = _encode_patches_pooled(
                         core,
-                        test_images,
+                        test_patches,
                         batch_size=args.batch_size,
                         device=device,
                     )
                 else:
                     test_z = encode_frames_pooled_batched(
                         core,
-                        test_images,
-                        patch_size=args.patch_size,
+                        test_frames,
+                        patch_size=PATCH_SIZE,
                         batch_size=args.batch_size,
                     )
-                spectrum = compute_latent_spectrum(test_z.reshape(-1, core.embed_dim))
+                spectrum = compute_latent_spectrum(test_z.reshape(-1, PATCH_LATENT_DIM))
                 scalars = {
                     "eval/test_loss": test_loss,
                     "repr/effective_rank": spectrum.effective_rank,
@@ -962,9 +688,7 @@ def main() -> None:
                     global_step=global_step,
                     optimizer=optimizer,
                     metadata=metadata,
-                    extra_state=_weighting_checkpoint_state(
-                        weighting_state, weighting_ref_indices, scaler
-                    ),
+                    extra_state=_weighting_checkpoint_state(weighting_state, weighting_ref_indices),
                 )
                 save_spatial_checkpoint(
                     checkpoint_dir / "latest.pt",
@@ -973,9 +697,7 @@ def main() -> None:
                     global_step=global_step,
                     optimizer=optimizer,
                     metadata=metadata,
-                    extra_state=_weighting_checkpoint_state(
-                        weighting_state, weighting_ref_indices, scaler
-                    ),
+                    extra_state=_weighting_checkpoint_state(weighting_state, weighting_ref_indices),
                 )
     finally:
         logger.close()

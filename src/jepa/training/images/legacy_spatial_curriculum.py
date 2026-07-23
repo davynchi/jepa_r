@@ -206,19 +206,19 @@ def select_reference_indices(num_frames: int, *, ref_size: int, seed: int) -> to
     return torch.randperm(num_frames, generator=generator)[:count]
 
 
-def _latent_covariance_from_images(
+def _latent_covariance_from_patches(
     core: SpatialIJEPACore,
-    images: torch.Tensor,
+    patches: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    latents = encode_samples_pooled(core, images).to(torch.float64)
+    latents = encode_samples_pooled(core, patches).to(torch.float64)
     centered = latents - latents.mean(dim=0, keepdim=True)
     covariance = centered.T @ centered / max(latents.shape[0] - 1, 1)
     return (covariance + covariance.T) / 2, latents
 
 
-def richness_from_images(
+def richness_from_patches(
     core: SpatialIJEPACore,
-    images: torch.Tensor,
+    patches: torch.Tensor,
     *,
     functional: SpatialRichnessFunctional,
     delta: float,
@@ -231,7 +231,7 @@ def richness_from_images(
         raise ValueError("trace_target must be positive")
     if trace_beta < 0:
         raise ValueError("trace_beta must be non-negative")
-    covariance, _ = _latent_covariance_from_images(core, images)
+    covariance, _ = _latent_covariance_from_patches(core, patches)
     trace = torch.trace(covariance)
     eye = torch.eye(covariance.shape[0], dtype=covariance.dtype, device=covariance.device)
     regularized = covariance + delta * eye
@@ -283,9 +283,7 @@ def _coordinate_importance_from_covariance(
     covariance = (covariance + covariance.T) / 2
     eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
     eigenvalues = eigenvalues.clamp_min(0)
-    weights = _normalize_coordinate_importance(
-        eigenvalues / eigenvalues.sum().clamp_min(delta), delta=delta
-    )
+    weights = _normalize_coordinate_importance(eigenvalues / eigenvalues.sum().clamp_min(delta), delta=delta)
     metadata = {
         "coord/importance_min": float(weights.min().item()),
         "coord/importance_max": float(weights.max().item()),
@@ -328,9 +326,7 @@ def _coordinate_importance_from_transformation(
     operator = torch.nan_to_num(operator, nan=0.0, posinf=0.0, neginf=0.0)
     _, singular_values, vh = torch.linalg.svd(operator + delta * eye, full_matrices=False)
     singular_values = singular_values.clamp(max=1.0)
-    weights = _normalize_coordinate_importance(
-        (1.0 - singular_values.abs()).clamp_min(0), delta=delta
-    )
+    weights = _normalize_coordinate_importance((1.0 - singular_values.abs()).clamp_min(0), delta=delta)
     basis = vh.T
     metadata = {
         "coord/importance_min": float(weights.min().item()),
@@ -397,7 +393,7 @@ def _dot_gradients(
 
 def score_frames_by_loss(
     core: SpatialIJEPACore,
-    train_images: torch.Tensor,
+    train_patches: torch.Tensor,
     *,
     grid: int,
     mask_config: MaskConfig,
@@ -414,24 +410,22 @@ def score_frames_by_loss(
     core.predictor.eval()
     core.target_encoder.eval()
 
-    scores = torch.empty(train_images.shape[0], dtype=torch.float64)
+    scores = torch.empty(train_patches.shape[0], dtype=torch.float64)
     mask_generator = torch.Generator().manual_seed(derive_seed(seed, "weighting-loss-masks"))
     try:
         with torch.no_grad():
-            for indices in torch.arange(train_images.shape[0], device=train_images.device).split(
+            for indices in torch.arange(train_patches.shape[0], device=train_patches.device).split(
                 batch_size
             ):
-                batch = train_images[indices].to(device)
-                context_masks, target_masks = sample_masks(
-                    grid,
-                    grid,
-                    mask_config,
-                    mask_generator,
-                    batch_size=batch.shape[0],
-                )
-                batch_losses = spatial_ijepa_per_sample_loss(
-                    core, batch, context_masks, target_masks
-                )
+                batch = train_patches[indices].to(device)
+                context_masks, target_masks = sample_masks(grid, grid, mask_config, mask_generator)
+                batch_losses = torch.zeros(batch.shape[0], device=device)
+                for context_mask in context_masks:
+                    for target_mask in target_masks:
+                        batch_losses = batch_losses + spatial_ijepa_per_sample_loss(
+                            core, batch, context_mask.to(device), target_mask.to(device)
+                        )
+                batch_losses = batch_losses / (len(context_masks) * len(target_masks))
                 scores[indices.detach().cpu()] = batch_losses.detach().cpu().to(torch.float64)
     finally:
         core.context_encoder.train(context_was_training)
@@ -442,7 +436,7 @@ def score_frames_by_loss(
 
 def score_frames_by_ras(
     core: SpatialIJEPACore,
-    train_images: torch.Tensor,
+    train_patches: torch.Tensor,
     *,
     ref_indices: torch.Tensor,
     grid: int,
@@ -468,13 +462,13 @@ def score_frames_by_ras(
     if not parameters:
         raise ValueError("RAS requires trainable context encoder parameters")
 
-    scores = torch.empty(train_images.shape[0], dtype=torch.float64)
+    scores = torch.empty(train_patches.shape[0], dtype=torch.float64)
     mask_generator = torch.Generator().manual_seed(derive_seed(seed, "weighting-ras-masks"))
     try:
-        ref_images = train_images[ref_indices.to(train_images.device)].to(device)
-        richness, richness_metadata = richness_from_images(
+        ref_patches = train_patches[ref_indices.to(train_patches.device)].to(device)
+        richness, richness_metadata = richness_from_patches(
             core,
-            ref_images,
+            ref_patches,
             functional=richness_functional,
             delta=richness_delta,
             trace_target=richness_trace_target,
@@ -489,33 +483,24 @@ def score_frames_by_ras(
             )
         )
 
-        for indices in torch.arange(train_images.shape[0], device=train_images.device).split(
+        for indices in torch.arange(train_patches.shape[0], device=train_patches.device).split(
             batch_size
         ):
-            batch = train_images[indices].to(device)
-            context_masks, target_masks = sample_masks(
-                grid,
-                grid,
-                mask_config,
-                mask_generator,
-                batch_size=batch.shape[0],
-            )
+            batch = train_patches[indices].to(device)
+            context_masks, target_masks = sample_masks(grid, grid, mask_config, mask_generator)
             batch_scores = torch.empty(batch.shape[0], dtype=torch.float64)
             for local_index in range(batch.shape[0]):
                 sample = batch[local_index : local_index + 1]
                 sample_loss = torch.zeros((), device=device)
-                sample_context_masks = [
-                    mask[local_index : local_index + 1] for mask in context_masks
-                ]
-                sample_target_masks = [
-                    mask[local_index : local_index + 1] for mask in target_masks
-                ]
-                sample_loss = spatial_ijepa_per_sample_loss(
-                    core,
-                    sample,
-                    sample_context_masks,
-                    sample_target_masks,
-                ).mean()
+                for context_mask in context_masks:
+                    for target_mask in target_masks:
+                        sample_loss = (
+                            sample_loss
+                            + spatial_ijepa_per_sample_loss(
+                                core, sample, context_mask.to(device), target_mask.to(device)
+                            ).mean()
+                        )
+                sample_loss = sample_loss / (len(context_masks) * len(target_masks))
                 loss_gradients = torch.autograd.grad(
                     sample_loss,
                     parameters,
@@ -542,7 +527,7 @@ def score_frames_by_ras(
 
 def score_frames_by_coordinate_importance(
     core: SpatialIJEPACore,
-    train_images: torch.Tensor,
+    train_patches: torch.Tensor,
     *,
     ref_indices: torch.Tensor,
     state: SpatialWeightingState,
@@ -554,7 +539,7 @@ def score_frames_by_coordinate_importance(
     coordinate_importance: CoordinateImportanceMethod,
     coordinate_ema_beta: float,
     coordinate_delta: float,
-    transform_pair_images: tuple[torch.Tensor, torch.Tensor] | None = None,
+    transform_pair_patches: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor, torch.Tensor]:
     if batch_size <= 0:
         raise ValueError("score batch_size must be positive")
@@ -569,22 +554,22 @@ def score_frames_by_coordinate_importance(
     if not parameters:
         raise ValueError("coordinate weighting requires trainable context encoder parameters")
 
-    scores = torch.empty(train_images.shape[0], dtype=torch.float64)
+    scores = torch.empty(train_patches.shape[0], dtype=torch.float64)
     mask_generator = torch.Generator().manual_seed(derive_seed(seed, "weighting-coord-masks"))
     try:
-        ref_images = train_images[ref_indices.to(train_images.device)].to(device)
-        ref_latents = encode_samples_pooled(core, ref_images)
+        ref_patches = train_patches[ref_indices.to(train_patches.device)].to(device)
+        ref_latents = encode_samples_pooled(core, ref_patches)
         if coordinate_importance == "covariance":
             coord_weights, basis, coord_metadata = _coordinate_importance_from_covariance(
                 ref_latents,
                 delta=coordinate_delta,
             )
         elif coordinate_importance == "transformation":
-            if transform_pair_images is None:
-                raise ValueError("transformation coordinate importance requires paired images")
-            source_images, target_images = transform_pair_images
-            source_latents = encode_samples_pooled(core, source_images.to(device))
-            target_latents = encode_samples_pooled(core, target_images.to(device))
+            if transform_pair_patches is None:
+                raise ValueError("transformation coordinate importance requires paired patches")
+            source_patches, target_patches = transform_pair_patches
+            source_latents = encode_samples_pooled(core, source_patches.to(device))
+            target_latents = encode_samples_pooled(core, target_patches.to(device))
             coord_weights, basis, coord_metadata = _coordinate_importance_from_transformation(
                 source_latents,
                 target_latents,
@@ -619,33 +604,24 @@ def score_frames_by_coordinate_importance(
             )
         )
 
-        for indices in torch.arange(train_images.shape[0], device=train_images.device).split(
+        for indices in torch.arange(train_patches.shape[0], device=train_patches.device).split(
             batch_size
         ):
-            batch = train_images[indices].to(device)
-            context_masks, target_masks = sample_masks(
-                grid,
-                grid,
-                mask_config,
-                mask_generator,
-                batch_size=batch.shape[0],
-            )
+            batch = train_patches[indices].to(device)
+            context_masks, target_masks = sample_masks(grid, grid, mask_config, mask_generator)
             batch_scores = torch.empty(batch.shape[0], dtype=torch.float64)
             for local_index in range(batch.shape[0]):
                 sample = batch[local_index : local_index + 1]
                 sample_loss = torch.zeros((), device=device)
-                sample_context_masks = [
-                    mask[local_index : local_index + 1] for mask in context_masks
-                ]
-                sample_target_masks = [
-                    mask[local_index : local_index + 1] for mask in target_masks
-                ]
-                sample_loss = spatial_ijepa_per_sample_loss(
-                    core,
-                    sample,
-                    sample_context_masks,
-                    sample_target_masks,
-                ).mean()
+                for context_mask in context_masks:
+                    for target_mask in target_masks:
+                        sample_loss = (
+                            sample_loss
+                            + spatial_ijepa_per_sample_loss(
+                                core, sample, context_mask.to(device), target_mask.to(device)
+                            ).mean()
+                        )
+                sample_loss = sample_loss / (len(context_masks) * len(target_masks))
                 loss_gradients = torch.autograd.grad(
                     sample_loss,
                     parameters,

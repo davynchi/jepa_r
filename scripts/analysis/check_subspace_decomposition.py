@@ -55,13 +55,12 @@ from jepa.configs.images.shapes3d import (  # noqa: E402
 )
 from jepa.data.images.shapes3d import build_shapes3d_dataset_splits  # noqa: E402
 from jepa.training.images.ijepa_spatial import (  # noqa: E402
-    build_spatial_ijepa_core,
+    build_spatial_ijepa_core_from_metadata,
     encode_frames_pooled,
     load_spatial_checkpoint,
+    normalize_ijepa_images,
 )
 
-PATCH_SIZE = 8
-PATCH_LATENT_DIM = 16
 RANDOM_SUBSPACE_DRAWS = 5
 
 
@@ -114,25 +113,28 @@ def main() -> None:
     test_context = datasets.test.contexts.reshape(-1, context_dim)[:n]
     num_entities = config.data.num_entities
 
-    core = build_spatial_ijepa_core(
-        "cnn",
-        patch_dim=3 * PATCH_SIZE * PATCH_SIZE,
-        patch_latent_dim=PATCH_LATENT_DIM,
-        num_patches=(64 // PATCH_SIZE) ** 2,
-    )
+    checkpoint = load_spatial_checkpoint(args.checkpoint)
+    metadata = checkpoint.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("checkpoint is missing model metadata")
+    if args.random_baseline:
+        torch.manual_seed(args.seed)
+    core = build_spatial_ijepa_core_from_metadata(metadata)
     if args.random_baseline:
         epoch = 0
-        torch.manual_seed(args.seed)
     else:
-        checkpoint = load_spatial_checkpoint(args.checkpoint)
         epoch = checkpoint["epoch"]
         core.context_encoder.load_state_dict(checkpoint["context_encoder"])
     core.context_encoder.eval()
 
-    train_z = encode_frames_pooled(core, train_frames, patch_size=PATCH_SIZE).cpu()
-    test_z = encode_frames_pooled(core, test_frames, patch_size=PATCH_SIZE).cpu()
+    train_z = encode_frames_pooled(
+        core, normalize_ijepa_images(train_frames), patch_size=core.patch_size
+    ).cpu()
+    test_z = encode_frames_pooled(
+        core, normalize_ijepa_images(test_frames), patch_size=core.patch_size
+    ).cpu()
 
-    k = max_useful_subspace_dim(num_entities, PATCH_LATENT_DIM)
+    k = max_useful_subspace_dim(num_entities, core.embed_dim)
     epsilon = config.evaluation.covariance_epsilon
     ridge = config.evaluation.probe_ridge
     generator = torch.Generator().manual_seed(args.seed)
@@ -140,7 +142,7 @@ def main() -> None:
     scatter = compute_scatter_matrices(train_z, train_entity, num_entities)
     eigen = solve_generalized_eigenproblem(scatter, epsilon=epsilon)
     projection = entity_subspace_projection(eigen.eigenvectors, k)
-    complement = np.eye(PATCH_LATENT_DIM) - projection
+    complement = np.eye(core.embed_dim) - projection
 
     # the same supervised search, run on noise: how much "structure" does LDA
     # invent when the labels carry none?
@@ -186,7 +188,7 @@ def main() -> None:
     # k arbitrary directions -- the floor that LDA's label-informed choice must beat
     random_shape, random_context = [], {f: [] for f in SHAPES3D_CONTEXT_FACTORS}
     for _ in range(RANDOM_SUBSPACE_DRAWS):
-        random_projection = _random_subspace_projection(PATCH_LATENT_DIM, k, generator)
+        random_projection = _random_subspace_projection(core.embed_dim, k, generator)
         train_random = project(train_z, random_projection)
         test_random = project(test_z, random_projection)
         _, accuracy = _probe(

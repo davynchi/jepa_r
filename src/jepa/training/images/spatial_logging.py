@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -20,6 +21,8 @@ except ModuleNotFoundError:  # pragma: no cover - depends on optional local inst
 _TENSORBOARD_SCALARS = {
     "train/loss",
     "train/lr",
+    "train/weight_decay",
+    "train/ema_momentum",
     "train/epoch_loss",
     "train/epoch_seconds",
     "train/elapsed_seconds",
@@ -98,19 +101,29 @@ class SpatialRunLogger:
         scalars: Mapping[str, float | int | bool | None],
         histograms: Mapping[str, torch.Tensor] | None = None,
     ) -> None:
+        safe_scalars: dict[str, float | int | bool | None] = {}
+        for name, value in scalars.items():
+            if (
+                value is not None
+                and not isinstance(value, bool)
+                and not math.isfinite(float(value))
+            ):
+                safe_scalars[name] = None
+            else:
+                safe_scalars[name] = value
         row: dict[str, Any] = {
             "time": time.time(),
             "step": step,
             "epoch": epoch,
             "event": event,
-            "scalars": dict(scalars),
+            "scalars": safe_scalars,
         }
         with self.metrics_path.open("a") as stream:
             stream.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
 
         if self.writer is None:
             return
-        for name, value in scalars.items():
+        for name, value in safe_scalars.items():
             if name not in _TENSORBOARD_SCALARS:
                 continue
             if value is None or isinstance(value, bool):

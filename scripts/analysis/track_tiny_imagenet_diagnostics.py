@@ -23,20 +23,18 @@ from jepa.data.images.tiny_imagenet import (  # noqa: E402
     TinyImageNetDataConfig,
     build_tiny_imagenet_static_dataset_splits,
 )
-from jepa.models.patches import patchify  # noqa: E402
 from jepa.training.images.ijepa_spatial import (  # noqa: E402
     MaskConfig,
-    build_spatial_ijepa_core,
+    build_spatial_ijepa_core_from_metadata,
     encode_frames_pooled_batched,
     load_spatial_checkpoint,
+    normalize_ijepa_images,
     sample_masks,
     spatial_ijepa_loss,
 )
 from jepa.training.images.spatial_logging import SpatialRunLogger  # noqa: E402
 
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[2] / "outputs" / "ijepa_spatial"
-PATCH_SIZE = 8
-PATCH_LATENT_DIM = 16
 BATCH_SIZE = 128
 POLL_SECONDS = 15
 PROBE_RIDGE = 1.0e-6
@@ -76,14 +74,14 @@ def _held_out_loss(core, test_samples, grid, mask_config, device) -> float:
     with torch.no_grad():
         for batch in test_samples.split(BATCH_SIZE):
             batch = batch.to(device)
-            context_masks, target_masks = sample_masks(grid, grid, mask_config, mask_generator)
-            loss = torch.zeros((), device=device)
-            for context_mask in context_masks:
-                for target_mask in target_masks:
-                    loss = loss + spatial_ijepa_loss(
-                        core, batch, context_mask.to(device), target_mask.to(device)
-                    )
-            loss = loss / (len(context_masks) * len(target_masks))
+            context_masks, target_masks = sample_masks(
+                grid,
+                grid,
+                mask_config,
+                mask_generator,
+                batch_size=batch.shape[0],
+            )
+            loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
             total_loss += float(loss.item()) * batch.shape[0]
             total_examples += batch.shape[0]
     return total_loss / total_examples
@@ -98,7 +96,7 @@ def _topk_accuracy(scores: torch.Tensor, labels: torch.Tensor, *, k: int) -> flo
 def main() -> None:
     args = _parse_args()
     run_dir = _resolve_run_dir(args.run_dir)
-    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir = run_dir / "network"
     records_path = run_dir / "metrics" / "diagnostics.json"
     logger = SpatialRunLogger(run_dir, enable_tensorboard=not args.no_tensorboard)
 
@@ -106,7 +104,9 @@ def main() -> None:
     if not run_config_path.exists():
         raise FileNotFoundError(f"missing run config: {run_config_path}")
     run_config = json.loads(run_config_path.read_text())
-    architecture = run_config.get("spatial", {}).get("architecture", "cnn")
+    spatial_config = run_config["spatial"]
+    patch_size = int(spatial_config["patch_size"])
+    image_size = int(spatial_config.get("image_size", 64))
     data_config = TinyImageNetDataConfig(**run_config["tiny_imagenet"]["data"])
     datasets = build_tiny_imagenet_static_dataset_splits(data_config)
     if args.device == "auto":
@@ -114,16 +114,13 @@ def main() -> None:
     else:
         device = torch.device(args.device)
 
-    train_frames = datasets.train.images
-    test_frames = datasets.test.images
+    train_frames = normalize_ijepa_images(datasets.train.images)
+    test_frames = normalize_ijepa_images(datasets.test.images)
     train_labels = datasets.train.entities
     test_labels = datasets.test.entities
     num_classes = data_config.num_entities
 
-    test_patches = patchify(test_frames, PATCH_SIZE)
-    grid = 64 // PATCH_SIZE
-    num_patches = test_patches.shape[1]
-    patch_dim = test_patches.shape[2]
+    grid = image_size // patch_size
     mask_config = MaskConfig()
 
     records_path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,12 +140,10 @@ def main() -> None:
                         continue
                     seen.add(path.name)
                     checkpoint = load_spatial_checkpoint(path)
-                    core = build_spatial_ijepa_core(
-                        architecture,
-                        patch_dim=patch_dim,
-                        patch_latent_dim=PATCH_LATENT_DIM,
-                        num_patches=num_patches,
-                    )
+                    metadata = checkpoint.get("metadata")
+                    if not isinstance(metadata, dict):
+                        raise ValueError(f"checkpoint has no model metadata: {path}")
+                    core = build_spatial_ijepa_core_from_metadata(metadata)
                     core.context_encoder.load_state_dict(checkpoint["context_encoder"])
                     core.predictor.load_state_dict(checkpoint["predictor"])
                     core.target_encoder.load_state_dict(checkpoint["target_encoder"])
@@ -156,17 +151,17 @@ def main() -> None:
                     core.predictor.to(device).eval()
                     core.target_encoder.to(device).eval()
 
-                    test_loss = _held_out_loss(core, test_patches, grid, mask_config, device)
+                    test_loss = _held_out_loss(core, test_frames, grid, mask_config, device)
                     train_z = encode_frames_pooled_batched(
                         core,
                         train_frames,
-                        patch_size=PATCH_SIZE,
+                        patch_size=patch_size,
                         batch_size=BATCH_SIZE,
                     ).cpu()
                     test_z = encode_frames_pooled_batched(
                         core,
                         test_frames,
-                        patch_size=PATCH_SIZE,
+                        patch_size=patch_size,
                         batch_size=BATCH_SIZE,
                     ).cpu()
                     spectrum = compute_latent_spectrum(test_z)

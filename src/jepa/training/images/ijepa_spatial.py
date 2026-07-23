@@ -1,20 +1,8 @@
-"""I-JEPA-style *spatial* masked prediction, with a CNN encoder instead of a ViT.
+"""Spatial I-JEPA built on the upstream Meta I-JEPA model semantics.
 
-Motivation: the temporal (V-JEPA-style) framing does not obviously fit Shapes3D
--- its six generative factors (floor/wall/object hue, scale, shape,
-orientation) are all *global* scene properties, and the object never moves, so
-a patch at a fixed grid position does not track any persistent local content
-across frames the way it would in real video. I-JEPA's framing needs no
-temporal structure at all: mask blocks *within a single frame* and predict
-their representations from the visible remainder.
-
-Adapted from https://github.com/facebookresearch/ijepa (CC BY-NC 4.0, see
-third_party/ijepa/). Kept from upstream: the multi-block mask sampling, the
-target-side ``F.layer_norm`` over the feature dim, and ``smooth_l1_loss``.
-Changed: a CNN encodes each patch independently and the visible patches are
-mean-pooled into a context summary (a ViT would instead mix them with
-self-attention), and the predictor is an MLP conditioned on a learned
-positional embedding rather than a transformer over mask tokens.
+The encoder, predictor, positional embeddings, target construction, and loss
+follow https://github.com/facebookresearch/ijepa. Project-specific dataset
+sampling and weighting live outside this module.
 """
 
 from __future__ import annotations
@@ -24,14 +12,14 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from jepa.models.encoders import Architecture, build_model_pair
-from jepa.models.patches import patchify
+from jepa.models import ijepa as upstream_ijepa
+from jepa.models.ijepa_utils import apply_masks, repeat_interleave_batch, trunc_normal_
 from jepa.training.core import (
     SCHEMA_VERSION,
     OptimizationPolicy,
@@ -39,16 +27,20 @@ from jepa.training.core import (
     resolve_policy,
 )
 
+IJEPAModelName = Literal["vit_tiny", "vit_small", "vit_base", "vit_large"]
+
 
 @dataclass(frozen=True, slots=True)
 class MaskConfig:
-    """Upstream defaults (configs/in1k_vith14_ep300.yaml) unless noted."""
+    """Multi-block mask settings from upstream I-JEPA."""
 
     enc_mask_scale: tuple[float, float] = (0.85, 1.0)
     pred_mask_scale: tuple[float, float] = (0.15, 0.2)
     aspect_ratio: tuple[float, float] = (0.75, 1.5)
     num_enc_masks: int = 1
     num_pred_masks: int = 4
+    # Upstream uses 10 on a 16x16 grid. Four is the corresponding safe
+    # minimum for our 8x8 grid, where a 15% target block can contain 9 tokens.
     min_keep: int = 4
     allow_overlap: bool = False
 
@@ -60,7 +52,7 @@ def _sample_block_size(
     aspect_ratio: tuple[float, float],
     generator: torch.Generator,
 ) -> tuple[int, int]:
-    """Port of MaskCollator._sample_block_size (third_party/ijepa)."""
+    """Equivalent to upstream ``MaskCollator._sample_block_size``."""
     rand = torch.rand(1, generator=generator).item()
     min_s, max_s = scale
     mask_scale = min_s + rand * (max_s - min_s)
@@ -69,9 +61,11 @@ def _sample_block_size(
     ratio = min_ar + rand * (max_ar - min_ar)
     h = int(round(math.sqrt(max_keep * ratio)))
     w = int(round(math.sqrt(max_keep / ratio)))
-    h = min(max(h, 1), grid_h)
-    w = min(max(w, 1), grid_w)
-    return h, w
+    while h >= grid_h:
+        h -= 1
+    while w >= grid_w:
+        w -= 1
+    return max(h, 1), max(w, 1)
 
 
 def _sample_block_mask(
@@ -79,195 +73,252 @@ def _sample_block_mask(
     grid_w: int,
     block_size: tuple[int, int],
     generator: torch.Generator,
-    acceptable: torch.Tensor | None = None,
+    *,
+    acceptable_regions: list[torch.Tensor] | None = None,
+    min_keep: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Port of MaskCollator._sample_block_mask. Returns (kept patch indices,
-    complement grid). ``acceptable`` is a [grid_h, grid_w] 0/1 grid the block
-    is intersected with (used to keep the context block off the target blocks)."""
+    """Equivalent to upstream ``MaskCollator._sample_block_mask``."""
     h, w = block_size
-    min_keep = 1
-    for _ in range(50):
-        top = int(torch.randint(0, max(grid_h - h, 1), (1,), generator=generator).item())
-        left = int(torch.randint(0, max(grid_w - w, 1), (1,), generator=generator).item())
-        grid = torch.zeros((grid_h, grid_w), dtype=torch.int32)
-        grid[top : top + h, left : left + w] = 1
-        if acceptable is not None:
-            grid = grid * acceptable
-        indices = torch.nonzero(grid.flatten(), as_tuple=False).squeeze(-1)
-        if indices.numel() > min_keep:
+    tries = 0
+    timeout = original_timeout = 20
+    while True:
+        top = int(torch.randint(0, grid_h - h, (1,), generator=generator).item())
+        left = int(torch.randint(0, grid_w - w, (1,), generator=generator).item())
+        mask = torch.zeros((grid_h, grid_w), dtype=torch.int32)
+        mask[top : top + h, left : left + w] = 1
+        if acceptable_regions is not None:
+            for region in acceptable_regions[: max(len(acceptable_regions) - tries, 0)]:
+                mask *= region
+        indices = torch.nonzero(mask.flatten(), as_tuple=False).squeeze(-1)
+        if len(indices) > min_keep:
             complement = torch.ones((grid_h, grid_w), dtype=torch.int32)
             complement[top : top + h, left : left + w] = 0
             return indices, complement
-    # Fall back to the unconstrained block if the constrained sampler kept
-    # failing (upstream logs a warning and relaxes the constraint instead).
-    grid = torch.zeros((grid_h, grid_w), dtype=torch.int32)
-    grid[top : top + h, left : left + w] = 1
-    indices = torch.nonzero(grid.flatten(), as_tuple=False).squeeze(-1)
-    complement = torch.ones((grid_h, grid_w), dtype=torch.int32)
-    complement[top : top + h, left : left + w] = 0
-    return indices, complement
+        timeout -= 1
+        if timeout == 0:
+            tries += 1
+            timeout = original_timeout
 
 
 def sample_masks(
-    grid_h: int, grid_w: int, config: MaskConfig, generator: torch.Generator
+    grid_h: int,
+    grid_w: int,
+    config: MaskConfig,
+    generator: torch.Generator,
+    *,
+    batch_size: int,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """One (context masks, target masks) draw, shared across the batch.
-
-    Upstream samples per-image masks inside a collate_fn and truncates them to
-    a common length so they can be stacked; we hold our whole split in memory
-    as one tensor and draw a single mask set per batch instead, which keeps
-    every image's mask the same length by construction.
-    """
+    """Sample upstream multi-block masks with independent locations per image."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     pred_size = _sample_block_size(
         grid_h, grid_w, config.pred_mask_scale, config.aspect_ratio, generator
     )
-    enc_size = _sample_block_size(grid_h, grid_w, config.enc_mask_scale, (1.0, 1.0), generator)
+    enc_size = _sample_block_size(
+        grid_h, grid_w, config.enc_mask_scale, (1.0, 1.0), generator
+    )
 
-    target_masks: list[torch.Tensor] = []
-    complements: list[torch.Tensor] = []
-    for _ in range(config.num_pred_masks):
-        mask, complement = _sample_block_mask(grid_h, grid_w, pred_size, generator)
-        target_masks.append(mask)
-        complements.append(complement)
+    targets_by_image: list[list[torch.Tensor]] = []
+    contexts_by_image: list[list[torch.Tensor]] = []
+    min_pred = grid_h * grid_w
+    min_enc = grid_h * grid_w
+    for _ in range(batch_size):
+        image_targets: list[torch.Tensor] = []
+        complements: list[torch.Tensor] = []
+        for _ in range(config.num_pred_masks):
+            mask, complement = _sample_block_mask(
+                grid_h,
+                grid_w,
+                pred_size,
+                generator,
+                min_keep=config.min_keep,
+            )
+            image_targets.append(mask)
+            complements.append(complement)
+            min_pred = min(min_pred, len(mask))
+        targets_by_image.append(image_targets)
 
-    acceptable = None
-    if not config.allow_overlap:
-        acceptable = torch.ones((grid_h, grid_w), dtype=torch.int32)
-        for complement in complements:
-            acceptable = acceptable * complement
+        acceptable = None if config.allow_overlap else complements
+        image_contexts: list[torch.Tensor] = []
+        for _ in range(config.num_enc_masks):
+            mask, _ = _sample_block_mask(
+                grid_h,
+                grid_w,
+                enc_size,
+                generator,
+                acceptable_regions=acceptable,
+                min_keep=config.min_keep,
+            )
+            image_contexts.append(mask)
+            min_enc = min(min_enc, len(mask))
+        contexts_by_image.append(image_contexts)
 
-    context_masks: list[torch.Tensor] = []
-    for _ in range(config.num_enc_masks):
-        mask, _ = _sample_block_mask(grid_h, grid_w, enc_size, generator, acceptable=acceptable)
-        context_masks.append(mask)
+    target_masks = [
+        torch.stack([targets_by_image[b][m][:min_pred] for b in range(batch_size)])
+        for m in range(config.num_pred_masks)
+    ]
+    context_masks = [
+        torch.stack([contexts_by_image[b][m][:min_enc] for b in range(batch_size)])
+        for m in range(config.num_enc_masks)
+    ]
     return context_masks, target_masks
-
-
-class SpatialPositionalPredictor(nn.Module):
-    """Predicts the latents of the patches named by a target mask, from the
-    pooled context summary plus a learned embedding of each target position."""
-
-    def __init__(
-        self,
-        num_patches: int,
-        context_dim: int,
-        patch_latent_dim: int,
-        *,
-        position_dim: int = 32,
-        hidden_dim: int = 128,
-    ) -> None:
-        super().__init__()
-        self.position_embedding = nn.Embedding(num_patches, position_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(context_dim + position_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, patch_latent_dim),
-        )
-
-    def forward(self, context_summary: torch.Tensor, target_indices: torch.Tensor) -> torch.Tensor:
-        """``context_summary``: [B, context_dim]; ``target_indices``: [k].
-        Returns [B, k, patch_latent_dim]."""
-        k = target_indices.shape[0]
-        position = self.position_embedding(target_indices)
-        context_expanded = context_summary.unsqueeze(1).expand(-1, k, -1)
-        position_expanded = position.unsqueeze(0).expand(context_summary.shape[0], -1, -1)
-        return self.mlp(torch.cat([context_expanded, position_expanded], dim=-1))
 
 
 @dataclass(slots=True)
 class SpatialIJEPACore:
     context_encoder: nn.Module
-    predictor: SpatialPositionalPredictor
+    predictor: nn.Module
     target_encoder: nn.Module
     policy: OptimizationPolicy
+    model_name: IJEPAModelName
+    image_size: int
+    patch_size: int
+    embed_dim: int
 
 
 def build_spatial_ijepa_core(
-    architecture: Architecture,
+    model_name: IJEPAModelName = "vit_tiny",
     *,
-    patch_dim: int,
-    patch_latent_dim: int,
-    num_patches: int,
+    image_size: int = 64,
+    patch_size: int = 8,
+    predictor_embed_dim: int = 192,
+    predictor_depth: int = 6,
     stop_gradient: bool = True,
     ema_enabled: bool = True,
-    hidden_dim: int = 64,
-    position_dim: int = 32,
-    predictor_hidden_dim: int = 128,
 ) -> SpatialIJEPACore:
-    encoder, _ = build_model_pair(
-        architecture, input_dim=patch_dim, latent_dim=patch_latent_dim, hidden_dim=hidden_dim
+    """Build the same encoder/predictor/target structure as upstream I-JEPA."""
+    if image_size % patch_size:
+        raise ValueError("image_size must be divisible by patch_size")
+    if model_name not in upstream_ijepa.VIT_EMBED_DIMS:
+        raise ValueError(f"unknown I-JEPA model: {model_name!r}")
+    encoder_factory = getattr(upstream_ijepa, model_name)
+    encoder = encoder_factory(img_size=[image_size], patch_size=patch_size)
+    predictor = upstream_ijepa.vit_predictor(
+        num_patches=encoder.patch_embed.num_patches,
+        embed_dim=encoder.embed_dim,
+        predictor_embed_dim=predictor_embed_dim,
+        depth=predictor_depth,
+        num_heads=encoder.num_heads,
     )
-    predictor = SpatialPositionalPredictor(
-        num_patches,
-        context_dim=patch_latent_dim,
-        patch_latent_dim=patch_latent_dim,
-        position_dim=position_dim,
-        hidden_dim=predictor_hidden_dim,
-    )
+
+    # Upstream helper.init_model performs this second initialization pass after
+    # constructing both modules.
+    def init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+
+    encoder.apply(init_weights)
+    predictor.apply(init_weights)
     policy = resolve_policy(stop_gradient=stop_gradient, ema_enabled=ema_enabled)
     target_encoder = deepcopy(encoder) if policy.separate_target else encoder
     if policy.separate_target and not policy.optimize_target:
         target_encoder.requires_grad_(False)
-    return SpatialIJEPACore(encoder, predictor, target_encoder, policy)
+    return SpatialIJEPACore(
+        context_encoder=encoder,
+        predictor=predictor,
+        target_encoder=target_encoder,
+        policy=policy,
+        model_name=model_name,
+        image_size=image_size,
+        patch_size=patch_size,
+        embed_dim=encoder.embed_dim,
+    )
 
 
-def encode_samples_pooled(core: SpatialIJEPACore, samples: torch.Tensor) -> torch.Tensor:
-    """Encode patch tensors and mean-pool their patch tokens."""
-    tokens = core.context_encoder(samples)
-    return tokens.mean(dim=1)
+def build_spatial_ijepa_core_from_metadata(metadata: Mapping[str, Any]) -> SpatialIJEPACore:
+    if metadata.get("model_family") != "upstream_ijepa":
+        raise ValueError(
+            "checkpoint predates the upstream I-JEPA integration and requires the legacy code"
+        )
+    return build_spatial_ijepa_core(
+        str(metadata.get("model_name", "vit_tiny")),  # type: ignore[arg-type]
+        image_size=int(metadata.get("image_size", 64)),
+        patch_size=int(metadata.get("patch_size", 8)),
+        predictor_embed_dim=int(metadata.get("predictor_embed_dim", 192)),
+        predictor_depth=int(metadata.get("predictor_depth", 6)),
+    )
+
+
+def _masks_to_device(masks: list[torch.Tensor], device: torch.device) -> list[torch.Tensor]:
+    return [mask.to(device=device, dtype=torch.long, non_blocking=True) for mask in masks]
+
+
+def normalize_ijepa_images(
+    images: torch.Tensor, *, inplace: bool = False
+) -> torch.Tensor:
+    """Apply the ImageNet normalization used by upstream I-JEPA transforms."""
+    mean = images.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+    std = images.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+    if inplace:
+        return images.sub_(mean).div_(std)
+    return (images - mean) / std
 
 
 def spatial_ijepa_per_sample_loss(
     core: SpatialIJEPACore,
-    patches: torch.Tensor,
-    context_mask: torch.Tensor,
-    target_mask: torch.Tensor,
+    images: torch.Tensor,
+    context_masks: list[torch.Tensor] | torch.Tensor,
+    target_masks: list[torch.Tensor] | torch.Tensor,
 ) -> torch.Tensor:
-    """Return one spatial I-JEPA loss value per frame in the batch.
-
-    ``patches``: [B, num_patches, patch_dim]; masks are 1-D index tensors.
-
-    Target-side ``layer_norm`` over the feature dim and ``smooth_l1_loss`` are
-    taken from upstream's src/train.py (forward_target / loss_fn).
-    """
-    context_patches = patches[:, context_mask, :]
-    target_patches = patches[:, target_mask, :]
+    """Return the upstream I-JEPA loss reduced to one value per input image."""
+    if isinstance(context_masks, torch.Tensor):
+        context_masks = [context_masks]
+    if isinstance(target_masks, torch.Tensor):
+        target_masks = [target_masks]
+    device = images.device
+    context_masks = _masks_to_device(context_masks, device)
+    target_masks = _masks_to_device(target_masks, device)
+    batch_size = images.shape[0]
 
     with torch.no_grad() if not core.policy.optimize_target else torch.enable_grad():
-        target_latents = core.target_encoder(target_patches)
-        target_latents = F.layer_norm(target_latents, (target_latents.size(-1),))
+        target = core.target_encoder(images)
+        target = F.layer_norm(target, (target.size(-1),))
+        target = apply_masks(target, target_masks)
+        target = repeat_interleave_batch(target, batch_size, repeat=len(context_masks))
     if core.policy.stop_gradient:
-        target_latents = target_latents.detach()
+        target = target.detach()
 
-    context_latents = core.context_encoder(context_patches)
-    context_summary = context_latents.mean(dim=1)
-    predicted = core.predictor(context_summary, target_mask)
-    per_element = F.smooth_l1_loss(predicted, target_latents, reduction="none")
-    return per_element.mean(dim=(1, 2))
+    context = core.context_encoder(images, context_masks)
+    prediction = core.predictor(context, context_masks, target_masks)
+    per_element = F.smooth_l1_loss(prediction, target, reduction="none")
+    return per_element.reshape(
+        len(target_masks), len(context_masks), batch_size, -1
+    ).mean(dim=(0, 1, 3))
 
 
 def spatial_ijepa_loss(
     core: SpatialIJEPACore,
-    patches: torch.Tensor,
-    context_mask: torch.Tensor,
-    target_mask: torch.Tensor,
+    images: torch.Tensor,
+    context_masks: list[torch.Tensor] | torch.Tensor,
+    target_masks: list[torch.Tensor] | torch.Tensor,
 ) -> torch.Tensor:
-    """Mean spatial I-JEPA loss over the batch."""
-    return spatial_ijepa_per_sample_loss(core, patches, context_mask, target_mask).mean()
+    return spatial_ijepa_per_sample_loss(core, images, context_masks, target_masks).mean()
+
+
+def encode_samples_pooled(core: SpatialIJEPACore, images: torch.Tensor) -> torch.Tensor:
+    """Mean-pool contextualized full-image encoder tokens."""
+    return core.context_encoder(images).mean(dim=1)
 
 
 @torch.no_grad()
 def encode_frames_pooled(
-    core: SpatialIJEPACore, frames: torch.Tensor, *, patch_size: int
+    core: SpatialIJEPACore,
+    frames: torch.Tensor,
+    *,
+    patch_size: int | None = None,
 ) -> torch.Tensor:
-    """Frame-level representation for post-hoc analysis: encode every patch
-    with the frozen context encoder and mean-pool. ``frames``: [..., C, H, W]."""
+    if patch_size is not None and patch_size != core.patch_size:
+        raise ValueError(
+            f"requested patch_size={patch_size}, checkpoint model uses {core.patch_size}"
+        )
     core.context_encoder.eval()
     device = next(core.context_encoder.parameters()).device
-    patches = patchify(frames, patch_size).to(device)
-    return encode_samples_pooled(core, patches)
+    return encode_samples_pooled(core, frames.to(device))
 
 
 @torch.no_grad()
@@ -275,17 +326,18 @@ def encode_frames_pooled_batched(
     core: SpatialIJEPACore,
     frames: torch.Tensor,
     *,
-    patch_size: int,
+    patch_size: int | None = None,
     batch_size: int,
 ) -> torch.Tensor:
-    """Memory-bounded frame-level encoding for large diagnostic splits."""
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    chunks = [
-        encode_frames_pooled(core, batch, patch_size=patch_size).detach().cpu()
-        for batch in frames.split(batch_size)
-    ]
-    return torch.cat(chunks, dim=0)
+    return torch.cat(
+        [
+            encode_frames_pooled(core, batch, patch_size=patch_size).detach().cpu()
+            for batch in frames.split(batch_size)
+        ],
+        dim=0,
+    )
 
 
 def save_spatial_checkpoint(
@@ -312,13 +364,10 @@ def save_spatial_checkpoint(
         payload["metadata"] = dict(metadata)
     if extra_state is not None:
         payload["extra_state"] = dict(extra_state)
-    _atomic_torch_save(
-        Path(path),
-        payload,
-    )
+    _atomic_torch_save(Path(path), payload)
 
 
-def load_spatial_checkpoint(path: str | Path) -> dict:
+def load_spatial_checkpoint(path: str | Path) -> dict[str, Any]:
     checkpoint = torch.load(Path(path), map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("checkpoint has an incompatible schema")
