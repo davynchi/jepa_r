@@ -4,7 +4,7 @@
 This intentionally preserves the pre-upstream-I-JEPA architecture so the
 corruption hypothesis can be tested independently of the architecture rewrite.
 
-    CUDA_VISIBLE_DEVICES=0 python scripts/images/train_shapes3d_corrupted_legacy.py \
+    CUDA_VISIBLE_DEVICES=0 python legacy/train_shapes3d_corrupted.py \
         --run-name corrupted_uniform --weighting-method uniform
     tensorboard --logdir outputs/shapes3d_corrupted_legacy
 """
@@ -17,7 +17,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import torch  # noqa: E402
 
@@ -27,17 +29,17 @@ from jepa.configs.images.shapes3d import (  # noqa: E402
     load_shapes3d_config,
     shapes3d_config_to_dict,
 )
-from jepa.data.images.corruptions import (  # noqa: E402
-    CORRUPTION_NAMES,
-    corrupt_images,
-)
 from jepa.data.images.shapes3d import (  # noqa: E402
     build_shapes3d_counterfactual_pairs,
     build_shapes3d_static_dataset_splits,
 )
-from jepa.models.patches import patchify  # noqa: E402
 from jepa.training.core import ema_update  # noqa: E402
-from jepa.training.images.legacy_ijepa_spatial import (  # noqa: E402
+from jepa.training.images.spatial_logging import (  # noqa: E402
+    SpatialRunLogger,
+    eigenvalue_scalars,
+)
+from legacy.corruptions import CORRUPTION_NAMES, corrupt_images  # noqa: E402
+from legacy.ijepa_spatial import (  # noqa: E402
     MaskConfig,
     build_spatial_ijepa_core,
     encode_frames_pooled_batched,
@@ -47,7 +49,8 @@ from jepa.training.images.legacy_ijepa_spatial import (  # noqa: E402
     save_spatial_checkpoint,
     spatial_ijepa_loss,
 )
-from jepa.training.images.legacy_spatial_curriculum import (  # noqa: E402
+from legacy.patches import patchify  # noqa: E402
+from legacy.spatial_curriculum import (  # noqa: E402
     SpatialWeightingConfig,
     SpatialWeightingState,
     init_spatial_weighting,
@@ -60,10 +63,6 @@ from jepa.training.images.legacy_spatial_curriculum import (  # noqa: E402
     update_coordinate_weighting_state,
     update_spatial_weights,
     weighting_diagnostics,
-)
-from jepa.training.images.spatial_logging import (  # noqa: E402
-    SpatialRunLogger,
-    eigenvalue_scalars,
 )
 
 ARCHITECTURE = "cnn"
@@ -78,9 +77,19 @@ EVAL_EVERY_EPOCHS = 10
 CHECKPOINT_EVERY_EPOCHS = 50
 CHECKPOINT_EVERY_STEPS = 0
 LOG_EVERY_STEPS = 25
-OUTPUT_ROOT = (
-    Path(__file__).resolve().parents[2] / "outputs" / "shapes3d_corrupted_legacy"
-)
+OUTPUT_ROOT = REPO_ROOT / "outputs" / "shapes3d_corrupted_legacy"
+CORRUPTION_TENSORBOARD_SCALARS = {
+    "corruption/sampled_fraction",
+    "corruption/probability_mass",
+    "corruption/mean_probability_ratio",
+    "corruption/top_10pct_fraction",
+    "corruption/score_mean_clean",
+    "corruption/score_mean_corrupted",
+    "corruption/probability_mass_noise",
+    "corruption/probability_mass_blur",
+    "corruption/probability_mass_occlusion",
+    "corruption/probability_mass_blank",
+}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -351,7 +360,11 @@ def main() -> None:
     run_dir = Path(args.output_root).expanduser().resolve() / run_name
     checkpoint_dir = run_dir / "network"
     checkpoint_dir.mkdir(parents=True, exist_ok=args.resume_from is not None)
-    logger = SpatialRunLogger(run_dir, enable_tensorboard=not args.no_tensorboard)
+    logger = SpatialRunLogger(
+        run_dir,
+        enable_tensorboard=not args.no_tensorboard,
+        extra_tensorboard_scalars=CORRUPTION_TENSORBOARD_SCALARS,
+    )
     curriculum_method = (
         "uniform" if args.weighting_method == "oracle-clean" else args.weighting_method
     )

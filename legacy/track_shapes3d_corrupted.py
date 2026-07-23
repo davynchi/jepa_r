@@ -28,7 +28,9 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -58,8 +60,8 @@ from jepa.data.images.shapes3d import (  # noqa: E402
     build_shapes3d_counterfactual_pairs,
     build_shapes3d_static_dataset_splits,
 )
-from jepa.models.patches import patchify  # noqa: E402
-from jepa.training.images.legacy_ijepa_spatial import (  # noqa: E402
+from jepa.training.images.spatial_logging import SpatialRunLogger  # noqa: E402
+from legacy.ijepa_spatial import (  # noqa: E402
     MaskConfig,
     build_spatial_ijepa_core,
     encode_frames_pooled,
@@ -68,11 +70,9 @@ from jepa.training.images.legacy_ijepa_spatial import (  # noqa: E402
     sample_masks,
     spatial_ijepa_loss,
 )
-from jepa.training.images.spatial_logging import SpatialRunLogger  # noqa: E402
+from legacy.patches import patchify  # noqa: E402
 
-DEFAULT_OUTPUT_ROOT = (
-    Path(__file__).resolve().parents[2] / "outputs" / "shapes3d_corrupted_legacy"
-)
+DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "shapes3d_corrupted_legacy"
 PATCH_SIZE = 8
 PATCH_LATENT_DIM = 16
 BATCH_SIZE = 128

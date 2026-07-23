@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -39,16 +39,6 @@ _TENSORBOARD_SCALARS = {
     "weighting/prob_max",
     "weighting/effective_sample_size",
     "weighting/top_10pct_mass",
-    "corruption/sampled_fraction",
-    "corruption/probability_mass",
-    "corruption/mean_probability_ratio",
-    "corruption/top_10pct_fraction",
-    "corruption/score_mean_clean",
-    "corruption/score_mean_corrupted",
-    "corruption/probability_mass_noise",
-    "corruption/probability_mass_blur",
-    "corruption/probability_mass_occlusion",
-    "corruption/probability_mass_blank",
     "ras/richness_value",
     "ras/richness_logdet",
     "ras/richness_trace",
@@ -90,10 +80,17 @@ _TENSORBOARD_HISTOGRAMS = {
 class SpatialRunLogger:
     """Write durable JSONL metrics and optional TensorBoard summaries."""
 
-    def __init__(self, run_dir: str | Path, *, enable_tensorboard: bool = True) -> None:
+    def __init__(
+        self,
+        run_dir: str | Path,
+        *,
+        enable_tensorboard: bool = True,
+        extra_tensorboard_scalars: Iterable[str] = (),
+    ) -> None:
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_path = self.run_dir / "metrics.jsonl"
+        self.tensorboard_scalars = _TENSORBOARD_SCALARS | set(extra_tensorboard_scalars)
         self.writer: Any | None = None
         if enable_tensorboard and TensorBoardSummaryWriter is not None:
             self.writer = TensorBoardSummaryWriter(log_dir=str(self.run_dir / "tensorboard"))
@@ -134,7 +131,7 @@ class SpatialRunLogger:
         if self.writer is None:
             return
         for name, value in safe_scalars.items():
-            if name not in _TENSORBOARD_SCALARS:
+            if name not in self.tensorboard_scalars:
                 continue
             if value is None or isinstance(value, bool):
                 continue

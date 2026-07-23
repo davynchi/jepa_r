@@ -8,7 +8,7 @@ from typing import Literal
 import torch
 
 from jepa.configs.base import derive_seed
-from jepa.training.images.legacy_ijepa_spatial import (
+from legacy.ijepa_spatial import (
     MaskConfig,
     SpatialIJEPACore,
     encode_samples_pooled,
@@ -316,14 +316,10 @@ def _coordinate_importance_from_transformation(
     source_eigs, source_basis = torch.linalg.eigh((source_cov + source_cov.T) / 2)
     target_eigs, target_basis = torch.linalg.eigh((target_cov + target_cov.T) / 2)
     source_inv_sqrt = (
-        source_basis
-        @ torch.diag(source_eigs.clamp_min(delta).rsqrt())
-        @ source_basis.T
+        source_basis @ torch.diag(source_eigs.clamp_min(delta).rsqrt()) @ source_basis.T
     )
     target_inv_sqrt = (
-        target_basis
-        @ torch.diag(target_eigs.clamp_min(delta).rsqrt())
-        @ target_basis.T
+        target_basis @ torch.diag(target_eigs.clamp_min(delta).rsqrt()) @ target_basis.T
     )
     operator = target_inv_sqrt @ cross_cov @ source_inv_sqrt
     operator = torch.nan_to_num(operator, nan=0.0, posinf=0.0, neginf=0.0)

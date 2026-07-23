@@ -53,13 +53,9 @@ def corrupt_images(
 
     if mode == "mixed":
         selected_kind_ids = torch.arange(count, dtype=torch.long) % 4 + 1
-        selected_kind_ids = selected_kind_ids[
-            torch.randperm(count, generator=generator)
-        ]
+        selected_kind_ids = selected_kind_ids[torch.randperm(count, generator=generator)]
     else:
-        selected_kind_ids = torch.full(
-            (count,), _MODE_TO_ID[mode], dtype=torch.long
-        )
+        selected_kind_ids = torch.full((count,), _MODE_TO_ID[mode], dtype=torch.long)
     kind_ids[corrupted_indices] = selected_kind_ids
 
     noise_indices = corrupted_indices[selected_kind_ids == _MODE_TO_ID["noise"]]
@@ -77,9 +73,7 @@ def corrupt_images(
             output[blur_indices], kernel_size=11, stride=1, padding=5
         )
 
-    occlusion_indices = corrupted_indices[
-        selected_kind_ids == _MODE_TO_ID["occlusion"]
-    ]
+    occlusion_indices = corrupted_indices[selected_kind_ids == _MODE_TO_ID["occlusion"]]
     if occlusion_indices.numel() > 0:
         height, width = output.shape[-2:]
         top, bottom = height // 4, height - height // 4

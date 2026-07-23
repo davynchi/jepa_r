@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+LEGACY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(dirname -- "$LEGACY_DIR")"
+cd "$REPO_ROOT"
+
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DIAGNOSTICS_DEVICE="${DIAGNOSTICS_DEVICE:-cpu}"
 DIAGNOSTICS_POLL_SECONDS="${DIAGNOSTICS_POLL_SECONDS:-15}"
@@ -52,7 +56,7 @@ DIAGNOSTICS_LOG="$RUN_DIR/diagnostics_watcher.log"
 
 mkdir -p "$RUN_DIR"
 
-"$PYTHON_BIN" scripts/images/train_shapes3d_corrupted_legacy.py \
+"$PYTHON_BIN" legacy/train_shapes3d_corrupted.py \
   "${TRAIN_ARGS[@]}" > "$TRAIN_LOG" 2>&1 &
 TRAIN_PID=$!
 
@@ -74,7 +78,7 @@ if [[ ! -f "$RUN_DIR/config.json" ]]; then
 fi
 
 DIAGNOSTICS_ARGS=(
-  scripts/analysis/track_shapes3d_corrupted_legacy.py
+  legacy/track_shapes3d_corrupted.py
   --run-dir "$RUN_DIR"
   --poll-seconds "$DIAGNOSTICS_POLL_SECONDS"
   --device "$DIAGNOSTICS_DEVICE"

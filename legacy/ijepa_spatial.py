@@ -30,14 +30,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from jepa.models.encoders import Architecture, build_model_pair
-from jepa.models.patches import patchify
 from jepa.training.core import (
     SCHEMA_VERSION,
     OptimizationPolicy,
     _atomic_torch_save,
     resolve_policy,
 )
+from legacy.encoders import LegacyArchitecture, build_legacy_model_pair
+from legacy.patches import patchify
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +185,7 @@ class SpatialIJEPACore:
 
 
 def build_spatial_ijepa_core(
-    architecture: Architecture,
+    architecture: LegacyArchitecture,
     *,
     patch_dim: int,
     patch_latent_dim: int,
@@ -196,7 +196,7 @@ def build_spatial_ijepa_core(
     position_dim: int = 32,
     predictor_hidden_dim: int = 128,
 ) -> SpatialIJEPACore:
-    encoder, _ = build_model_pair(
+    encoder, _ = build_legacy_model_pair(
         architecture, input_dim=patch_dim, latent_dim=patch_latent_dim, hidden_dim=hidden_dim
     )
     predictor = SpatialPositionalPredictor(

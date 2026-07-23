@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+LEGACY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(dirname -- "$LEGACY_DIR")"
+cd "$REPO_ROOT"
+
 PYTHON_BIN="${PYTHON_BIN:-python}"
 GPU_A="${GPU_A:-0}"
 GPU_B="${GPU_B:-1}"
@@ -36,7 +40,7 @@ run_experiment() {
   CUDA_VISIBLE_DEVICES="$gpu" \
     PYTHON_BIN="$PYTHON_BIN" \
     DIAGNOSTICS_DEVICE=cpu \
-    scripts/images/train_shapes3d_corrupted_legacy_with_diagnostics.sh \
+    legacy/train_shapes3d_corrupted_with_diagnostics.sh \
     "${COMMON_ARGS[@]}" "$@"
 }
 
