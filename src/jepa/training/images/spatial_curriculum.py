@@ -366,7 +366,8 @@ def _masked_pooled_latents(
     images: torch.Tensor,
     masks: list[torch.Tensor],
 ) -> torch.Tensor:
-    encoded = core.context_encoder(images, masks)
+    device_masks = [mask.to(images.device, non_blocking=True) for mask in masks]
+    encoded = core.context_encoder(images, device_masks)
     num_masks = len(masks)
     batch_size = images.shape[0]
     if encoded.shape[0] != num_masks * batch_size:

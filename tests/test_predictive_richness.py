@@ -45,6 +45,17 @@ class _PatchMeanEncoder(nn.Module):
         )
 
 
+class _DeviceCheckingEncoder(_PatchMeanEncoder):
+    def forward(
+        self,
+        images: torch.Tensor,
+        masks: list[torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        if masks is not None:
+            assert all(mask.device == images.device for mask in masks)
+        return super().forward(images, masks)
+
+
 def _fake_core() -> SpatialIJEPACore:
     encoder = _PatchMeanEncoder(patch_size=2, embed_dim=3)
     return SpatialIJEPACore(
@@ -57,6 +68,14 @@ def _fake_core() -> SpatialIJEPACore:
         patch_size=2,
         embed_dim=3,
     )
+
+
+def _device_checking_core() -> SpatialIJEPACore:
+    core = _fake_core()
+    encoder = _DeviceCheckingEncoder(patch_size=2, embed_dim=3)
+    core.context_encoder = encoder
+    core.target_encoder = encoder
+    return core
 
 
 def _mask_config() -> MaskConfig:
@@ -141,3 +160,19 @@ def test_predictive_barlow_runs_through_batch_ras() -> None:
     assert torch.isfinite(scores).all()
     assert torch.isfinite(torch.tensor(metadata["ras/grad_richness_norm"]))
     assert "ras/predictive_invariance_loss" in metadata
+
+
+def test_predictive_barlow_moves_sampled_masks_to_image_device() -> None:
+    richness, _ = richness_from_images(
+        _device_checking_core(),
+        torch.randn(8, 3, 16, 16),
+        functional="predictive-barlow",
+        delta=1.0e-4,
+        trace_target=1.0,
+        trace_beta=0.0,
+        grid=8,
+        mask_config=_mask_config(),
+        mask_seed=9,
+    )
+
+    assert torch.isfinite(richness)
