@@ -132,6 +132,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
     parser.add_argument("--predictor-embed-dim", type=int, default=192)
     parser.add_argument("--predictor-depth", type=int, default=6)
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("none", "bfloat16", "float16"),
+        default=None,
+        help="CUDA autocast dtype; overrides the legacy --bfloat16 flag",
+    )
     parser.add_argument("--bfloat16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--crop-scale", type=float, nargs=2, default=(0.3, 1.0))
     parser.add_argument("--horizontal-flip-prob", type=float, default=0.0)
@@ -262,6 +268,12 @@ def _default_run_name(seed: int) -> str:
     return f"spatial_ijepa_seed{seed}_{stamp}"
 
 
+def _requested_amp_dtype_name(args: argparse.Namespace) -> str:
+    if args.amp_dtype is not None:
+        return args.amp_dtype
+    return "bfloat16" if args.bfloat16 else "none"
+
+
 def _checkpoint_metadata(args: argparse.Namespace, run_dir: Path) -> dict[str, object]:
     return {
         "model_family": "upstream_ijepa",
@@ -272,6 +284,7 @@ def _checkpoint_metadata(args: argparse.Namespace, run_dir: Path) -> dict[str, o
         "predictor_embed_dim": args.predictor_embed_dim,
         "predictor_depth": args.predictor_depth,
         "ema": [args.ema_start, args.ema_end],
+        "amp_dtype": _requested_amp_dtype_name(args),
         "run_dir": str(run_dir),
         "dataset": args.dataset,
         "data_source": f"{args.dataset}_images",
@@ -566,6 +579,7 @@ def _encode_images_pooled(
 def main() -> None:
     args = _parse_args()
     _validate_args(args)
+    amp_dtype_name = _requested_amp_dtype_name(args)
     run_name = args.run_name or _default_run_name(args.seed)
     run_dir = Path(args.output_root).expanduser().resolve() / run_name
     checkpoint_dir = run_dir / "network"
@@ -669,6 +683,7 @@ def main() -> None:
                 "ipe_scale": args.ipe_scale,
                 "ema": [args.ema_start, args.ema_end],
                 "bfloat16": args.bfloat16,
+                "amp_dtype": amp_dtype_name,
                 "crop_scale": list(args.crop_scale),
                 "horizontal_flip_probability": args.horizontal_flip_prob,
                 "mask_loader_workers": args.mask_loader_workers,
@@ -828,11 +843,16 @@ def main() -> None:
         args=args,
     )
     total_schedule_steps = int(args.ipe_scale * args.epochs * iterations_per_epoch)
-    use_bfloat16 = args.bfloat16 and device.type == "cuda"
+    amp_dtype = {
+        "none": None,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }[amp_dtype_name]
+    use_amp = amp_dtype is not None and device.type == "cuda"
     try:
-        scaler = torch.amp.GradScaler("cuda", enabled=use_bfloat16)
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     except (AttributeError, TypeError):  # PyTorch versions used by older DataSphere images.
-        scaler = torch.cuda.amp.GradScaler(enabled=use_bfloat16)
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     start = time.time()
     global_step = 0
     metadata = _checkpoint_metadata(args, run_dir)
@@ -1013,8 +1033,8 @@ def main() -> None:
                     )
                 with torch.autocast(
                     device_type=device.type,
-                    dtype=torch.bfloat16,
-                    enabled=use_bfloat16,
+                    dtype=amp_dtype or torch.bfloat16,
+                    enabled=use_amp,
                 ):
                     if bandit_sampler is not None:
                         loss, batch_contexts = spatial_ijepa_loss_with_context(
@@ -1022,7 +1042,7 @@ def main() -> None:
                         )
                     else:
                         loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
-                if use_bfloat16:
+                if use_amp:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                 else:
@@ -1062,7 +1082,7 @@ def main() -> None:
                         "bandit/cache_coverage": bandit_cache.coverage,
                         **richness_snapshot.metadata,
                     }
-                if use_bfloat16:
+                if use_amp:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
@@ -1200,7 +1220,7 @@ def main() -> None:
                         ),
                         score_granularity=weighting_config.ras_score_granularity,
                         alignment=weighting_config.ras_alignment,
-                        use_bfloat16=use_bfloat16,
+                        amp_dtype=amp_dtype,
                     )
                 elif weighting_config.method == "coord":
                     (

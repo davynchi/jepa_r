@@ -645,7 +645,7 @@ def score_frames_by_ras(
     predictive_redundancy_weight: float = 0.005,
     score_granularity: RASScoreGranularity = "sample",
     alignment: RASAlignment = "dot",
-    use_bfloat16: bool = True,
+    amp_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if batch_size <= 0:
         raise ValueError("score batch_size must be positive")
@@ -670,8 +670,8 @@ def score_frames_by_ras(
         ref_images = train_images[ref_indices.to(train_images.device)].to(device)
         with torch.autocast(
             device_type=device.type,
-            dtype=torch.bfloat16,
-            enabled=use_bfloat16 and device.type == "cuda",
+            dtype=amp_dtype or torch.bfloat16,
+            enabled=amp_dtype is not None and device.type == "cuda",
         ):
             richness, richness_metadata = richness_from_images(
                 core,
@@ -712,8 +712,8 @@ def score_frames_by_ras(
             if score_granularity == "batch":
                 with torch.autocast(
                     device_type=device.type,
-                    dtype=torch.bfloat16,
-                    enabled=use_bfloat16 and device.type == "cuda",
+                    dtype=amp_dtype or torch.bfloat16,
+                    enabled=amp_dtype is not None and device.type == "cuda",
                 ):
                     group_loss = spatial_ijepa_per_sample_loss(
                         core,
@@ -752,8 +752,8 @@ def score_frames_by_ras(
                     ]
                     with torch.autocast(
                         device_type=device.type,
-                        dtype=torch.bfloat16,
-                        enabled=use_bfloat16 and device.type == "cuda",
+                        dtype=amp_dtype or torch.bfloat16,
+                        enabled=amp_dtype is not None and device.type == "cuda",
                     ):
                         sample_loss = spatial_ijepa_per_sample_loss(
                             core,
