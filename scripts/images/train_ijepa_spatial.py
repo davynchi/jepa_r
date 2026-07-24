@@ -220,7 +220,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--weighting-ref-size", type=int, default=1024)
     parser.add_argument(
         "--weighting-richness",
-        choices=("logdet", "rbar", "pr", "predictive-barlow"),
+        choices=("logdet", "rbar", "pr", "predictive-barlow", "predictive-spectral"),
         default="logdet",
         help="Richness functional used by --weighting-method ras",
     )
@@ -232,6 +232,12 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.005,
         help="Off-diagonal cross-correlation penalty for predictive-barlow richness",
+    )
+    parser.add_argument(
+        "--weighting-predictive-kappa",
+        type=float,
+        default=1.0,
+        help="Spectral gain used by predictive-spectral richness",
     )
     parser.add_argument(
         "--ras-score-granularity",
@@ -321,12 +327,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--weighting-target-ess-fraction must be in [0, 1]")
     if args.weighting_predictive_redundancy_weight < 0:
         raise ValueError("--weighting-predictive-redundancy-weight must be non-negative")
+    if args.weighting_predictive_kappa <= 0:
+        raise ValueError("--weighting-predictive-kappa must be positive")
     if (
         args.weighting_method == "ras-thompson"
-        and args.weighting_richness == "predictive-barlow"
+        and args.weighting_richness in {"predictive-barlow", "predictive-spectral"}
     ):
         raise ValueError(
-            "predictive-barlow currently supports periodic --weighting-method ras only"
+            "predictive richness currently supports periodic --weighting-method ras only"
         )
     if args.mask_loader_workers < 0:
         raise ValueError("--mask-loader-workers must be non-negative")
@@ -602,6 +610,7 @@ def main() -> None:
         richness_trace_target=args.weighting_richness_trace_target,
         richness_trace_beta=args.weighting_richness_trace_beta,
         predictive_redundancy_weight=args.weighting_predictive_redundancy_weight,
+        predictive_kappa=args.weighting_predictive_kappa,
         ras_score_granularity=args.ras_score_granularity,
         ras_alignment=args.ras_alignment,
         coordinate_importance=args.coordinate_importance,
@@ -718,6 +727,7 @@ def main() -> None:
                     "predictive_redundancy_weight": (
                         weighting_config.predictive_redundancy_weight
                     ),
+                    "predictive_kappa": weighting_config.predictive_kappa,
                     "ras_score_granularity": weighting_config.ras_score_granularity,
                     "ras_alignment": weighting_config.ras_alignment,
                     "coordinate_importance": weighting_config.coordinate_importance,
@@ -1218,6 +1228,7 @@ def main() -> None:
                         predictive_redundancy_weight=(
                             weighting_config.predictive_redundancy_weight
                         ),
+                        predictive_kappa=weighting_config.predictive_kappa,
                         score_granularity=weighting_config.ras_score_granularity,
                         alignment=weighting_config.ras_alignment,
                         amp_dtype=amp_dtype,

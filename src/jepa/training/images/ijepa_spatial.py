@@ -275,6 +275,27 @@ def spatial_ijepa_per_sample_loss_with_context(
     target_masks: list[torch.Tensor] | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return per-image loss and pooled masked-context representations."""
+    prediction, target, context, num_context_masks, num_target_masks = (
+        spatial_ijepa_prediction_targets(core, images, context_masks, target_masks)
+    )
+    batch_size = images.shape[0]
+    pooled_context = context.reshape(
+        num_context_masks, batch_size, context.shape[-2], context.shape[-1]
+    ).mean(dim=(0, 2))
+    per_element = F.smooth_l1_loss(prediction, target, reduction="none")
+    losses = per_element.reshape(
+        num_target_masks, num_context_masks, batch_size, -1
+    ).mean(dim=(0, 1, 3))
+    return losses, pooled_context
+
+
+def spatial_ijepa_prediction_targets(
+    core: SpatialIJEPACore,
+    images: torch.Tensor,
+    context_masks: list[torch.Tensor] | torch.Tensor,
+    target_masks: list[torch.Tensor] | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Return aligned predictor/EMA-target tokens and the encoded context."""
     if isinstance(context_masks, torch.Tensor):
         context_masks = [context_masks]
     if isinstance(target_masks, torch.Tensor):
@@ -293,15 +314,14 @@ def spatial_ijepa_per_sample_loss_with_context(
         target = target.detach()
 
     context = core.context_encoder(images, context_masks)
-    pooled_context = context.reshape(
-        len(context_masks), batch_size, context.shape[-2], context.shape[-1]
-    ).mean(dim=(0, 2))
     prediction = core.predictor(context, context_masks, target_masks)
-    per_element = F.smooth_l1_loss(prediction, target, reduction="none")
-    losses = per_element.reshape(len(target_masks), len(context_masks), batch_size, -1).mean(
-        dim=(0, 1, 3)
+    return (
+        prediction,
+        target,
+        context,
+        len(context_masks),
+        len(target_masks),
     )
-    return losses, pooled_context
 
 
 def spatial_ijepa_loss(

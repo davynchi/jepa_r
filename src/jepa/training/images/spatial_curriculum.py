@@ -14,6 +14,7 @@ from jepa.training.images.ijepa_spatial import (
     SpatialIJEPACore,
     encode_samples_pooled,
     sample_masks,
+    spatial_ijepa_prediction_targets,
     spatial_ijepa_per_sample_loss,
 )
 
@@ -24,7 +25,13 @@ SpatialWeightingMethod = Literal[
     "coord",
     "ras-thompson",
 ]
-SpatialRichnessFunctional = Literal["logdet", "rbar", "pr", "predictive-barlow"]
+SpatialRichnessFunctional = Literal[
+    "logdet",
+    "rbar",
+    "pr",
+    "predictive-barlow",
+    "predictive-spectral",
+]
 RASScoreGranularity = Literal["sample", "batch"]
 RASAlignment = Literal["dot", "cosine"]
 CoordinateImportanceMethod = Literal["covariance", "transformation", "dynamics"]
@@ -49,6 +56,7 @@ class SpatialWeightingConfig:
     richness_trace_target: float = 1.0
     richness_trace_beta: float = 0.01
     predictive_redundancy_weight: float = 0.005
+    predictive_kappa: float = 1.0
     ras_score_granularity: RASScoreGranularity = "sample"
     ras_alignment: RASAlignment = "dot"
     coordinate_importance: CoordinateImportanceMethod = "covariance"
@@ -108,7 +116,13 @@ def _validate_config(config: SpatialWeightingConfig) -> None:
         raise ValueError("ref_size must be positive")
     if config.richness_delta <= 0:
         raise ValueError("richness_delta must be positive")
-    if config.richness_functional not in {"logdet", "rbar", "pr", "predictive-barlow"}:
+    if config.richness_functional not in {
+        "logdet",
+        "rbar",
+        "pr",
+        "predictive-barlow",
+        "predictive-spectral",
+    }:
         raise ValueError(f"unknown richness functional: {config.richness_functional!r}")
     if config.richness_trace_target <= 0:
         raise ValueError("richness_trace_target must be positive")
@@ -116,6 +130,8 @@ def _validate_config(config: SpatialWeightingConfig) -> None:
         raise ValueError("richness_trace_beta must be non-negative")
     if config.predictive_redundancy_weight < 0:
         raise ValueError("predictive_redundancy_weight must be non-negative")
+    if config.predictive_kappa <= 0:
+        raise ValueError("predictive_kappa must be positive")
     if config.ras_score_granularity not in {"sample", "batch"}:
         raise ValueError(f"unknown RAS score granularity: {config.ras_score_granularity!r}")
     if config.ras_alignment not in {"dot", "cosine"}:
@@ -303,6 +319,7 @@ def richness_from_images(
     mask_config: MaskConfig | None = None,
     mask_seed: int | None = None,
     predictive_redundancy_weight: float = 0.005,
+    predictive_kappa: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if delta <= 0:
         raise ValueError("delta must be positive")
@@ -312,6 +329,8 @@ def richness_from_images(
         raise ValueError("trace_beta must be non-negative")
     if predictive_redundancy_weight < 0:
         raise ValueError("predictive_redundancy_weight must be non-negative")
+    if predictive_kappa <= 0:
+        raise ValueError("predictive_kappa must be positive")
     if functional == "predictive-barlow":
         if grid is None or mask_config is None or mask_seed is None:
             raise ValueError(
@@ -325,6 +344,20 @@ def richness_from_images(
             mask_seed=mask_seed,
             delta=delta,
             redundancy_weight=predictive_redundancy_weight,
+        )
+    if functional == "predictive-spectral":
+        if grid is None or mask_config is None or mask_seed is None:
+            raise ValueError(
+                "predictive-spectral richness requires grid, mask_config, and mask_seed"
+            )
+        return _predictive_spectral_richness(
+            core,
+            images,
+            grid=grid,
+            mask_config=mask_config,
+            mask_seed=mask_seed,
+            delta=delta,
+            kappa=predictive_kappa,
         )
 
     covariance, _ = _latent_covariance_from_images(core, images)
@@ -426,6 +459,83 @@ def _predictive_barlow_richness(
         "ras/predictive_diag_min": float(diagonal.detach().min().cpu().item()),
         "ras/predictive_invariance_loss": float(invariance_loss.detach().cpu().item()),
         "ras/predictive_redundancy_loss": float(redundancy_loss.detach().cpu().item()),
+    }
+
+
+def _predictive_spectral_richness(
+    core: SpatialIJEPACore,
+    images: torch.Tensor,
+    *,
+    grid: int,
+    mask_config: MaskConfig,
+    mask_seed: int,
+    delta: float,
+    kappa: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if images.shape[0] < 2:
+        raise ValueError("predictive-spectral richness requires at least two reference images")
+
+    generator = torch.Generator().manual_seed(mask_seed)
+    context_masks, target_masks = sample_masks(
+        grid,
+        grid,
+        mask_config,
+        generator,
+        batch_size=images.shape[0],
+    )
+    prediction, target, _, _, _ = spatial_ijepa_prediction_targets(
+        core,
+        images,
+        context_masks,
+        target_masks,
+    )
+    prediction = prediction.float().reshape(-1, prediction.shape[-1])
+    target = target.float().reshape(-1, target.shape[-1])
+    prediction = prediction - prediction.mean(dim=0, keepdim=True)
+    target = target - target.mean(dim=0, keepdim=True)
+    denominator = max(prediction.shape[0] - 1, 1)
+    prediction_covariance = prediction.T @ prediction / denominator
+    target_covariance = target.T @ target / denominator
+    cross_covariance = prediction.T @ target / denominator
+    eye = torch.eye(
+        prediction.shape[-1],
+        dtype=prediction.dtype,
+        device=prediction.device,
+    )
+    prediction_cholesky = torch.linalg.cholesky(prediction_covariance + delta * eye)
+    target_cholesky = torch.linalg.cholesky(target_covariance + delta * eye)
+    left_whitened = torch.linalg.solve_triangular(
+        prediction_cholesky,
+        cross_covariance,
+        upper=False,
+    )
+    whitened_cross_covariance = torch.linalg.solve_triangular(
+        target_cholesky,
+        left_whitened.T,
+        upper=False,
+    ).T
+    predictive_gram = whitened_cross_covariance @ whitened_cross_covariance.T
+    sign, logabsdet = torch.linalg.slogdet(eye + kappa * predictive_gram)
+    if torch.any(sign <= 0):
+        raise RuntimeError("predictive spectral matrix is not positive definite")
+    richness = logabsdet
+
+    with torch.no_grad():
+        squared_singular_values = torch.linalg.eigvalsh(predictive_gram).clamp_min(0)
+        singular_values = torch.sqrt(squared_singular_values)
+        energy = squared_singular_values.sum()
+        proportions = squared_singular_values / energy.clamp_min(delta)
+        effective_rank = torch.exp(
+            -(proportions * torch.log(proportions.clamp_min(delta))).sum()
+        )
+        threshold_rank = (singular_values > 0.1).sum()
+    return richness, {
+        "ras/richness_value": float(richness.detach().cpu().item()),
+        "ras/predictive_spectral_energy": float(energy.cpu().item()),
+        "ras/predictive_spectral_effective_rank": float(effective_rank.cpu().item()),
+        "ras/predictive_spectral_rank_01": float(threshold_rank.cpu().item()),
+        "ras/predictive_spectral_sigma_max": float(singular_values[-1].cpu().item()),
+        "ras/predictive_spectral_sigma_mean": float(singular_values.mean().cpu().item()),
     }
 
 
@@ -643,6 +753,7 @@ def score_frames_by_ras(
     richness_trace_target: float,
     richness_trace_beta: float,
     predictive_redundancy_weight: float = 0.005,
+    predictive_kappa: float = 1.0,
     score_granularity: RASScoreGranularity = "sample",
     alignment: RASAlignment = "dot",
     amp_dtype: torch.dtype | None = None,
@@ -684,6 +795,7 @@ def score_frames_by_ras(
                 mask_config=mask_config,
                 mask_seed=derive_seed(seed, "weighting-ras-richness-masks"),
                 predictive_redundancy_weight=predictive_redundancy_weight,
+                predictive_kappa=predictive_kappa,
             )
         richness_gradients_raw = torch.autograd.grad(richness, parameters, retain_graph=False)
         richness_gradients = tuple(gradient.detach() for gradient in richness_gradients_raw)
