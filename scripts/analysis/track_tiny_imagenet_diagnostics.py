@@ -26,7 +26,7 @@ from jepa.data.images.tiny_imagenet import (  # noqa: E402
 from jepa.training.images.ijepa_spatial import (  # noqa: E402
     MaskConfig,
     build_spatial_ijepa_core_from_metadata,
-    encode_frames_pooled_batched,
+    encode_samples_pooled,
     load_spatial_checkpoint,
     normalize_ijepa_images,
     sample_masks,
@@ -35,7 +35,7 @@ from jepa.training.images.ijepa_spatial import (  # noqa: E402
 from jepa.training.images.spatial_logging import SpatialRunLogger  # noqa: E402
 
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[2] / "outputs" / "ijepa_spatial"
-BATCH_SIZE = 128
+DEFAULT_BATCH_SIZE = 1024
 POLL_SECONDS = 15
 PROBE_RIDGE = 1.0e-6
 
@@ -49,6 +49,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint-pattern", default="epoch_*.pt")
     parser.add_argument("--poll-seconds", type=float, default=POLL_SECONDS)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("auto", "none", "float16", "bfloat16"),
+        default="auto",
+        help="Autocast dtype; auto reuses the training run configuration",
+    )
+    parser.add_argument(
+        "--resident-device-data",
+        action="store_true",
+        help="Keep normalized train/test images on the evaluation device",
+    )
     parser.add_argument(
         "--device",
         choices=("auto", "cpu", "cuda"),
@@ -67,13 +79,22 @@ def _resolve_run_dir(value: str) -> Path:
     return path.resolve()
 
 
-def _held_out_loss(core, test_samples, grid, mask_config, device) -> float:
+def _held_out_loss(
+    core,
+    test_samples,
+    grid,
+    mask_config,
+    device,
+    *,
+    batch_size: int,
+    amp_dtype: torch.dtype | None,
+) -> float:
     mask_generator = torch.Generator().manual_seed(derive_seed(0, "tiny-test-masks"))
     total_loss = 0.0
     total_examples = 0
-    with torch.no_grad():
-        for batch in test_samples.split(BATCH_SIZE):
-            batch = batch.to(device)
+    with torch.inference_mode():
+        for batch in test_samples.split(batch_size):
+            batch = batch.to(device, non_blocking=True)
             context_masks, target_masks = sample_masks(
                 grid,
                 grid,
@@ -81,10 +102,50 @@ def _held_out_loss(core, test_samples, grid, mask_config, device) -> float:
                 mask_generator,
                 batch_size=batch.shape[0],
             )
-            loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype or torch.float32,
+                enabled=amp_dtype is not None and device.type == "cuda",
+            ):
+                loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
             total_loss += float(loss.item()) * batch.shape[0]
             total_examples += batch.shape[0]
     return total_loss / total_examples
+
+
+def _encode_pooled(
+    core,
+    frames: torch.Tensor,
+    *,
+    batch_size: int,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+) -> torch.Tensor:
+    encoded = []
+    with torch.inference_mode():
+        for batch in frames.split(batch_size):
+            batch = batch.to(device, non_blocking=True)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype or torch.float32,
+                enabled=amp_dtype is not None and device.type == "cuda",
+            ):
+                latents = encode_samples_pooled(core, batch)
+            encoded.append(latents.float().cpu())
+    return torch.cat(encoded, dim=0)
+
+
+def _resolve_amp_dtype(args: argparse.Namespace, spatial_config: dict) -> torch.dtype | None:
+    value = args.amp_dtype
+    if value == "auto":
+        value = str(spatial_config.get("amp_dtype", ""))
+        if not value:
+            value = "bfloat16" if spatial_config.get("bfloat16", False) else "none"
+    return {
+        "none": None,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[value]
 
 
 def _topk_accuracy(scores: torch.Tensor, labels: torch.Tensor, *, k: int) -> float:
@@ -105,6 +166,8 @@ def main() -> None:
         raise FileNotFoundError(f"missing run config: {run_config_path}")
     run_config = json.loads(run_config_path.read_text())
     spatial_config = run_config["spatial"]
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
     patch_size = int(spatial_config["patch_size"])
     image_size = int(spatial_config.get("image_size", 64))
     data_config = TinyImageNetDataConfig(**run_config["tiny_imagenet"]["data"])
@@ -113,9 +176,16 @@ def main() -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
+    amp_dtype = _resolve_amp_dtype(args, spatial_config)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     train_frames = normalize_ijepa_images(datasets.train.images)
     test_frames = normalize_ijepa_images(datasets.test.images)
+    if args.resident_device_data:
+        train_frames = train_frames.to(device)
+        test_frames = test_frames.to(device)
     train_labels = datasets.train.entities
     test_labels = datasets.test.entities
     num_classes = data_config.num_entities
@@ -151,19 +221,29 @@ def main() -> None:
                     core.predictor.to(device).eval()
                     core.target_encoder.to(device).eval()
 
-                    test_loss = _held_out_loss(core, test_frames, grid, mask_config, device)
-                    train_z = encode_frames_pooled_batched(
-                        core,
-                        train_frames,
-                        patch_size=patch_size,
-                        batch_size=BATCH_SIZE,
-                    ).cpu()
-                    test_z = encode_frames_pooled_batched(
+                    test_loss = _held_out_loss(
                         core,
                         test_frames,
-                        patch_size=patch_size,
-                        batch_size=BATCH_SIZE,
-                    ).cpu()
+                        grid,
+                        mask_config,
+                        device,
+                        batch_size=args.batch_size,
+                        amp_dtype=amp_dtype,
+                    )
+                    train_z = _encode_pooled(
+                        core,
+                        train_frames,
+                        batch_size=args.batch_size,
+                        device=device,
+                        amp_dtype=amp_dtype,
+                    )
+                    test_z = _encode_pooled(
+                        core,
+                        test_frames,
+                        batch_size=args.batch_size,
+                        device=device,
+                        amp_dtype=amp_dtype,
+                    )
                     spectrum = compute_latent_spectrum(test_z)
 
                     classifier = fit_entity_classifier(
