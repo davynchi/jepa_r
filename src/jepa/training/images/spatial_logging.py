@@ -52,6 +52,8 @@ _TENSORBOARD_SCALARS = {
     "ras/predictive_spectral_rank_01",
     "ras/predictive_spectral_sigma_max",
     "ras/predictive_spectral_sigma_mean",
+    "ras/predictive_spectral_prediction_jitter",
+    "ras/predictive_spectral_target_jitter",
     "ras/grad_richness_norm",
     "ras/positive_fraction",
     "ras/negative_fraction",

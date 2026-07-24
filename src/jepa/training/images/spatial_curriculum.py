@@ -497,13 +497,32 @@ def _predictive_spectral_richness(
     prediction_covariance = prediction.T @ prediction / denominator
     target_covariance = target.T @ target / denominator
     cross_covariance = prediction.T @ target / denominator
+    prediction_covariance = (prediction_covariance + prediction_covariance.T) / 2
+    target_covariance = (target_covariance + target_covariance.T) / 2
     eye = torch.eye(
         prediction.shape[-1],
         dtype=prediction.dtype,
         device=prediction.device,
     )
-    prediction_cholesky = torch.linalg.cholesky(prediction_covariance + delta * eye)
-    target_cholesky = torch.linalg.cholesky(target_covariance + delta * eye)
+
+    # Empirical covariances are PSD analytically, but float32 round-off can
+    # produce small negative eigenvalues when the representation is ill-conditioned.
+    prediction_min_eigenvalue = torch.linalg.eigvalsh(
+        prediction_covariance.detach()
+    )[0]
+    target_min_eigenvalue = torch.linalg.eigvalsh(target_covariance.detach())[0]
+    prediction_jitter = max(
+        delta,
+        float((-prediction_min_eigenvalue + delta).clamp_min(0).cpu().item()),
+    )
+    target_jitter = max(
+        delta,
+        float((-target_min_eigenvalue + delta).clamp_min(0).cpu().item()),
+    )
+    prediction_cholesky = torch.linalg.cholesky(
+        prediction_covariance + prediction_jitter * eye
+    )
+    target_cholesky = torch.linalg.cholesky(target_covariance + target_jitter * eye)
     left_whitened = torch.linalg.solve_triangular(
         prediction_cholesky,
         cross_covariance,
@@ -536,6 +555,8 @@ def _predictive_spectral_richness(
         "ras/predictive_spectral_rank_01": float(threshold_rank.cpu().item()),
         "ras/predictive_spectral_sigma_max": float(singular_values[-1].cpu().item()),
         "ras/predictive_spectral_sigma_mean": float(singular_values.mean().cpu().item()),
+        "ras/predictive_spectral_prediction_jitter": prediction_jitter,
+        "ras/predictive_spectral_target_jitter": target_jitter,
     }
 
 
