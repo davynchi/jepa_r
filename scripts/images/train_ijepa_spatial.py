@@ -191,6 +191,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--weighting-warmup-epochs", type=int, default=0)
     parser.add_argument("--weighting-update-every-epochs", type=int, default=1)
+    parser.add_argument(
+        "--weighting-bootstrap-on-resume",
+        action="store_true",
+        help="Refresh periodic weighting once at the resume checkpoint before training",
+    )
     parser.add_argument("--weighting-temperature", type=float, default=1.0)
     parser.add_argument("--weighting-replay-beta", type=float, default=1.0)
     parser.add_argument("--weighting-uniform-mix", type=float, default=0.05)
@@ -712,6 +717,7 @@ def main() -> None:
                     "method": weighting_config.method,
                     "warmup_epochs": weighting_config.warmup_epochs,
                     "update_every_epochs": weighting_config.update_every_epochs,
+                    "bootstrap_on_resume": args.weighting_bootstrap_on_resume,
                     "temperature": weighting_config.temperature,
                     "replay_beta": weighting_config.replay_beta,
                     "uniform_mix": weighting_config.uniform_mix,
@@ -943,6 +949,98 @@ def main() -> None:
             f"resumed_from={checkpoint_path} start_epoch={start_epoch} global_step={global_step}",
             flush=True,
         )
+
+    def refresh_periodic_weighting(update_epoch: int) -> None:
+        nonlocal weighting_state
+        score_batch_size = weighting_config.score_batch_size or args.batch_size
+        if weighting_config.method == "loss":
+            scores = score_frames_by_loss(
+                core,
+                train_images,
+                grid=grid,
+                mask_config=mask_config,
+                batch_size=score_batch_size,
+                seed=derive_seed(args.seed, "weighting", update_epoch),
+                device=device,
+            )
+            score_metadata: dict[str, float] = {}
+        elif weighting_config.method == "ras":
+            scores, score_metadata = score_frames_by_ras(
+                core,
+                train_images,
+                ref_indices=weighting_ref_indices,
+                grid=grid,
+                mask_config=mask_config,
+                batch_size=score_batch_size,
+                seed=derive_seed(args.seed, "weighting", update_epoch),
+                device=device,
+                richness_functional=weighting_config.richness_functional,
+                richness_delta=weighting_config.richness_delta,
+                richness_trace_target=weighting_config.richness_trace_target,
+                richness_trace_beta=weighting_config.richness_trace_beta,
+                predictive_redundancy_weight=(
+                    weighting_config.predictive_redundancy_weight
+                ),
+                predictive_kappa=weighting_config.predictive_kappa,
+                score_granularity=weighting_config.ras_score_granularity,
+                alignment=weighting_config.ras_alignment,
+                amp_dtype=amp_dtype,
+            )
+        elif weighting_config.method == "coord":
+            (
+                scores,
+                score_metadata,
+                coordinate_importance,
+                coordinate_previous_ref_latents,
+            ) = score_frames_by_coordinate_importance(
+                core,
+                train_images,
+                ref_indices=weighting_ref_indices,
+                state=weighting_state,
+                grid=grid,
+                mask_config=mask_config,
+                batch_size=score_batch_size,
+                seed=derive_seed(args.seed, "weighting", update_epoch),
+                device=device,
+                coordinate_importance=weighting_config.coordinate_importance,
+                coordinate_ema_beta=weighting_config.coordinate_ema_beta,
+                coordinate_delta=weighting_config.coordinate_delta,
+                transform_pair_images=transform_pair_images,
+            )
+        else:
+            raise ValueError(f"unsupported weighting method: {weighting_config.method}")
+
+        weighting_state = update_spatial_weights(weighting_state, scores, weighting_config)
+        if weighting_config.method == "coord":
+            weighting_state = update_coordinate_weighting_state(
+                weighting_state,
+                coordinate_importance=coordinate_importance,
+                previous_ref_latents=coordinate_previous_ref_latents,
+            )
+        logger.log(
+            step=global_step,
+            epoch=update_epoch,
+            event="weighting_update",
+            scalars={
+                **weighting_diagnostics(weighting_state),
+                "weighting/target_effective_sample_size": (
+                    weighting_config.target_ess_fraction * n
+                ),
+                **score_metadata,
+            },
+            histograms={
+                "hist/weighting_scores": weighting_state.last_scores,
+                "hist/weighting_probabilities": weighting_state.probabilities,
+            },
+        )
+
+    if (
+        args.resume_from is not None
+        and args.weighting_bootstrap_on_resume
+        and weighting_config.method in {"loss", "ras", "coord"}
+    ):
+        refresh_periodic_weighting(start_epoch - 1)
+
     try:
         for epoch in range(start_epoch, args.epochs + 1):
             core.context_encoder.train()
@@ -1199,86 +1297,7 @@ def main() -> None:
                 },
             )
             if should_update_weights(epoch, weighting_config):
-                score_batch_size = weighting_config.score_batch_size or args.batch_size
-                if weighting_config.method == "loss":
-                    scores = score_frames_by_loss(
-                        core,
-                        train_images,
-                        grid=grid,
-                        mask_config=mask_config,
-                        batch_size=score_batch_size,
-                        seed=derive_seed(args.seed, "weighting", epoch),
-                        device=device,
-                    )
-                    score_metadata: dict[str, float] = {}
-                elif weighting_config.method == "ras":
-                    scores, score_metadata = score_frames_by_ras(
-                        core,
-                        train_images,
-                        ref_indices=weighting_ref_indices,
-                        grid=grid,
-                        mask_config=mask_config,
-                        batch_size=score_batch_size,
-                        seed=derive_seed(args.seed, "weighting", epoch),
-                        device=device,
-                        richness_functional=weighting_config.richness_functional,
-                        richness_delta=weighting_config.richness_delta,
-                        richness_trace_target=weighting_config.richness_trace_target,
-                        richness_trace_beta=weighting_config.richness_trace_beta,
-                        predictive_redundancy_weight=(
-                            weighting_config.predictive_redundancy_weight
-                        ),
-                        predictive_kappa=weighting_config.predictive_kappa,
-                        score_granularity=weighting_config.ras_score_granularity,
-                        alignment=weighting_config.ras_alignment,
-                        amp_dtype=amp_dtype,
-                    )
-                elif weighting_config.method == "coord":
-                    (
-                        scores,
-                        score_metadata,
-                        coordinate_importance,
-                        coordinate_previous_ref_latents,
-                    ) = score_frames_by_coordinate_importance(
-                        core,
-                        train_images,
-                        ref_indices=weighting_ref_indices,
-                        state=weighting_state,
-                        grid=grid,
-                        mask_config=mask_config,
-                        batch_size=score_batch_size,
-                        seed=derive_seed(args.seed, "weighting", epoch),
-                        device=device,
-                        coordinate_importance=weighting_config.coordinate_importance,
-                        coordinate_ema_beta=weighting_config.coordinate_ema_beta,
-                        coordinate_delta=weighting_config.coordinate_delta,
-                        transform_pair_images=transform_pair_images,
-                    )
-                else:
-                    raise ValueError(f"unsupported weighting method: {weighting_config.method}")
-                weighting_state = update_spatial_weights(weighting_state, scores, weighting_config)
-                if weighting_config.method == "coord":
-                    weighting_state = update_coordinate_weighting_state(
-                        weighting_state,
-                        coordinate_importance=coordinate_importance,
-                        previous_ref_latents=coordinate_previous_ref_latents,
-                    )
-                logger.log(
-                    step=global_step,
-                    epoch=epoch,
-                    event="weighting_update",
-                    scalars={
-                        **weighting_diagnostics(weighting_state),
-                        "weighting/target_effective_sample_size": (
-                            weighting_config.target_ess_fraction * n
-                        ),
-                        **score_metadata,
-                    },
-                    histograms={
-                        "hist/weighting_scores": weighting_state.last_scores,
-                        "hist/weighting_probabilities": weighting_state.probabilities,
-                    },
-                )
+                refresh_periodic_weighting(epoch)
 
             if epoch % args.eval_every_epochs == 0 or epoch == 1:
                 test_loss = _evaluate_spatial_loss(
