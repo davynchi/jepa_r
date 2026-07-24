@@ -1,6 +1,11 @@
 # Project instructions
 
 - Use `uv` as the default Python package and environment installer. Install Python libraries with `uv` unless the user explicitly asks for another tool.
+- Never launch an experiment based on an ambiguous reference such as "that one" or
+  "the same". Ask the user to disambiguate instead of making a quick inference.
+- Before launching any experiment, state the exact dataset, model, sampling/weighting
+  method, richness functional, important hyperparameters, server, and GPU, then wait
+  for the user's confirmation.
 
 ## Skill routing
 
