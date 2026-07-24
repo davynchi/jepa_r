@@ -489,8 +489,11 @@ def _predictive_spectral_richness(
         context_masks,
         target_masks,
     )
-    prediction = prediction.float().reshape(-1, prediction.shape[-1])
-    target = target.float().reshape(-1, target.shape[-1])
+    # Keep spectral linear algebra out of the surrounding BF16 autocast.
+    # A100 handles these small matrices efficiently in float64, and the extra
+    # precision matters for nearly rank-deficient empirical covariances.
+    prediction = prediction.to(torch.float64).reshape(-1, prediction.shape[-1])
+    target = target.to(torch.float64).reshape(-1, target.shape[-1])
     prediction = prediction - prediction.mean(dim=0, keepdim=True)
     target = target - target.mean(dim=0, keepdim=True)
     denominator = max(prediction.shape[0] - 1, 1)

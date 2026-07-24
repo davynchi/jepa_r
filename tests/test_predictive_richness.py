@@ -186,18 +186,19 @@ def test_predictive_spectral_is_finite_and_differentiable() -> None:
         predictor_embed_dim=24,
         predictor_depth=1,
     )
-    richness, metadata = richness_from_images(
-        core,
-        torch.randn(8, 3, 16, 16),
-        functional="predictive-spectral",
-        delta=1.0e-3,
-        trace_target=1.0,
-        trace_beta=0.0,
-        grid=4,
-        mask_config=_mask_config(),
-        mask_seed=19,
-        predictive_kappa=1.0,
-    )
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        richness, metadata = richness_from_images(
+            core,
+            torch.randn(8, 3, 16, 16),
+            functional="predictive-spectral",
+            delta=1.0e-3,
+            trace_target=1.0,
+            trace_beta=0.0,
+            grid=4,
+            mask_config=_mask_config(),
+            mask_seed=19,
+            predictive_kappa=1.0,
+        )
 
     assert torch.isfinite(richness)
     assert metadata["ras/predictive_spectral_energy"] >= 0
