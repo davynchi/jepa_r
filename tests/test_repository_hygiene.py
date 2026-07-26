@@ -9,15 +9,12 @@ FORBIDDEN_DEPENDENCIES = {
     "opencv-python",
     "submitit",
     "timm",
-    "torchvision",
 }
 FORBIDDEN_RUNTIME_TERMS = {
     "decord",
     "opencv",
     "submitit",
     "timm",
-    "torchvision",
-    "vision_transformer",
 }
 
 

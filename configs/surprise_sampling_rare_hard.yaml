@@ -20,7 +20,7 @@ model:
   hidden_layers: 1
 
 training:
-  epochs: 30
+  epochs: 300
   batch_size: 256
   learning_rate: 0.001
   ema_decay: 0.99

@@ -7,3 +7,5 @@
 build/
 dist/
 outputs/
+
+.DS_Store

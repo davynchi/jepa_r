@@ -1,0 +1,131 @@
+experiment:
+  output_root: outputs/moving_mnist_motion
+  seed: 0
+  device: auto
+data:
+  source: mnist
+  root: data/mnist
+  download: true
+  train_samples: 20000
+  validation_samples: 2000
+  total_frames: 20
+  context_frames: 10
+  canvas_size: 64
+  digit_size: 28
+  min_speed: 2.0
+  max_speed: 5.0
+  num_directions: 8
+model:
+  patch_size: 8
+  tubelet_size: 2
+  embed_dim: 128
+  encoder_depth: 4
+  predictor_depth: 2
+  num_heads: 4
+  mlp_ratio: 4.0
+  dropout: 0.0
+  position_embedding_type: separate_3d
+objective:
+  foreground_weight: 1.0
+  foreground_threshold: 0.05
+  target_weighting_mode: uniform
+  motion_weight_min: 0.25
+  motion_weight_max: 4.0
+  motion_weight_power: 1.0
+  motion_weight_epsilon: 1.0e-06
+training:
+  epochs: 10
+  batch_size: 128
+  eval_batch_size: 256
+  learning_rate: 0.00025
+  minimum_learning_rate: 1.0e-06
+  lr_warmup_epochs: 3
+  weight_decay: 0.05
+  gradient_clip: 1.0
+  ema_start: 0.99
+  ema_end: 0.9999
+  checkpoint_every: 1
+  diagnostics_samples: 256
+  pairing_diagnostics_samples: 512
+  num_workers: 4
+  amp: true
+  encoder_learning_rate: 0.00025
+  predictor_learning_rate: 0.00025
+  minimum_encoder_learning_rate: 1.0e-06
+  minimum_predictor_learning_rate: 1.0e-06
+sampling:
+  strategy: uniform_shuffle
+  score_update_mode: oracle_epochwise
+  warmup_epochs: 5
+  uniform_mix: 0.4
+  loss_ema_beta: 0.8
+  progress_ema_beta: 0.8
+  surprise_alpha: 1.0
+  band_center: 0.6
+  band_width: 0.18
+  progress_boost: 2.0
+  progress_margin: 0.0
+  quarantine_percentile: 0.97
+  min_weight: 0.25
+  max_weight: 4.0
+checkpoint_selection:
+  primary:
+    metric: velocity_vector_rmse
+    mode: min
+    source: probe
+  tie_breakers:
+  - metric: future_fde
+    mode: min
+    source: probe
+  - metric: context_token_effective_rank
+    mode: max
+    source: pretrain
+probe:
+  train_samples: 8000
+  validation_samples: 2000
+  evaluation_samples: 2000
+  test_samples: 5000
+  batch_size: 256
+  num_workers: 4
+  classifier_epochs: 80
+  classifier_batch_size: 256
+  classifier_lr: 0.01
+  classifier_weight_decay: 0.0001
+  ridge_lambdas:
+  - 0.0001
+  - 0.001
+  - 0.01
+  - 0.1
+  - 1.0
+  - 10.0
+  attentive_tasks:
+  - direction
+  attentive_epochs: 30
+  attentive_batch_size: 128
+  attentive_lr: 0.001
+  attentive_weight_decay: 0.0001
+  attentive_heads: 4
+  attentive_mlp_ratio: 2.0
+  attentive_spatial_pool: 4
+  pairing_samples: 512
+  raw_spatial_pool: 8
+lowshot:
+  budgets:
+  - 128
+  - 512
+  - 2048
+  split_seeds:
+  - 0
+  - 1
+  - 2
+  random_init_seeds:
+  - 0
+  - 1
+  - 2
+  batch_size: 256
+  num_workers: 4
+  classifier_epochs: 50
+  classifier_batch_size: 128
+  classifier_lr: 0.01
+  classifier_weight_decay: 0.0001
+  raw_spatial_pool: 8
