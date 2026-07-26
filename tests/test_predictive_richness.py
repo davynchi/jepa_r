@@ -250,3 +250,84 @@ def test_predictive_spectral_runs_through_batch_ras() -> None:
     assert torch.isfinite(scores).all()
     assert metadata["ras/alignment_cosine"] == 1.0
     assert "ras/predictive_spectral_effective_rank" in metadata
+
+
+def test_new_predictive_richness_variants_are_finite_and_differentiable() -> None:
+    for functional in (
+        "predictive-covariance",
+        "predictive-energy",
+        "predictive-dimension",
+        "predictive-combined",
+    ):
+        core = build_spatial_ijepa_core(
+            "vit_tiny",
+            image_size=16,
+            patch_size=4,
+            predictor_embed_dim=24,
+            predictor_depth=1,
+        )
+        richness, metadata = richness_from_images(
+            core,
+            torch.randn(8, 3, 16, 16),
+            functional=functional,
+            delta=1.0e-3,
+            trace_target=1.0,
+            trace_beta=0.0,
+            grid=4,
+            mask_config=_mask_config(),
+            mask_seed=29,
+            predictive_kappa=1.0,
+        )
+
+        assert torch.isfinite(richness), functional
+        assert torch.isfinite(torch.tensor(metadata["ras/richness_value"])), functional
+        assert "ras/predictive_covariance_logdet" in metadata
+        assert "ras/predictive_spectral_combined" in metadata
+        gradients = torch.autograd.grad(
+            richness,
+            tuple(
+                parameter
+                for parameter in core.context_encoder.parameters()
+                if parameter.requires_grad
+            ),
+            allow_unused=True,
+        )
+        finite_gradients = [
+            gradient
+            for gradient in gradients
+            if gradient is not None and gradient.numel() > 0
+        ]
+        assert finite_gradients, functional
+        assert all(torch.isfinite(gradient).all() for gradient in finite_gradients), functional
+
+
+def test_predictive_combined_runs_through_batch_ras() -> None:
+    core = build_spatial_ijepa_core(
+        "vit_tiny",
+        image_size=16,
+        patch_size=4,
+        predictor_embed_dim=24,
+        predictor_depth=1,
+    )
+    images = torch.randn(4, 3, 16, 16)
+    scores, metadata = score_frames_by_ras(
+        core,
+        images,
+        ref_indices=torch.arange(4),
+        grid=4,
+        mask_config=_mask_config(),
+        batch_size=2,
+        seed=31,
+        device=torch.device("cpu"),
+        richness_functional="predictive-combined",
+        richness_delta=1.0e-3,
+        richness_trace_target=1.0,
+        richness_trace_beta=0.0,
+        predictive_kappa=1.0,
+        score_granularity="batch",
+        alignment="cosine",
+    )
+
+    assert scores.shape == (4,)
+    assert torch.isfinite(scores).all()
+    assert "ras/predictive_spectral_combined" in metadata

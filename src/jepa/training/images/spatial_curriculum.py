@@ -31,6 +31,10 @@ SpatialRichnessFunctional = Literal[
     "pr",
     "predictive-barlow",
     "predictive-spectral",
+    "predictive-covariance",
+    "predictive-energy",
+    "predictive-dimension",
+    "predictive-combined",
 ]
 RASScoreGranularity = Literal["sample", "batch"]
 RASAlignment = Literal["dot", "cosine"]
@@ -122,6 +126,10 @@ def _validate_config(config: SpatialWeightingConfig) -> None:
         "pr",
         "predictive-barlow",
         "predictive-spectral",
+        "predictive-covariance",
+        "predictive-energy",
+        "predictive-dimension",
+        "predictive-combined",
     }:
         raise ValueError(f"unknown richness functional: {config.richness_functional!r}")
     if config.richness_trace_target <= 0:
@@ -345,14 +353,21 @@ def richness_from_images(
             delta=delta,
             redundancy_weight=predictive_redundancy_weight,
         )
-    if functional == "predictive-spectral":
+    if functional in {
+        "predictive-spectral",
+        "predictive-covariance",
+        "predictive-energy",
+        "predictive-dimension",
+        "predictive-combined",
+    }:
         if grid is None or mask_config is None or mask_seed is None:
             raise ValueError(
-                "predictive-spectral richness requires grid, mask_config, and mask_seed"
+                f"{functional} richness requires grid, mask_config, and mask_seed"
             )
-        return _predictive_spectral_richness(
+        return _predictive_covariance_richness(
             core,
             images,
+            functional=functional,
             grid=grid,
             mask_config=mask_config,
             mask_seed=mask_seed,
@@ -462,10 +477,11 @@ def _predictive_barlow_richness(
     }
 
 
-def _predictive_spectral_richness(
+def _predictive_covariance_richness(
     core: SpatialIJEPACore,
     images: torch.Tensor,
     *,
+    functional: SpatialRichnessFunctional,
     grid: int,
     mask_config: MaskConfig,
     mask_seed: int,
@@ -473,7 +489,7 @@ def _predictive_spectral_richness(
     kappa: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if images.shape[0] < 2:
-        raise ValueError("predictive-spectral richness requires at least two reference images")
+        raise ValueError(f"{functional} richness requires at least two reference images")
 
     generator = torch.Generator().manual_seed(mask_seed)
     context_masks, target_masks = sample_masks(
@@ -537,24 +553,66 @@ def _predictive_spectral_richness(
         upper=False,
     ).T
     predictive_gram = whitened_cross_covariance @ whitened_cross_covariance.T
-    sign, logabsdet = torch.linalg.slogdet(eye + kappa * predictive_gram)
-    if torch.any(sign <= 0):
-        raise RuntimeError("predictive spectral matrix is not positive definite")
-    richness = logabsdet
+    squared_singular_values = torch.linalg.eigvalsh(predictive_gram).clamp_min(0)
+    singular_values = torch.sqrt(squared_singular_values)
+    energy = squared_singular_values.sum()
+    proportions = squared_singular_values / energy.clamp_min(delta)
+    effective_rank = torch.exp(
+        -(proportions * torch.log(proportions.clamp_min(delta))).sum()
+    )
+    combined = energy * effective_rank / prediction.shape[-1]
+
+    left_whitened_prediction_covariance = torch.linalg.solve_triangular(
+        target_cholesky,
+        prediction_covariance,
+        upper=False,
+    )
+    target_whitened_prediction_covariance = torch.linalg.solve_triangular(
+        target_cholesky,
+        left_whitened_prediction_covariance.T,
+        upper=False,
+    ).T
+    target_whitened_prediction_covariance = (
+        target_whitened_prediction_covariance
+        + target_whitened_prediction_covariance.T
+    ) / 2
+    covariance_sign, covariance_logabsdet = torch.linalg.slogdet(
+        eye + kappa * target_whitened_prediction_covariance
+    )
+    spectral_sign, spectral_logabsdet = torch.linalg.slogdet(
+        eye + kappa * predictive_gram
+    )
+    if torch.any(covariance_sign <= 0) or torch.any(spectral_sign <= 0):
+        raise RuntimeError("predictive richness matrix is not positive definite")
+
+    if functional == "predictive-spectral":
+        richness = spectral_logabsdet
+    elif functional == "predictive-covariance":
+        richness = covariance_logabsdet
+    elif functional == "predictive-energy":
+        richness = energy
+    elif functional == "predictive-dimension":
+        richness = effective_rank
+    elif functional == "predictive-combined":
+        richness = combined
+    else:
+        raise ValueError(f"unknown predictive richness functional: {functional!r}")
 
     with torch.no_grad():
-        squared_singular_values = torch.linalg.eigvalsh(predictive_gram).clamp_min(0)
-        singular_values = torch.sqrt(squared_singular_values)
-        energy = squared_singular_values.sum()
-        proportions = squared_singular_values / energy.clamp_min(delta)
-        effective_rank = torch.exp(
-            -(proportions * torch.log(proportions.clamp_min(delta))).sum()
-        )
         threshold_rank = (singular_values > 0.1).sum()
     return richness, {
         "ras/richness_value": float(richness.detach().cpu().item()),
-        "ras/predictive_spectral_energy": float(energy.cpu().item()),
-        "ras/predictive_spectral_effective_rank": float(effective_rank.cpu().item()),
+        "ras/predictive_covariance_logdet": float(
+            covariance_logabsdet.detach().cpu().item()
+        ),
+        "ras/predictive_spectral_logdet": float(
+            spectral_logabsdet.detach().cpu().item()
+        ),
+        "ras/predictive_spectral_energy": float(energy.detach().cpu().item()),
+        "ras/predictive_spectral_effective_rank": float(
+            effective_rank.detach().cpu().item()
+        ),
+        "ras/predictive_spectral_combined": float(combined.detach().cpu().item()),
         "ras/predictive_spectral_rank_01": float(threshold_rank.cpu().item()),
         "ras/predictive_spectral_sigma_max": float(singular_values[-1].cpu().item()),
         "ras/predictive_spectral_sigma_mean": float(singular_values.mean().cpu().item()),

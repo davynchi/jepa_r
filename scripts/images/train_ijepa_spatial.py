@@ -225,7 +225,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--weighting-ref-size", type=int, default=1024)
     parser.add_argument(
         "--weighting-richness",
-        choices=("logdet", "rbar", "pr", "predictive-barlow", "predictive-spectral"),
+        choices=(
+            "logdet",
+            "rbar",
+            "pr",
+            "predictive-barlow",
+            "predictive-spectral",
+            "predictive-covariance",
+            "predictive-energy",
+            "predictive-dimension",
+            "predictive-combined",
+        ),
         default="logdet",
         help="Richness functional used by --weighting-method ras",
     )
@@ -336,7 +346,15 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--weighting-predictive-kappa must be positive")
     if (
         args.weighting_method == "ras-thompson"
-        and args.weighting_richness in {"predictive-barlow", "predictive-spectral"}
+        and args.weighting_richness
+        in {
+            "predictive-barlow",
+            "predictive-spectral",
+            "predictive-covariance",
+            "predictive-energy",
+            "predictive-dimension",
+            "predictive-combined",
+        }
     ):
         raise ValueError(
             "predictive richness currently supports periodic --weighting-method ras only"

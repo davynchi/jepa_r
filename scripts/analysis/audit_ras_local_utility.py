@@ -38,7 +38,18 @@ from jepa.training.images.ijepa_spatial import (  # noqa: E402
 from jepa.training.images.spatial_curriculum import richness_from_images  # noqa: E402
 
 
-RICHNESS_FUNCTIONALS = ("predictive-spectral", "predictive-barlow")
+RICHNESS_FUNCTIONALS = (
+    "predictive-spectral",
+    "predictive-barlow",
+    "predictive-covariance",
+    "predictive-energy",
+    "predictive-dimension",
+    "predictive-combined",
+)
+FUNCTIONAL_SLUG = {
+    functional: functional.removeprefix("predictive-").replace("-", "_")
+    for functional in RICHNESS_FUNCTIONALS
+}
 PROBE_RIDGE = 1.0e-6
 
 
@@ -88,6 +99,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--richness-delta", type=float, default=1.0e-3)
     parser.add_argument("--predictive-kappa", type=float, default=1.0)
     parser.add_argument("--predictive-redundancy-weight", type=float, default=0.005)
+    parser.add_argument(
+        "--richness-functionals",
+        nargs="+",
+        choices=RICHNESS_FUNCTIONALS,
+        default=("predictive-spectral", "predictive-barlow"),
+        help="Richness functionals scored and measured in the audit.",
+    )
     return parser.parse_args()
 
 
@@ -281,21 +299,14 @@ def correlation(left: list[float], right: list[float], *, ranks: bool) -> float:
 
 
 def summarize(records: list[dict[str, float]]) -> dict[str, dict[str, float]]:
-    score_keys = (
-        "ras_spectral_dot",
-        "ras_spectral_cosine",
-        "ras_barlow_dot",
-        "ras_barlow_cosine",
+    score_keys = sorted(key for key in records[0] if key.startswith("ras_")) + [
         "jepa_loss",
         "gradient_norm",
         "random_score",
-    )
-    utility_keys = (
-        "delta_richness_spectral",
-        "delta_richness_barlow",
-        "negative_delta_probe_loss",
-        "delta_probe_accuracy",
-    )
+    ]
+    utility_keys = sorted(
+        key for key in records[0] if key.startswith("delta_richness_")
+    ) + ["negative_delta_probe_loss", "delta_probe_accuracy"]
     summary = {}
     for score_key in score_keys:
         summary[score_key] = {}
@@ -308,7 +319,9 @@ def summarize(records: list[dict[str, float]]) -> dict[str, dict[str, float]]:
             summary[score_key][f"spearman/{utility_key}"] = correlation(
                 scores, utilities, ranks=True
             )
-    for richness_key in ("delta_richness_spectral", "delta_richness_barlow"):
+    for richness_key in sorted(
+        key for key in records[0] if key.startswith("delta_richness_")
+    ):
         summary[f"realized/{richness_key}"] = {}
         richness_values = [record[richness_key] for record in records]
         for utility_key in ("negative_delta_probe_loss", "delta_probe_accuracy"):
@@ -322,24 +335,45 @@ def summarize(records: list[dict[str, float]]) -> dict[str, dict[str, float]]:
     return summary
 
 
-def plot_summary(records: list[dict[str, float]], output: Path) -> None:
-    panels = (
-        ("ras_spectral_cosine", "delta_richness_spectral", "Spectral RAS vs realized ΔR"),
-        ("ras_barlow_cosine", "delta_richness_barlow", "Barlow RAS vs realized ΔR"),
-        ("ras_spectral_cosine", "negative_delta_probe_loss", "Spectral RAS vs probe utility"),
-        ("ras_barlow_cosine", "negative_delta_probe_loss", "Barlow RAS vs probe utility"),
+def plot_summary(
+    records: list[dict[str, float]],
+    output: Path,
+    functionals: tuple[str, ...] | list[str],
+) -> None:
+    fig, axes = plt.subplots(
+        2,
+        len(functionals),
+        figsize=(6 * len(functionals), 9),
+        squeeze=False,
     )
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
-    for axis, (x_key, y_key, title) in zip(axes.flat, panels, strict=True):
-        x = [record[x_key] for record in records]
-        y = [record[y_key] for record in records]
-        pearson = correlation(x, y, ranks=False)
-        spearman = correlation(x, y, ranks=True)
-        axis.scatter(x, y, s=15, alpha=0.55)
-        axis.set_title(f"{title}\nPearson r={pearson:.3f} · Spearman ρ={spearman:.3f}")
-        axis.set_xlabel(x_key)
-        axis.set_ylabel(y_key)
-        axis.grid(alpha=0.2)
+    for column, functional in enumerate(functionals):
+        slug = FUNCTIONAL_SLUG[functional]
+        panels = (
+            (
+                axes[0, column],
+                f"ras_{slug}_cosine",
+                f"delta_richness_{slug}",
+                f"{functional}\nRAS vs realized ΔR",
+            ),
+            (
+                axes[1, column],
+                f"delta_richness_{slug}",
+                "negative_delta_probe_loss",
+                f"{functional}\nrealized ΔR vs probe utility",
+            ),
+        )
+        for axis, x_key, y_key, title in panels:
+            x = [record[x_key] for record in records]
+            y = [record[y_key] for record in records]
+            pearson = correlation(x, y, ranks=False)
+            spearman = correlation(x, y, ranks=True)
+            axis.scatter(x, y, s=15, alpha=0.55)
+            axis.set_title(
+                f"{title}\nPearson r={pearson:.3f} · Spearman ρ={spearman:.3f}"
+            )
+            axis.set_xlabel(x_key)
+            axis.set_ylabel(y_key)
+            axis.grid(alpha=0.2)
     fig.tight_layout()
     fig.savefig(output, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -451,7 +485,7 @@ def main() -> None:
     )
     base_richness = {}
     richness_gradients = {}
-    for functional in RICHNESS_FUNCTIONALS:
+    for functional in args.richness_functionals:
         value = richness(
             core,
             reference_images,
@@ -527,12 +561,13 @@ def main() -> None:
             encoder_parameters,
             allow_unused=True,
         )
-        spectral_dot, spectral_cosine = gradient_alignment(
-            loss_gradients, richness_gradients["predictive-spectral"]
-        )
-        barlow_dot, barlow_cosine = gradient_alignment(
-            loss_gradients, richness_gradients["predictive-barlow"]
-        )
+        alignments = {
+            functional: gradient_alignment(
+                loss_gradients,
+                richness_gradients[functional],
+            )
+            for functional in args.richness_functionals
+        }
         candidate_gradient_norm = float(gradient_norm(loss_gradients).item())
 
         for virtual_step in range(args.virtual_steps):
@@ -562,7 +597,7 @@ def main() -> None:
         core.target_encoder.eval()
         post_richness = {}
         with torch.no_grad():
-            for functional in RICHNESS_FUNCTIONALS:
+            for functional in args.richness_functionals:
                 post_richness[functional] = float(
                     richness(
                         core,
@@ -587,10 +622,6 @@ def main() -> None:
         )
         record = {
             "candidate": candidate,
-            "ras_spectral_dot": spectral_dot,
-            "ras_spectral_cosine": spectral_cosine,
-            "ras_barlow_dot": barlow_dot,
-            "ras_barlow_cosine": barlow_cosine,
             "jepa_loss": float(candidate_loss.detach().item()),
             "gradient_norm": candidate_gradient_norm,
             "random_score": float(
@@ -601,23 +632,25 @@ def main() -> None:
                     ),
                 ).item()
             ),
-            "delta_richness_spectral": (
-                post_richness["predictive-spectral"]
-                - base_richness["predictive-spectral"]
-            ),
-            "delta_richness_barlow": (
-                post_richness["predictive-barlow"] - base_richness["predictive-barlow"]
-            ),
             "negative_delta_probe_loss": base_probe_loss - post_probe_loss,
             "delta_probe_accuracy": post_probe_accuracy - base_probe_accuracy,
         }
+        for functional in args.richness_functionals:
+            slug = FUNCTIONAL_SLUG[functional]
+            dot, cosine = alignments[functional]
+            record[f"ras_{slug}_dot"] = dot
+            record[f"ras_{slug}_cosine"] = cosine
+            record[f"delta_richness_{slug}"] = (
+                post_richness[functional] - base_richness[functional]
+            )
         with records_path.open("a") as stream:
             stream.write(json.dumps(record) + "\n")
         completed[candidate] = record
         print(
             f"candidate={candidate + 1}/{args.num_candidates} "
-            f"spectral_cos={spectral_cosine:.4f} "
-            f"dR={record['delta_richness_spectral']:.4g} "
+            f"{FUNCTIONAL_SLUG[args.richness_functionals[0]]}_cos="
+            f"{alignments[args.richness_functionals[0]][1]:.4f} "
+            f"dR={record['delta_richness_' + FUNCTIONAL_SLUG[args.richness_functionals[0]]]:.4g} "
             f"probe_utility={record['negative_delta_probe_loss']:.4g}",
             flush=True,
         )
@@ -632,7 +665,11 @@ def main() -> None:
         "correlations": summarize(records),
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
-    plot_summary(records, output_dir / "correlations.png")
+    plot_summary(
+        records,
+        output_dir / "correlations.png",
+        args.richness_functionals,
+    )
     print(json.dumps(summary["correlations"], indent=2), flush=True)
 
 
