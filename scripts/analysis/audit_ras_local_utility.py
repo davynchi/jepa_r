@@ -35,8 +35,10 @@ from jepa.training.images.ijepa_spatial import (  # noqa: E402
     sample_masks,
     spatial_ijepa_loss,
 )
-from jepa.training.images.spatial_curriculum import richness_from_images  # noqa: E402
-
+from jepa.training.images.spatial_curriculum import (  # noqa: E402
+    adamw_update_direction,
+    richness_from_images,
+)
 
 RICHNESS_FUNCTIONALS = (
     "predictive-spectral",
@@ -244,6 +246,25 @@ def gradient_alignment(
     return float(ras_dot.item()), float(ras_cosine.item())
 
 
+def update_alignment(
+    updates: tuple[torch.Tensor | None, ...],
+    richness_gradients: tuple[torch.Tensor, ...],
+) -> tuple[float, float]:
+    dot = torch.zeros((), dtype=torch.float64, device=richness_gradients[0].device)
+    for update, richness_gradient in zip(updates, richness_gradients, strict=True):
+        if update is not None:
+            dot += (update.double() * richness_gradient.double()).sum()
+    update_norm = gradient_norm(updates)
+    richness_norm = gradient_norm(richness_gradients)
+    denominator = update_norm * richness_norm
+    cosine = (
+        torch.zeros_like(dot)
+        if denominator <= torch.finfo(torch.float64).eps
+        else dot / denominator
+    )
+    return float(dot.item()), float(cosine.item())
+
+
 def richness(
     core,
     reference_images: torch.Tensor,
@@ -348,10 +369,16 @@ def plot_summary(
     )
     for column, functional in enumerate(functionals):
         slug = FUNCTIONAL_SLUG[functional]
+        optimizer_score_key = f"ras_{slug}_adamw_cosine"
+        score_key = (
+            optimizer_score_key
+            if optimizer_score_key in records[0]
+            else f"ras_{slug}_cosine"
+        )
         panels = (
             (
                 axes[0, column],
-                f"ras_{slug}_cosine",
+                score_key,
                 f"delta_richness_{slug}",
                 f"{functional}\nRAS vs realized ΔR",
             ),
@@ -440,7 +467,9 @@ def main() -> None:
         + args.num_candidates * args.candidate_batch_size
     )
     if required > len(order):
-        raise ValueError(f"audit requests {required} distinct train samples, only {len(order)} exist")
+        raise ValueError(
+            f"audit requests {required} distinct train samples, only {len(order)} exist"
+        )
     reference_indices = order[: args.reference_size]
     probe_indices = order[args.reference_size : args.reference_size + args.probe_train_size]
     candidate_indices = order[
@@ -568,6 +597,20 @@ def main() -> None:
             )
             for functional in args.richness_functionals
         }
+        optimizer_alignments = {}
+        if args.virtual_optimizer == "adamw":
+            update_direction = adamw_update_direction(
+                encoder_parameters,
+                loss_gradients,
+                optimizer,
+            )
+            optimizer_alignments = {
+                functional: update_alignment(
+                    update_direction,
+                    richness_gradients[functional],
+                )
+                for functional in args.richness_functionals
+            }
         candidate_gradient_norm = float(gradient_norm(loss_gradients).item())
 
         for virtual_step in range(args.virtual_steps):
@@ -640,6 +683,10 @@ def main() -> None:
             dot, cosine = alignments[functional]
             record[f"ras_{slug}_dot"] = dot
             record[f"ras_{slug}_cosine"] = cosine
+            if functional in optimizer_alignments:
+                adamw_dot, adamw_cosine = optimizer_alignments[functional]
+                record[f"ras_{slug}_adamw_dot"] = adamw_dot
+                record[f"ras_{slug}_adamw_cosine"] = adamw_cosine
             record[f"delta_richness_{slug}"] = (
                 post_richness[functional] - base_richness[functional]
             )

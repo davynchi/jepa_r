@@ -9,6 +9,7 @@ from jepa.training.images.ijepa_spatial import (
     build_spatial_ijepa_core,
 )
 from jepa.training.images.spatial_curriculum import (
+    adamw_update_direction,
     richness_from_images,
     score_frames_by_ras,
 )
@@ -86,6 +87,84 @@ def _mask_config() -> MaskConfig:
         num_pred_masks=1,
         min_keep=0,
     )
+
+
+def test_adamw_update_direction_matches_optimizer_step_without_mutating_state() -> None:
+    parameter = nn.Parameter(torch.tensor([0.25, -0.75], dtype=torch.float64))
+    optimizer = torch.optim.AdamW(
+        [parameter],
+        lr=0.03,
+        betas=(0.8, 0.95),
+        eps=1.0e-7,
+        weight_decay=0.1,
+        amsgrad=True,
+    )
+    parameter.grad = torch.tensor([0.2, -0.4], dtype=torch.float64)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    gradient = torch.tensor([-0.3, 0.7], dtype=torch.float64)
+    state_before = {
+        key: value.detach().clone() if torch.is_tensor(value) else value
+        for key, value in optimizer.state[parameter].items()
+    }
+    predicted = adamw_update_direction(
+        (parameter,),
+        (gradient,),
+        optimizer,
+    )[0]
+
+    assert predicted is not None
+    for key, value in optimizer.state[parameter].items():
+        expected = state_before[key]
+        if torch.is_tensor(value):
+            assert torch.equal(value, expected)
+        else:
+            assert value == expected
+
+    previous = parameter.detach().clone()
+    parameter.grad = gradient.clone()
+    optimizer.step()
+    actual = parameter.detach() - previous
+    assert torch.allclose(predicted, actual, atol=1.0e-12, rtol=1.0e-10)
+
+
+def test_optimizer_aware_ras_runs_through_batch_scoring() -> None:
+    core = build_spatial_ijepa_core(
+        "vit_tiny",
+        image_size=16,
+        patch_size=4,
+        predictor_embed_dim=24,
+        predictor_depth=1,
+    )
+    optimizer = torch.optim.AdamW(
+        tuple(core.context_encoder.parameters()) + tuple(core.predictor.parameters()),
+        lr=1.0e-3,
+        weight_decay=0.05,
+    )
+    images = torch.randn(4, 3, 16, 16)
+    scores, metadata = score_frames_by_ras(
+        core,
+        images,
+        ref_indices=torch.arange(4),
+        grid=4,
+        mask_config=_mask_config(),
+        batch_size=2,
+        seed=13,
+        device=torch.device("cpu"),
+        richness_functional="predictive-barlow",
+        richness_delta=1.0e-4,
+        richness_trace_target=1.0,
+        richness_trace_beta=0.0,
+        score_granularity="batch",
+        alignment="adamw-cosine",
+        optimizer=optimizer,
+    )
+
+    assert scores.shape == (4,)
+    assert torch.isfinite(scores).all()
+    assert metadata["ras/alignment_cosine"] == 1.0
+    assert metadata["ras/alignment_adamw"] == 1.0
 
 
 def test_predictive_barlow_prefers_spatially_stable_signal_to_pixel_noise() -> None:

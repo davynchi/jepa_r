@@ -14,8 +14,8 @@ from jepa.training.images.ijepa_spatial import (
     SpatialIJEPACore,
     encode_samples_pooled,
     sample_masks,
-    spatial_ijepa_prediction_targets,
     spatial_ijepa_per_sample_loss,
+    spatial_ijepa_prediction_targets,
 )
 
 SpatialWeightingMethod = Literal[
@@ -37,7 +37,7 @@ SpatialRichnessFunctional = Literal[
     "predictive-combined",
 ]
 RASScoreGranularity = Literal["sample", "batch"]
-RASAlignment = Literal["dot", "cosine"]
+RASAlignment = Literal["dot", "cosine", "adamw-dot", "adamw-cosine"]
 CoordinateImportanceMethod = Literal["covariance", "transformation", "dynamics"]
 ScoreNormalization = Literal["zscore", "robust"]
 
@@ -142,8 +142,15 @@ def _validate_config(config: SpatialWeightingConfig) -> None:
         raise ValueError("predictive_kappa must be positive")
     if config.ras_score_granularity not in {"sample", "batch"}:
         raise ValueError(f"unknown RAS score granularity: {config.ras_score_granularity!r}")
-    if config.ras_alignment not in {"dot", "cosine"}:
+    if config.ras_alignment not in {
+        "dot",
+        "cosine",
+        "adamw-dot",
+        "adamw-cosine",
+    }:
         raise ValueError(f"unknown RAS alignment: {config.ras_alignment!r}")
+    if config.ras_alignment.startswith("adamw-") and config.method != "ras":
+        raise ValueError("optimizer-aware RAS alignment is currently supported by method='ras'")
     if config.coordinate_importance not in {"covariance", "transformation", "dynamics"}:
         raise ValueError(f"unknown coordinate importance: {config.coordinate_importance!r}")
     if not 0 <= config.coordinate_ema_beta <= 1:
@@ -775,6 +782,86 @@ def _ras_gradient_score(
     return score, loss_gradient_norm
 
 
+def adamw_update_direction(
+    parameters: tuple[torch.nn.Parameter, ...],
+    gradients: tuple[torch.Tensor | None, ...],
+    optimizer: torch.optim.Optimizer,
+) -> tuple[torch.Tensor | None, ...]:
+    """Predict the next AdamW parameter deltas without mutating optimizer state."""
+    if len(parameters) != len(gradients):
+        raise ValueError("parameters and gradients must have the same length")
+
+    parameter_groups = {
+        id(parameter): group
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    updates: list[torch.Tensor | None] = []
+    for parameter, gradient in zip(parameters, gradients, strict=True):
+        if gradient is None:
+            updates.append(None)
+            continue
+        group = parameter_groups.get(id(parameter))
+        if group is None:
+            raise ValueError("all RAS parameters must belong to the supplied optimizer")
+        if gradient.is_sparse:
+            raise ValueError("optimizer-aware RAS does not support sparse gradients")
+
+        beta1, beta2 = group["betas"]
+        learning_rate = float(group["lr"])
+        epsilon = float(group["eps"])
+        weight_decay = float(group.get("weight_decay", 0.0))
+        maximize = bool(group.get("maximize", False))
+        amsgrad = bool(group.get("amsgrad", False))
+        effective_gradient = -gradient if maximize else gradient
+
+        state = optimizer.state.get(parameter, {})
+        step_value = state.get("step", 0)
+        step = int(step_value.item()) if torch.is_tensor(step_value) else int(step_value)
+        next_step = step + 1
+        exp_avg = state.get("exp_avg", torch.zeros_like(parameter))
+        exp_avg_sq = state.get("exp_avg_sq", torch.zeros_like(parameter))
+        next_exp_avg = exp_avg * beta1 + effective_gradient * (1.0 - beta1)
+        next_exp_avg_sq = (
+            exp_avg_sq * beta2 + effective_gradient.conj() * effective_gradient * (1.0 - beta2)
+        )
+
+        if amsgrad:
+            max_exp_avg_sq = state.get("max_exp_avg_sq", torch.zeros_like(parameter))
+            variance = torch.maximum(max_exp_avg_sq, next_exp_avg_sq)
+        else:
+            variance = next_exp_avg_sq
+        bias_correction1 = 1.0 - beta1**next_step
+        bias_correction2 = 1.0 - beta2**next_step
+        denominator = variance.sqrt() / math.sqrt(bias_correction2)
+        denominator = denominator + epsilon
+        adaptive_update = -learning_rate * (next_exp_avg / bias_correction1) / denominator
+        decay_update = -learning_rate * weight_decay * parameter
+        updates.append((adaptive_update + decay_update).detach())
+    return tuple(updates)
+
+
+def _ras_update_score(
+    update_direction: tuple[torch.Tensor | None, ...],
+    richness_gradients: tuple[torch.Tensor, ...],
+    *,
+    cosine: bool,
+    richness_gradient_norm: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    update_norm = _gradient_norm(
+        update_direction,
+        device=richness_gradient_norm.device,
+    )
+    score = _dot_gradients(update_direction, richness_gradients).to(torch.float64)
+    if cosine:
+        denominator = update_norm * richness_gradient_norm
+        if denominator <= torch.finfo(torch.float64).eps:
+            score = torch.zeros_like(score)
+        else:
+            score = score / denominator
+    return score, update_norm
+
+
 def score_frames_by_loss(
     core: SpatialIJEPACore,
     train_images: torch.Tensor,
@@ -839,13 +926,17 @@ def score_frames_by_ras(
     score_granularity: RASScoreGranularity = "sample",
     alignment: RASAlignment = "dot",
     amp_dtype: torch.dtype | None = None,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if batch_size <= 0:
         raise ValueError("score batch_size must be positive")
     if score_granularity not in {"sample", "batch"}:
         raise ValueError(f"unknown RAS score granularity: {score_granularity!r}")
-    if alignment not in {"dot", "cosine"}:
+    if alignment not in {"dot", "cosine", "adamw-dot", "adamw-cosine"}:
         raise ValueError(f"unknown RAS alignment: {alignment!r}")
+    optimizer_aware = alignment.startswith("adamw-")
+    if optimizer_aware and optimizer is None:
+        raise ValueError(f"{alignment} RAS alignment requires an optimizer")
     context_was_training = core.context_encoder.training
     predictor_was_training = core.predictor.training
     target_was_training = core.target_encoder.training
@@ -893,7 +984,7 @@ def score_frames_by_ras(
             generator=torch.Generator().manual_seed(derive_seed(seed, "weighting-ras-order")),
         ).to(train_images.device)
         score_groups = score_order.split(batch_size)
-        loss_gradient_norms: list[float] = []
+        scoring_direction_norms: list[float] = []
         for indices in score_groups:
             batch = train_images[indices].to(device)
             context_masks, target_masks = sample_masks(
@@ -921,14 +1012,30 @@ def score_frames_by_ras(
                     retain_graph=False,
                     allow_unused=True,
                 )
-                group_score_tensor, loss_gradient_norm = _ras_gradient_score(
-                    loss_gradients,
-                    richness_gradients,
-                    alignment=alignment,
-                    richness_gradient_norm=grad_norm,
-                )
+                if optimizer_aware:
+                    assert optimizer is not None
+                    update_direction = adamw_update_direction(
+                        parameters,
+                        loss_gradients,
+                        optimizer,
+                    )
+                    group_score_tensor, scoring_direction_norm = _ras_update_score(
+                        update_direction,
+                        richness_gradients,
+                        cosine=alignment == "adamw-cosine",
+                        richness_gradient_norm=grad_norm,
+                    )
+                else:
+                    group_score_tensor, scoring_direction_norm = _ras_gradient_score(
+                        loss_gradients,
+                        richness_gradients,
+                        alignment=alignment,
+                        richness_gradient_norm=grad_norm,
+                    )
                 group_score = float(group_score_tensor.detach().cpu().item())
-                loss_gradient_norms.append(float(loss_gradient_norm.detach().cpu().item()))
+                scoring_direction_norms.append(
+                    float(scoring_direction_norm.detach().cpu().item())
+                )
                 batch_scores = torch.full(
                     (batch.shape[0],),
                     group_score,
@@ -961,14 +1068,30 @@ def score_frames_by_ras(
                         retain_graph=False,
                         allow_unused=True,
                     )
-                    sample_score, loss_gradient_norm = _ras_gradient_score(
-                        loss_gradients,
-                        richness_gradients,
-                        alignment=alignment,
-                        richness_gradient_norm=grad_norm,
-                    )
+                    if optimizer_aware:
+                        assert optimizer is not None
+                        update_direction = adamw_update_direction(
+                            parameters,
+                            loss_gradients,
+                            optimizer,
+                        )
+                        sample_score, scoring_direction_norm = _ras_update_score(
+                            update_direction,
+                            richness_gradients,
+                            cosine=alignment == "adamw-cosine",
+                            richness_gradient_norm=grad_norm,
+                        )
+                    else:
+                        sample_score, scoring_direction_norm = _ras_gradient_score(
+                            loss_gradients,
+                            richness_gradients,
+                            alignment=alignment,
+                            richness_gradient_norm=grad_norm,
+                        )
                     batch_scores[local_index] = float(sample_score.detach().cpu().item())
-                    loss_gradient_norms.append(float(loss_gradient_norm.detach().cpu().item()))
+                    scoring_direction_norms.append(
+                        float(scoring_direction_norm.detach().cpu().item())
+                    )
             scores[indices.detach().cpu()] = batch_scores
     finally:
         core.context_encoder.train(context_was_training)
@@ -982,11 +1105,12 @@ def score_frames_by_ras(
         "ras/negative_fraction": float((scores < 0).to(torch.float64).mean().item()),
         "ras/score_granularity_batch": float(score_granularity == "batch"),
         "ras/score_groups": float(math.ceil(train_images.shape[0] / batch_size)),
-        "ras/alignment_cosine": float(alignment == "cosine"),
-        "ras/loss_gradient_norm_mean": float(
-            torch.tensor(loss_gradient_norms, dtype=torch.float64).mean().item()
+        "ras/alignment_cosine": float(alignment.endswith("cosine")),
+        "ras/alignment_adamw": float(optimizer_aware),
+        "ras/scoring_direction_norm_mean": float(
+            torch.tensor(scoring_direction_norms, dtype=torch.float64).mean().item()
         ),
-        "ras/loss_gradient_norm_max": float(max(loss_gradient_norms)),
+        "ras/scoring_direction_norm_max": float(max(scoring_direction_norms)),
     }
     return scores, metadata
 

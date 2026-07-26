@@ -262,9 +262,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ras-alignment",
-        choices=("dot", "cosine"),
+        choices=("dot", "cosine", "adamw-dot", "adamw-cosine"),
         default="dot",
-        help="Use raw gradient alignment or normalize both gradients to unit norm",
+        help=(
+            "Align richness with the raw loss gradient or the predicted next AdamW "
+            "update; cosine variants normalize both directions"
+        ),
     )
     parser.add_argument(
         "--coordinate-importance",
@@ -1003,6 +1006,7 @@ def main() -> None:
                 score_granularity=weighting_config.ras_score_granularity,
                 alignment=weighting_config.ras_alignment,
                 amp_dtype=amp_dtype,
+                optimizer=optimizer,
             )
         elif weighting_config.method == "coord":
             (
