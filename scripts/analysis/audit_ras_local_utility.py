@@ -50,6 +50,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-candidates", type=int, default=256)
     parser.add_argument("--candidate-batch-size", type=int, default=128)
     parser.add_argument("--virtual-steps", type=int, default=3)
+    parser.add_argument(
+        "--virtual-optimizer",
+        choices=("adamw", "sgd-small"),
+        default="adamw",
+        help="Optimizer used for realized post-update utility.",
+    )
+    parser.add_argument(
+        "--sgd-learning-rate",
+        type=float,
+        default=1.0e-5,
+        help="Learning rate for --virtual-optimizer sgd-small.",
+    )
+    parser.add_argument(
+        "--reuse-score-masks-first-step",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the exact masks from RAS scoring for the first virtual update.",
+    )
+    parser.add_argument(
+        "--virtual-ema-update",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply the training EMA target update after each virtual step.",
+    )
     parser.add_argument("--reference-size", type=int, default=1024)
     parser.add_argument("--probe-train-size", type=int, default=5000)
     parser.add_argument("--probe-test-size", type=int, default=1000)
@@ -284,6 +308,17 @@ def summarize(records: list[dict[str, float]]) -> dict[str, dict[str, float]]:
             summary[score_key][f"spearman/{utility_key}"] = correlation(
                 scores, utilities, ranks=True
             )
+    for richness_key in ("delta_richness_spectral", "delta_richness_barlow"):
+        summary[f"realized/{richness_key}"] = {}
+        richness_values = [record[richness_key] for record in records]
+        for utility_key in ("negative_delta_probe_loss", "delta_probe_accuracy"):
+            utilities = [record[utility_key] for record in records]
+            summary[f"realized/{richness_key}"][f"pearson/{utility_key}"] = correlation(
+                richness_values, utilities, ranks=False
+            )
+            summary[f"realized/{richness_key}"][f"spearman/{utility_key}"] = correlation(
+                richness_values, utilities, ranks=True
+            )
     return summary
 
 
@@ -298,9 +333,10 @@ def plot_summary(records: list[dict[str, float]], output: Path) -> None:
     for axis, (x_key, y_key, title) in zip(axes.flat, panels, strict=True):
         x = [record[x_key] for record in records]
         y = [record[y_key] for record in records]
-        rho = correlation(x, y, ranks=True)
+        pearson = correlation(x, y, ranks=False)
+        spearman = correlation(x, y, ranks=True)
         axis.scatter(x, y, s=15, alpha=0.55)
-        axis.set_title(f"{title}\nSpearman ρ={rho:.3f}")
+        axis.set_title(f"{title}\nPearson r={pearson:.3f} · Spearman ρ={spearman:.3f}")
         axis.set_xlabel(x_key)
         axis.set_ylabel(y_key)
         axis.grid(alpha=0.2)
@@ -320,6 +356,8 @@ def main() -> None:
         args.probe_test_size,
     ) <= 0:
         raise ValueError("all audit sizes and --virtual-steps must be positive")
+    if not math.isfinite(args.sgd_learning_rate) or args.sgd_learning_rate <= 0:
+        raise ValueError("--sgd-learning-rate must be finite and positive")
     run_dir = args.run_dir.expanduser().resolve()
     checkpoint_path = run_dir / "network" / args.checkpoint
     output_dir = args.output_dir.expanduser().resolve()
@@ -349,7 +387,13 @@ def main() -> None:
     core.context_encoder.to(device)
     core.predictor.to(device)
     core.target_encoder.to(device)
-    optimizer = optimizer_for_checkpoint(core, checkpoint)
+    if args.virtual_optimizer == "adamw":
+        optimizer: torch.optim.Optimizer = optimizer_for_checkpoint(core, checkpoint)
+    else:
+        optimizer = torch.optim.SGD(
+            tuple(core.context_encoder.parameters()) + tuple(core.predictor.parameters()),
+            lr=args.sgd_learning_rate,
+        )
     grid = int(spatial_config["image_size"]) // int(spatial_config["patch_size"])
     min_keep = int(spatial_config.get("mask_min_keep") or (10 if grid >= 16 else 4))
     mask_config = MaskConfig(min_keep=min_keep)
@@ -427,7 +471,11 @@ def main() -> None:
     base_context = clone_module_state(core.context_encoder)
     base_predictor = clone_module_state(core.predictor)
     base_target = clone_module_state(core.target_encoder)
-    base_optimizer = copy.deepcopy(optimizer.state_dict())
+    base_optimizer = (
+        copy.deepcopy(optimizer.state_dict())
+        if args.virtual_optimizer == "adamw"
+        else None
+    )
     ema_start, ema_end = spatial_config.get("ema", [0.996, 1.0])
     schedule_steps = max(
         int(
@@ -451,7 +499,8 @@ def main() -> None:
         restore_module_state(core.context_encoder, base_context)
         restore_module_state(core.predictor, base_predictor)
         restore_module_state(core.target_encoder, base_target)
-        optimizer.load_state_dict(base_optimizer)
+        if base_optimizer is not None:
+            optimizer.load_state_dict(base_optimizer)
         core.context_encoder.train()
         core.predictor.train()
         core.target_encoder.train()
@@ -459,7 +508,7 @@ def main() -> None:
         score_generator = torch.Generator().manual_seed(
             derive_seed(args.seed, "candidate-score", candidate)
         )
-        context_masks, target_masks = sample_masks(
+        score_context_masks, score_target_masks = sample_masks(
             grid,
             grid,
             mask_config,
@@ -467,7 +516,12 @@ def main() -> None:
             batch_size=len(batch),
         )
         with autocast(device, amp_dtype):
-            candidate_loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
+            candidate_loss = spatial_ijepa_loss(
+                core,
+                batch,
+                score_context_masks,
+                score_target_masks,
+            )
         loss_gradients = torch.autograd.grad(
             candidate_loss,
             encoder_parameters,
@@ -483,21 +537,25 @@ def main() -> None:
 
         for virtual_step in range(args.virtual_steps):
             optimizer.zero_grad(set_to_none=True)
-            step_generator = torch.Generator().manual_seed(
-                derive_seed(args.seed, "candidate-step", candidate, virtual_step)
-            )
-            context_masks, target_masks = sample_masks(
-                grid,
-                grid,
-                mask_config,
-                step_generator,
-                batch_size=len(batch),
-            )
+            if virtual_step == 0 and args.reuse_score_masks_first_step:
+                context_masks, target_masks = score_context_masks, score_target_masks
+            else:
+                step_generator = torch.Generator().manual_seed(
+                    derive_seed(args.seed, "candidate-step", candidate, virtual_step)
+                )
+                context_masks, target_masks = sample_masks(
+                    grid,
+                    grid,
+                    mask_config,
+                    step_generator,
+                    batch_size=len(batch),
+                )
             with autocast(device, amp_dtype):
                 loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
             loss.backward()
             optimizer.step()
-            ema_update(core.target_encoder, core.context_encoder, ema_momentum)
+            if args.virtual_ema_update:
+                ema_update(core.target_encoder, core.context_encoder, ema_momentum)
 
         core.context_encoder.eval()
         core.predictor.eval()
