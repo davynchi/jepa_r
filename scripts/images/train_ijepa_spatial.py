@@ -117,6 +117,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None, help="Directory name under --output-root")
     parser.add_argument("--output-root", default=str(OUTPUT_ROOT))
     parser.add_argument("--epochs", type=int, default=TOTAL_EPOCHS)
+    parser.add_argument(
+        "--stop-after-epoch",
+        type=int,
+        default=0,
+        help=(
+            "Stop cleanly after this epoch while retaining the schedule defined by "
+            "--epochs; 0 disables early stopping"
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=LR, help="Peak/reference learning rate")
     parser.add_argument("--start-lr", type=float, default=START_LR)
@@ -341,6 +350,10 @@ def _checkpoint_metadata(args: argparse.Namespace, run_dir: Path) -> dict[str, o
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be positive")
+    if args.stop_after_epoch < 0 or args.stop_after_epoch > args.epochs:
+        raise ValueError("--stop-after-epoch must be 0 or lie in [1, --epochs]")
     if args.image_size <= 0 or args.patch_size <= 0:
         raise ValueError("image and patch sizes must be positive")
     if args.image_size % args.patch_size:
@@ -815,6 +828,7 @@ def main() -> None:
                 "mask_min_keep": args.mask_min_keep,
                 "batch_size": args.batch_size,
                 "epochs": args.epochs,
+                "stop_after_epoch": args.stop_after_epoch,
                 "seed": args.seed,
                 "dataset": args.dataset,
                 "data_source": f"{args.dataset}_images",
@@ -1521,9 +1535,12 @@ def main() -> None:
                     f"top5={class_top5_accuracy:.4f} seconds={probe_seconds:.1f}",
                     flush=True,
                 )
+            stopping_after_epoch = (
+                args.stop_after_epoch > 0 and epoch == args.stop_after_epoch
+            )
             if (
                 args.checkpoint_every_epochs > 0 and epoch % args.checkpoint_every_epochs == 0
-            ) or epoch == args.epochs:
+            ) or epoch == args.epochs or stopping_after_epoch:
                 save_spatial_checkpoint(
                     checkpoint_dir / f"epoch_{epoch:04d}.pt",
                     core,
@@ -1558,6 +1575,13 @@ def main() -> None:
                         richness_snapshot=richness_snapshot,
                     ),
                 )
+            if stopping_after_epoch:
+                print(
+                    f"stopped cleanly after epoch={epoch} "
+                    f"with schedule_epochs={args.epochs}",
+                    flush=True,
+                )
+                break
     finally:
         logger.close()
 
