@@ -8,6 +8,7 @@ import copy
 import json
 import math
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
+from jepa.analysis.subspace import fit_entity_classifier  # noqa: E402
 from jepa.configs.base import derive_seed  # noqa: E402
 from jepa.data.images.tiny_imagenet import (  # noqa: E402
     TinyImageNetDataConfig,
@@ -46,6 +48,7 @@ RICHNESS_FUNCTIONALS = (
     "predictive-dimension",
     "predictive-combined",
 )
+PROBE_MODES = ("ridge", "linear", "linear-l2", "mlp")
 FUNCTIONAL_SLUG = {
     functional: functional.removeprefix("predictive-").replace("-", "_")
     for functional in RICHNESS_FUNCTIONALS
@@ -96,6 +99,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-batch-size", type=int, default=1024)
     parser.add_argument("--probe-learning-rate", type=float, default=1.0e-2)
     parser.add_argument("--probe-weight-decay", type=float, default=0.0)
+    parser.add_argument("--probe-ridge", type=float, default=1.0e-6)
+    parser.add_argument("--mlp-epochs", type=int, default=30)
+    parser.add_argument("--mlp-hidden-dim", type=int, default=1024)
+    parser.add_argument("--mlp-learning-rate", type=float, default=1.0e-3)
+    parser.add_argument("--mlp-weight-decay", type=float, default=1.0e-4)
+    parser.add_argument(
+        "--probe-modes",
+        nargs="+",
+        choices=PROBE_MODES,
+        default=PROBE_MODES,
+    )
+    parser.add_argument(
+        "--probe-encoders",
+        nargs="+",
+        choices=("context", "target"),
+        default=("context", "target"),
+    )
     parser.add_argument("--encode-batch-size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
@@ -156,26 +176,58 @@ def encode_pooled(
     return torch.cat(chunks)
 
 
+class MLPProbe(torch.nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, num_classes: int) -> None:
+        super().__init__()
+        self.network = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.network(features)
+
+
+@dataclass(slots=True)
+class FrozenProbe:
+    name: str
+    encoder_name: str
+    normalize: bool
+    head: torch.nn.Module | None = None
+    ridge_classifier: Any | None = None
+
+
 def probe_metrics(
-    head: torch.nn.Module,
+    probe: FrozenProbe,
     features: torch.Tensor,
     labels: torch.Tensor,
     *,
     device: torch.device,
     batch_size: int,
 ) -> tuple[float, float]:
-    head.eval()
-    scores = []
-    with torch.inference_mode():
-        for batch in features.split(batch_size):
-            scores.append(head(batch.to(device, non_blocking=True)).float().cpu())
-    scores = torch.cat(scores)
+    if probe.normalize:
+        features = F.normalize(features, dim=-1)
+    if probe.ridge_classifier is not None:
+        scores = probe.ridge_classifier.probe.predict(features).float()
+    else:
+        assert probe.head is not None
+        probe.head.eval()
+        scores = []
+        with torch.inference_mode():
+            for batch in features.split(batch_size):
+                scores.append(
+                    probe.head(batch.to(device, non_blocking=True)).float().cpu()
+                )
+        scores = torch.cat(scores)
     loss = F.cross_entropy(scores, labels).item()
     accuracy = scores.argmax(dim=-1).eq(labels).float().mean().item()
     return loss, accuracy
 
 
-def train_linear_probe(
+def train_neural_probe(
+    head: torch.nn.Module,
     train_features: torch.Tensor,
     train_labels: torch.Tensor,
     validation_features: torch.Tensor,
@@ -184,17 +236,28 @@ def train_linear_probe(
     num_classes: int,
     args: argparse.Namespace,
     device: torch.device,
-) -> torch.nn.Linear:
-    head = torch.nn.Linear(train_features.shape[1], num_classes).to(device)
+    seed: int,
+    epochs: int,
+    learning_rate: float,
+    weight_decay: float,
+) -> torch.nn.Module:
+    del num_classes
+    head.to(device)
     optimizer = torch.optim.AdamW(
         head.parameters(),
-        lr=args.probe_learning_rate,
-        weight_decay=args.probe_weight_decay,
+        lr=learning_rate,
+        weight_decay=weight_decay,
     )
-    generator = torch.Generator().manual_seed(derive_seed(args.seed, "probe-head"))
+    generator = torch.Generator().manual_seed(seed)
     best_loss = math.inf
     best_state = None
-    for _ in range(args.probe_epochs):
+    evaluation_probe = FrozenProbe(
+        name="training",
+        encoder_name="",
+        normalize=False,
+        head=head,
+    )
+    for _ in range(epochs):
         head.train()
         order = torch.randperm(len(train_features), generator=generator)
         for indices in order.split(args.probe_batch_size):
@@ -207,7 +270,7 @@ def train_linear_probe(
             loss.backward()
             optimizer.step()
         validation_loss, _ = probe_metrics(
-            head,
+            evaluation_probe,
             validation_features,
             validation_labels,
             device=device,
@@ -223,6 +286,81 @@ def train_linear_probe(
     head.load_state_dict(best_state)
     head.requires_grad_(False)
     return head
+
+
+def build_probe_matrix(
+    encoded: dict[str, dict[str, torch.Tensor]],
+    labels: dict[str, torch.Tensor],
+    *,
+    num_classes: int,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> dict[str, FrozenProbe]:
+    probes = {}
+    for encoder_name in args.probe_encoders:
+        features = encoded[encoder_name]
+        for mode in args.probe_modes:
+            name = f"{encoder_name}_{mode.replace('-', '_')}"
+            normalize = mode == "linear-l2"
+            train_features = (
+                F.normalize(features["train"], dim=-1)
+                if normalize
+                else features["train"]
+            )
+            validation_features = (
+                F.normalize(features["validation"], dim=-1)
+                if normalize
+                else features["validation"]
+            )
+            if mode == "ridge":
+                classifier = fit_entity_classifier(
+                    train_features,
+                    labels["train"],
+                    num_classes,
+                    ridge=args.probe_ridge,
+                )
+                probes[name] = FrozenProbe(
+                    name=name,
+                    encoder_name=encoder_name,
+                    normalize=False,
+                    ridge_classifier=classifier,
+                )
+                continue
+            if mode == "mlp":
+                head: torch.nn.Module = MLPProbe(
+                    train_features.shape[1],
+                    args.mlp_hidden_dim,
+                    num_classes,
+                )
+                epochs = args.mlp_epochs
+                learning_rate = args.mlp_learning_rate
+                weight_decay = args.mlp_weight_decay
+            else:
+                head = torch.nn.Linear(train_features.shape[1], num_classes)
+                epochs = args.probe_epochs
+                learning_rate = args.probe_learning_rate
+                weight_decay = args.probe_weight_decay
+            head = train_neural_probe(
+                head,
+                train_features,
+                labels["train"],
+                validation_features,
+                labels["validation"],
+                num_classes=num_classes,
+                args=args,
+                device=device,
+                seed=derive_seed(args.seed, "probe-head", encoder_name, mode),
+                epochs=epochs,
+                learning_rate=learning_rate,
+                weight_decay=weight_decay,
+            )
+            probes[name] = FrozenProbe(
+                name=name,
+                encoder_name=encoder_name,
+                normalize=normalize,
+                head=head,
+            )
+    return probes
 
 
 def optimizer_for_checkpoint(core, checkpoint: dict[str, Any]) -> torch.optim.AdamW:
@@ -392,8 +530,10 @@ def summarize(records: list[dict[str, float]]) -> dict[str, dict[str, float]]:
         "random_score",
     ]
     utility_keys = sorted(
-        key for key in records[0] if key.startswith("delta_richness_")
-    ) + ["negative_delta_probe_loss", "delta_probe_accuracy"]
+        key
+        for key in records[0]
+        if key.startswith(("delta_richness_", "probe_"))
+    )
     summary = {}
     for score_key in score_keys:
         summary[score_key] = {}
@@ -411,7 +551,9 @@ def summarize(records: list[dict[str, float]]) -> dict[str, dict[str, float]]:
     ):
         summary[f"realized/{richness_key}"] = {}
         richness_values = [record[richness_key] for record in records]
-        for utility_key in ("negative_delta_probe_loss", "delta_probe_accuracy"):
+        for utility_key in sorted(
+            key for key in records[0] if key.startswith("probe_")
+        ):
             utilities = [record[utility_key] for record in records]
             summary[f"realized/{richness_key}"][f"pearson/{utility_key}"] = correlation(
                 richness_values, utilities, ranks=False
@@ -485,10 +627,22 @@ def main() -> None:
         args.probe_test_size,
         args.probe_epochs,
         args.probe_batch_size,
+        args.mlp_epochs,
+        args.mlp_hidden_dim,
     ) <= 0:
         raise ValueError("all audit sizes and --virtual-steps must be positive")
     if not math.isfinite(args.sgd_learning_rate) or args.sgd_learning_rate <= 0:
         raise ValueError("--sgd-learning-rate must be finite and positive")
+    for name in ("probe_learning_rate", "mlp_learning_rate", "probe_ridge"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and positive")
+    for name in ("probe_weight_decay", "mlp_weight_decay"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"--{name.replace('_', '-')} must be finite and non-negative"
+            )
     run_dir = args.run_dir.expanduser().resolve()
     checkpoint_path = run_dir / "network" / args.checkpoint
     output_dir = args.output_dir.expanduser().resolve()
@@ -568,43 +722,58 @@ def main() -> None:
     probe_test_labels = test_labels[test_indices]
     mask_seed = derive_seed(args.seed, "audit-richness")
 
-    train_z = encode_pooled(
-        core.target_encoder,
-        train_images[probe_indices],
-        device=device,
-        batch_size=args.encode_batch_size,
-        amp_dtype=amp_dtype,
-    )
-    validation_z = encode_pooled(
-        core.target_encoder,
-        probe_validation_images,
-        device=device,
-        batch_size=args.encode_batch_size,
-        amp_dtype=amp_dtype,
-    )
-    test_z = encode_pooled(
-        core.target_encoder,
-        probe_test_images,
-        device=device,
-        batch_size=args.encode_batch_size,
-        amp_dtype=amp_dtype,
-    )
-    classifier = train_linear_probe(
-        train_z,
-        train_labels[probe_indices],
-        validation_z,
-        probe_validation_labels,
+    encoders = {
+        "context": core.context_encoder,
+        "target": core.target_encoder,
+    }
+    encoded = {}
+    for encoder_name in args.probe_encoders:
+        encoder = encoders[encoder_name]
+        encoded[encoder_name] = {
+            "train": encode_pooled(
+                encoder,
+                train_images[probe_indices],
+                device=device,
+                batch_size=args.encode_batch_size,
+                amp_dtype=amp_dtype,
+            ),
+            "validation": encode_pooled(
+                encoder,
+                probe_validation_images,
+                device=device,
+                batch_size=args.encode_batch_size,
+                amp_dtype=amp_dtype,
+            ),
+            "test": encode_pooled(
+                encoder,
+                probe_test_images,
+                device=device,
+                batch_size=args.encode_batch_size,
+                amp_dtype=amp_dtype,
+            ),
+        }
+    probe_labels = {
+        "train": train_labels[probe_indices],
+        "validation": probe_validation_labels,
+        "test": probe_test_labels,
+    }
+    probes = build_probe_matrix(
+        encoded,
+        probe_labels,
         num_classes=data_config.num_entities,
         args=args,
         device=device,
     )
-    base_probe_loss, base_probe_accuracy = probe_metrics(
-        classifier,
-        test_z,
-        probe_test_labels,
-        device=device,
-        batch_size=args.probe_batch_size,
-    )
+    base_probe_metrics = {
+        name: probe_metrics(
+            probe,
+            encoded[probe.encoder_name]["test"],
+            probe_test_labels,
+            device=device,
+            batch_size=args.probe_batch_size,
+        )
+        for name, probe in probes.items()
+    }
 
     encoder_parameters = tuple(
         parameter for parameter in core.context_encoder.parameters() if parameter.requires_grad
@@ -760,20 +929,26 @@ def main() -> None:
                         amp_dtype=amp_dtype,
                     ).item()
                 )
-        post_test_z = encode_pooled(
-            core.target_encoder,
-            probe_test_images,
-            device=device,
-            batch_size=args.encode_batch_size,
-            amp_dtype=amp_dtype,
-        )
-        post_probe_loss, post_probe_accuracy = probe_metrics(
-            classifier,
-            post_test_z,
-            probe_test_labels,
-            device=device,
-            batch_size=args.probe_batch_size,
-        )
+        post_features = {
+            encoder_name: encode_pooled(
+                encoders[encoder_name],
+                probe_test_images,
+                device=device,
+                batch_size=args.encode_batch_size,
+                amp_dtype=amp_dtype,
+            )
+            for encoder_name in args.probe_encoders
+        }
+        post_probe_metrics = {
+            name: probe_metrics(
+                probe,
+                post_features[probe.encoder_name],
+                probe_test_labels,
+                device=device,
+                batch_size=args.probe_batch_size,
+            )
+            for name, probe in probes.items()
+        }
         record = {
             "candidate": candidate,
             "mask_repeat": mask_repeat,
@@ -792,9 +967,21 @@ def main() -> None:
                     ),
                 ).item()
             ),
-            "negative_delta_probe_loss": base_probe_loss - post_probe_loss,
-            "delta_probe_accuracy": post_probe_accuracy - base_probe_accuracy,
         }
+        for name in probes:
+            base_loss, base_accuracy = base_probe_metrics[name]
+            post_loss, post_accuracy = post_probe_metrics[name]
+            record[f"probe_{name}_utility_loss"] = base_loss - post_loss
+            record[f"probe_{name}_delta_accuracy"] = post_accuracy - base_accuracy
+        compatibility_probe = (
+            "target_linear" if "target_linear" in probes else next(iter(probes))
+        )
+        record["negative_delta_probe_loss"] = record[
+            f"probe_{compatibility_probe}_utility_loss"
+        ]
+        record["delta_probe_accuracy"] = record[
+            f"probe_{compatibility_probe}_delta_accuracy"
+        ]
         for functional in args.richness_functionals:
             slug = FUNCTIONAL_SLUG[functional]
             dot, cosine = alignments[functional]
@@ -824,8 +1011,10 @@ def main() -> None:
     summary = {
         "checkpoint": str(checkpoint_path),
         "config": vars(args) | {"run_dir": str(run_dir), "output_dir": str(output_dir)},
-        "base_probe_loss": base_probe_loss,
-        "base_probe_accuracy": base_probe_accuracy,
+        "base_probes": {
+            name: {"loss": metrics[0], "accuracy": metrics[1]}
+            for name, metrics in base_probe_metrics.items()
+        },
         "base_richness": base_richness,
         "correlations": summarize(records),
     }
