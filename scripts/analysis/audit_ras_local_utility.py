@@ -20,7 +20,6 @@ import matplotlib.pyplot as plt  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
-from jepa.analysis.subspace import fit_entity_classifier  # noqa: E402
 from jepa.configs.base import derive_seed  # noqa: E402
 from jepa.data.images.tiny_imagenet import (  # noqa: E402
     TinyImageNetDataConfig,
@@ -29,7 +28,6 @@ from jepa.data.images.tiny_imagenet import (  # noqa: E402
 from jepa.training.images.ijepa_spatial import (  # noqa: E402
     MaskConfig,
     build_spatial_ijepa_core_from_metadata,
-    encode_samples_pooled,
     load_spatial_checkpoint,
     normalize_ijepa_images,
     sample_masks,
@@ -52,9 +50,6 @@ FUNCTIONAL_SLUG = {
     functional: functional.removeprefix("predictive-").replace("-", "_")
     for functional in RICHNESS_FUNCTIONALS
 }
-PROBE_RIDGE = 1.0e-6
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
@@ -62,6 +57,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-candidates", type=int, default=256)
     parser.add_argument("--candidate-batch-size", type=int, default=128)
+    parser.add_argument(
+        "--mask-repeats",
+        type=int,
+        default=1,
+        help="Repeat every candidate with independently sampled JEPA masks.",
+    )
     parser.add_argument("--virtual-steps", type=int, default=3)
     parser.add_argument(
         "--virtual-optimizer",
@@ -90,6 +91,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-size", type=int, default=1024)
     parser.add_argument("--probe-train-size", type=int, default=5000)
     parser.add_argument("--probe-test-size", type=int, default=1000)
+    parser.add_argument("--probe-validation-size", type=int, default=1000)
+    parser.add_argument("--probe-epochs", type=int, default=30)
+    parser.add_argument("--probe-batch-size", type=int, default=1024)
+    parser.add_argument("--probe-learning-rate", type=float, default=1.0e-2)
+    parser.add_argument("--probe-weight-decay", type=float, default=0.0)
     parser.add_argument("--encode-batch-size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
@@ -132,7 +138,7 @@ def autocast(device: torch.device, dtype: torch.dtype | None):
 
 
 def encode_pooled(
-    core,
+    encoder: torch.nn.Module,
     images: torch.Tensor,
     *,
     device: torch.device,
@@ -140,23 +146,83 @@ def encode_pooled(
     amp_dtype: torch.dtype | None,
 ) -> torch.Tensor:
     chunks = []
-    core.context_encoder.eval()
+    encoder.eval()
     with torch.inference_mode():
         for batch in images.split(batch_size):
             with autocast(device, amp_dtype):
                 chunks.append(
-                    encode_samples_pooled(core, batch.to(device, non_blocking=True))
-                    .float()
-                    .cpu()
+                    encoder(batch.to(device, non_blocking=True)).mean(dim=1).float().cpu()
                 )
     return torch.cat(chunks)
 
 
-def probe_metrics(classifier, features: torch.Tensor, labels: torch.Tensor) -> tuple[float, float]:
-    scores = classifier.probe.predict(features).float()
+def probe_metrics(
+    head: torch.nn.Module,
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    device: torch.device,
+    batch_size: int,
+) -> tuple[float, float]:
+    head.eval()
+    scores = []
+    with torch.inference_mode():
+        for batch in features.split(batch_size):
+            scores.append(head(batch.to(device, non_blocking=True)).float().cpu())
+    scores = torch.cat(scores)
     loss = F.cross_entropy(scores, labels).item()
     accuracy = scores.argmax(dim=-1).eq(labels).float().mean().item()
     return loss, accuracy
+
+
+def train_linear_probe(
+    train_features: torch.Tensor,
+    train_labels: torch.Tensor,
+    validation_features: torch.Tensor,
+    validation_labels: torch.Tensor,
+    *,
+    num_classes: int,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> torch.nn.Linear:
+    head = torch.nn.Linear(train_features.shape[1], num_classes).to(device)
+    optimizer = torch.optim.AdamW(
+        head.parameters(),
+        lr=args.probe_learning_rate,
+        weight_decay=args.probe_weight_decay,
+    )
+    generator = torch.Generator().manual_seed(derive_seed(args.seed, "probe-head"))
+    best_loss = math.inf
+    best_state = None
+    for _ in range(args.probe_epochs):
+        head.train()
+        order = torch.randperm(len(train_features), generator=generator)
+        for indices in order.split(args.probe_batch_size):
+            optimizer.zero_grad(set_to_none=True)
+            logits = head(train_features[indices].to(device, non_blocking=True))
+            loss = F.cross_entropy(
+                logits,
+                train_labels[indices].to(device, non_blocking=True),
+            )
+            loss.backward()
+            optimizer.step()
+        validation_loss, _ = probe_metrics(
+            head,
+            validation_features,
+            validation_labels,
+            device=device,
+            batch_size=args.probe_batch_size,
+        )
+        if validation_loss < best_loss:
+            best_loss = validation_loss
+            best_state = {
+                name: value.detach().cpu().clone()
+                for name, value in head.state_dict().items()
+            }
+    assert best_state is not None
+    head.load_state_dict(best_state)
+    head.requires_grad_(False)
+    return head
 
 
 def optimizer_for_checkpoint(core, checkpoint: dict[str, Any]) -> torch.optim.AdamW:
@@ -411,10 +477,14 @@ def main() -> None:
     if min(
         args.num_candidates,
         args.candidate_batch_size,
+        args.mask_repeats,
         args.virtual_steps,
         args.reference_size,
         args.probe_train_size,
+        args.probe_validation_size,
         args.probe_test_size,
+        args.probe_epochs,
+        args.probe_batch_size,
     ) <= 0:
         raise ValueError("all audit sizes and --virtual-steps must be positive")
     if not math.isfinite(args.sgd_learning_rate) or args.sgd_learning_rate <= 0:
@@ -429,8 +499,13 @@ def main() -> None:
     data_config = TinyImageNetDataConfig(**config["tiny_imagenet"]["data"])
     datasets = build_tiny_imagenet_static_dataset_splits(data_config)
     train_images = normalize_ijepa_images(datasets.train.images, inplace=True)
+    validation_images = normalize_ijepa_images(
+        datasets.validation.images,
+        inplace=True,
+    )
     test_images = normalize_ijepa_images(datasets.test.images, inplace=True)
     train_labels = datasets.train.entities
+    validation_labels = datasets.validation.entities
     test_labels = datasets.test.entities
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -480,33 +555,55 @@ def main() -> None:
         len(test_images),
         generator=torch.Generator().manual_seed(derive_seed(args.seed, "probe-test")),
     )[: args.probe_test_size]
+    validation_indices = torch.randperm(
+        len(validation_images),
+        generator=torch.Generator().manual_seed(
+            derive_seed(args.seed, "probe-validation")
+        ),
+    )[: args.probe_validation_size]
     reference_images = train_images[reference_indices].to(device)
+    probe_validation_images = validation_images[validation_indices]
+    probe_validation_labels = validation_labels[validation_indices]
     probe_test_images = test_images[test_indices]
     probe_test_labels = test_labels[test_indices]
     mask_seed = derive_seed(args.seed, "audit-richness")
 
     train_z = encode_pooled(
-        core,
+        core.target_encoder,
         train_images[probe_indices],
         device=device,
         batch_size=args.encode_batch_size,
         amp_dtype=amp_dtype,
     )
+    validation_z = encode_pooled(
+        core.target_encoder,
+        probe_validation_images,
+        device=device,
+        batch_size=args.encode_batch_size,
+        amp_dtype=amp_dtype,
+    )
     test_z = encode_pooled(
-        core,
+        core.target_encoder,
         probe_test_images,
         device=device,
         batch_size=args.encode_batch_size,
         amp_dtype=amp_dtype,
     )
-    classifier = fit_entity_classifier(
+    classifier = train_linear_probe(
         train_z,
         train_labels[probe_indices],
-        data_config.num_entities,
-        ridge=PROBE_RIDGE,
+        validation_z,
+        probe_validation_labels,
+        num_classes=data_config.num_entities,
+        args=args,
+        device=device,
     )
     base_probe_loss, base_probe_accuracy = probe_metrics(
-        classifier, test_z, probe_test_labels
+        classifier,
+        test_z,
+        probe_test_labels,
+        device=device,
+        batch_size=args.probe_batch_size,
     )
 
     encoder_parameters = tuple(
@@ -554,10 +651,14 @@ def main() -> None:
     if records_path.exists():
         for line in records_path.read_text().splitlines():
             record = json.loads(line)
-            completed[int(record["candidate"])] = record
+            key = (int(record["candidate"]), int(record.get("mask_repeat", 0)))
+            completed[key] = record
 
-    for candidate, indices in enumerate(candidate_indices):
-        if candidate in completed:
+    num_trials = args.num_candidates * args.mask_repeats
+    for trial in range(num_trials):
+        candidate, mask_repeat = divmod(trial, args.mask_repeats)
+        key = (candidate, mask_repeat)
+        if key in completed:
             continue
         restore_module_state(core.context_encoder, base_context)
         restore_module_state(core.predictor, base_predictor)
@@ -567,9 +668,9 @@ def main() -> None:
         core.context_encoder.train()
         core.predictor.train()
         core.target_encoder.train()
-        batch = train_images[indices].to(device)
+        batch = train_images[candidate_indices[candidate]].to(device)
         score_generator = torch.Generator().manual_seed(
-            derive_seed(args.seed, "candidate-score", candidate)
+            derive_seed(args.seed, "candidate-score", candidate, mask_repeat)
         )
         score_context_masks, score_target_masks = sample_masks(
             grid,
@@ -619,7 +720,13 @@ def main() -> None:
                 context_masks, target_masks = score_context_masks, score_target_masks
             else:
                 step_generator = torch.Generator().manual_seed(
-                    derive_seed(args.seed, "candidate-step", candidate, virtual_step)
+                    derive_seed(
+                        args.seed,
+                        "candidate-step",
+                        candidate,
+                        mask_repeat,
+                        virtual_step,
+                    )
                 )
                 context_masks, target_masks = sample_masks(
                     grid,
@@ -654,24 +761,34 @@ def main() -> None:
                     ).item()
                 )
         post_test_z = encode_pooled(
-            core,
+            core.target_encoder,
             probe_test_images,
             device=device,
             batch_size=args.encode_batch_size,
             amp_dtype=amp_dtype,
         )
         post_probe_loss, post_probe_accuracy = probe_metrics(
-            classifier, post_test_z, probe_test_labels
+            classifier,
+            post_test_z,
+            probe_test_labels,
+            device=device,
+            batch_size=args.probe_batch_size,
         )
         record = {
             "candidate": candidate,
+            "mask_repeat": mask_repeat,
             "jepa_loss": float(candidate_loss.detach().item()),
             "gradient_norm": candidate_gradient_norm,
             "random_score": float(
                 torch.rand(
                     (),
                     generator=torch.Generator().manual_seed(
-                        derive_seed(args.seed, "random-score", candidate)
+                        derive_seed(
+                            args.seed,
+                            "random-score",
+                            candidate,
+                            mask_repeat,
+                        )
                     ),
                 ).item()
             ),
@@ -692,9 +809,10 @@ def main() -> None:
             )
         with records_path.open("a") as stream:
             stream.write(json.dumps(record) + "\n")
-        completed[candidate] = record
+        completed[key] = record
         print(
             f"candidate={candidate + 1}/{args.num_candidates} "
+            f"mask_repeat={mask_repeat + 1}/{args.mask_repeats} "
             f"{FUNCTIONAL_SLUG[args.richness_functionals[0]]}_cos="
             f"{alignments[args.richness_functionals[0]][1]:.4f} "
             f"dR={record['delta_richness_' + FUNCTIONAL_SLUG[args.richness_functionals[0]]]:.4g} "
@@ -702,7 +820,7 @@ def main() -> None:
             flush=True,
         )
 
-    records = [completed[index] for index in sorted(completed)]
+    records = [completed[key] for key in sorted(completed)]
     summary = {
         "checkpoint": str(checkpoint_path),
         "config": vars(args) | {"run_dir": str(run_dir), "output_dir": str(output_dir)},
