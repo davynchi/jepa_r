@@ -19,7 +19,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
-from jepa.analysis.subspace import compute_latent_spectrum  # noqa: E402
+from jepa.analysis.subspace import (  # noqa: E402
+    classifier_accuracy,
+    compute_latent_spectrum,
+    fit_entity_classifier,
+)
 from jepa.configs.base import derive_seed  # noqa: E402
 from jepa.configs.images.shapes3d import (  # noqa: E402
     load_shapes3d_config,
@@ -103,6 +107,8 @@ EVAL_EVERY_EPOCHS = 10
 CHECKPOINT_EVERY_EPOCHS = 50
 CHECKPOINT_EVERY_STEPS = 0
 LOG_EVERY_STEPS = 25
+PROBE_EVERY_EPOCHS = 50
+PROBE_RIDGE = 1.0e-6
 OUTPUT_ROOT = Path(__file__).resolve().parents[2] / "outputs" / "ijepa_spatial"
 
 
@@ -152,6 +158,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-val-samples", type=int, default=1000)
     parser.add_argument("--num-test-samples", type=int, default=1000)
     parser.add_argument("--eval-every-epochs", type=int, default=EVAL_EVERY_EPOCHS)
+    parser.add_argument(
+        "--probe-every-epochs",
+        type=int,
+        default=PROBE_EVERY_EPOCHS,
+        help="Fit and evaluate a frozen-encoder linear probe at this epoch cadence; 0 disables",
+    )
+    parser.add_argument(
+        "--probe-train-size",
+        type=int,
+        default=0,
+        help="Number of train samples used by the linear probe; 0 uses the full train split",
+    )
+    parser.add_argument(
+        "--probe-test-size",
+        type=int,
+        default=0,
+        help="Number of test samples used by the linear probe; 0 uses the full test split",
+    )
+    parser.add_argument("--probe-ridge", type=float, default=PROBE_RIDGE)
     parser.add_argument("--checkpoint-every-epochs", type=int, default=CHECKPOINT_EVERY_EPOCHS)
     parser.add_argument(
         "--checkpoint-every-steps",
@@ -368,6 +393,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--mask-prefetch-factor must be positive")
     if args.mask_min_keep < 0:
         raise ValueError("--mask-min-keep must be non-negative")
+    if args.probe_every_epochs < 0:
+        raise ValueError("--probe-every-epochs must be non-negative")
+    if args.probe_train_size < 0 or args.probe_test_size < 0:
+        raise ValueError("probe split sizes must be non-negative")
+    if args.probe_ridge <= 0:
+        raise ValueError("--probe-ridge must be positive")
 
 
 def _init_upstream_optimizer(
@@ -610,6 +641,64 @@ def _encode_images_pooled(
     return torch.cat(encoded, dim=0)
 
 
+def _select_probe_subset(
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    size: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if size == 0 or size >= labels.shape[0]:
+        return images, labels
+    indices = torch.randperm(
+        labels.shape[0],
+        generator=torch.Generator().manual_seed(seed),
+    )[:size]
+    return images[indices.to(images.device)], labels[indices]
+
+
+def _topk_accuracy(scores: torch.Tensor, labels: torch.Tensor, *, k: int) -> float:
+    topk = scores.topk(min(k, scores.shape[-1]), dim=-1).indices
+    return topk.eq(labels.unsqueeze(-1)).any(dim=-1).to(torch.float64).mean().item()
+
+
+def _evaluate_linear_probe(
+    core,
+    *,
+    train_images: torch.Tensor,
+    train_labels: torch.Tensor,
+    test_images: torch.Tensor,
+    test_labels: torch.Tensor,
+    num_classes: int,
+    batch_size: int,
+    device: torch.device,
+    ridge: float,
+) -> tuple[float, float]:
+    train_z = _encode_images_pooled(
+        core,
+        train_images,
+        batch_size=batch_size,
+        device=device,
+    )
+    test_z = _encode_images_pooled(
+        core,
+        test_images,
+        batch_size=batch_size,
+        device=device,
+    )
+    classifier = fit_entity_classifier(
+        train_z,
+        train_labels,
+        num_classes,
+        ridge=ridge,
+    )
+    scores = classifier.probe.predict(test_z)
+    return (
+        classifier_accuracy(classifier, test_z, test_labels),
+        _topk_accuracy(scores, test_labels, k=5),
+    )
+
+
 def main() -> None:
     args = _parse_args()
     _validate_args(args)
@@ -730,6 +819,10 @@ def main() -> None:
                 "dataset": args.dataset,
                 "data_source": f"{args.dataset}_images",
                 "eval_every_epochs": args.eval_every_epochs,
+                "probe_every_epochs": args.probe_every_epochs,
+                "probe_train_size": args.probe_train_size,
+                "probe_test_size": args.probe_test_size,
+                "probe_ridge": args.probe_ridge,
                 "checkpoint_every_epochs": args.checkpoint_every_epochs,
                 "checkpoint_every_steps": args.checkpoint_every_steps,
                 "log_every_steps": args.log_every_steps,
@@ -779,6 +872,9 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
 
     train_paths = list(datasets.train.paths) if args.dataset == "mini-webvision" else None
+    train_labels = datasets.train.entities.detach().cpu().to(torch.long)
+    test_labels = datasets.test.entities.detach().cpu().to(torch.long)
+    num_classes = int(max(train_labels.max().item(), test_labels.max().item()) + 1)
     if args.dataset == "mini-webvision":
         train_images = datasets.train.images
         test_images = datasets.test.images
@@ -821,6 +917,25 @@ def main() -> None:
                 transform_pair_images[0].to(device),
                 transform_pair_images[1].to(device),
             )
+    probe_enabled = args.probe_every_epochs > 0 and train_paths is None
+    if args.probe_every_epochs > 0 and not probe_enabled:
+        print(
+            "inline linear probing is disabled for file-backed Mini-WebVision",
+            flush=True,
+        )
+    if probe_enabled:
+        probe_train_images, probe_train_labels = _select_probe_subset(
+            train_images,
+            train_labels,
+            size=args.probe_train_size,
+            seed=derive_seed(args.seed, "linear-probe-train"),
+        )
+        probe_test_images, probe_test_labels = _select_probe_subset(
+            test_images,
+            test_labels,
+            size=args.probe_test_size,
+            seed=derive_seed(args.seed, "linear-probe-test"),
+        )
     print(
         f"run_dir={run_dir}\n"
         f"dataset={args.dataset} model={args.model_name} device={device} "
@@ -1369,6 +1484,41 @@ def main() -> None:
                     f"effective_rank={spectrum.effective_rank:6.3f} "
                     f"trace_cov={spectrum.trace_covariance:9.4f} "
                     f"elapsed={time.time() - start:.0f}s",
+                    flush=True,
+                )
+            if (
+                probe_enabled
+                and args.probe_every_epochs > 0
+                and epoch % args.probe_every_epochs == 0
+            ):
+                probe_started = time.time()
+                class_accuracy, class_top5_accuracy = _evaluate_linear_probe(
+                    core,
+                    train_images=probe_train_images,
+                    train_labels=probe_train_labels,
+                    test_images=probe_test_images,
+                    test_labels=probe_test_labels,
+                    num_classes=num_classes,
+                    batch_size=args.batch_size,
+                    device=device,
+                    ridge=args.probe_ridge,
+                )
+                probe_seconds = time.time() - probe_started
+                logger.log(
+                    step=global_step,
+                    epoch=epoch,
+                    event="linear_probe",
+                    scalars={
+                        "diag/class_accuracy": class_accuracy,
+                        "diag/class_top5_accuracy": class_top5_accuracy,
+                        "diag/probe_seconds": probe_seconds,
+                        "diag/probe_train_samples": float(probe_train_labels.shape[0]),
+                        "diag/probe_test_samples": float(probe_test_labels.shape[0]),
+                    },
+                )
+                print(
+                    f"epoch={epoch:4d} linear_probe_top1={class_accuracy:.4f} "
+                    f"top5={class_top5_accuracy:.4f} seconds={probe_seconds:.1f}",
                     flush=True,
                 )
             if (
