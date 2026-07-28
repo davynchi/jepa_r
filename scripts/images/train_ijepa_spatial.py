@@ -992,7 +992,12 @@ def main() -> None:
             },
         }
     )
-    device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "--device cuda was requested, but CUDA is unavailable. "
+            "Attach a GPU compute configuration before starting training."
+        )
+    device = torch.device(args.device)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
