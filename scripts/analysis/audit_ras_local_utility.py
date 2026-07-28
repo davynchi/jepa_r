@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--virtual-steps", type=int, default=3)
     parser.add_argument(
+        "--step-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiply every virtual optimizer learning rate by this factor.",
+    )
+    parser.add_argument(
         "--virtual-optimizer",
         choices=("adamw", "sgd-small"),
         default="adamw",
@@ -633,6 +639,8 @@ def main() -> None:
         raise ValueError("all audit sizes and --virtual-steps must be positive")
     if not math.isfinite(args.sgd_learning_rate) or args.sgd_learning_rate <= 0:
         raise ValueError("--sgd-learning-rate must be finite and positive")
+    if not math.isfinite(args.step_multiplier) or args.step_multiplier <= 0:
+        raise ValueError("--step-multiplier must be finite and positive")
     for name in ("probe_learning_rate", "mlp_learning_rate", "probe_ridge"):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
@@ -684,6 +692,8 @@ def main() -> None:
             tuple(core.context_encoder.parameters()) + tuple(core.predictor.parameters()),
             lr=args.sgd_learning_rate,
         )
+    for parameter_group in optimizer.param_groups:
+        parameter_group["lr"] *= args.step_multiplier
     grid = int(spatial_config["image_size"]) // int(spatial_config["patch_size"])
     min_keep = int(spatial_config.get("mask_min_keep") or (10 if grid >= 16 else 4))
     mask_config = MaskConfig(min_keep=min_keep)
@@ -774,6 +784,13 @@ def main() -> None:
         )
         for name, probe in probes.items()
     }
+    base_reference_features = encode_pooled(
+        core.context_encoder,
+        reference_images,
+        device=device,
+        batch_size=args.encode_batch_size,
+        amp_dtype=amp_dtype,
+    )
 
     encoder_parameters = tuple(
         parameter for parameter in core.context_encoder.parameters() if parameter.requires_grad
@@ -939,6 +956,31 @@ def main() -> None:
             )
             for encoder_name in args.probe_encoders
         }
+        post_reference_features = encode_pooled(
+            core.context_encoder,
+            reference_images,
+            device=device,
+            batch_size=args.encode_batch_size,
+            amp_dtype=amp_dtype,
+        )
+        reference_difference = post_reference_features - base_reference_features
+        representation_drift = float(
+            reference_difference.float().square().mean().sqrt().item()
+        )
+        normalized_base_reference = F.normalize(base_reference_features.float(), dim=1)
+        normalized_post_reference = F.normalize(post_reference_features.float(), dim=1)
+        representation_cosine_drift = float(
+            (1.0 - (normalized_base_reference * normalized_post_reference).sum(dim=1))
+            .mean()
+            .item()
+        )
+        with torch.no_grad(), autocast(device, amp_dtype):
+            post_candidate_loss = spatial_ijepa_loss(
+                core,
+                batch,
+                score_context_masks,
+                score_target_masks,
+            )
         post_probe_metrics = {
             name: probe_metrics(
                 probe,
@@ -952,8 +994,15 @@ def main() -> None:
         record = {
             "candidate": candidate,
             "mask_repeat": mask_repeat,
+            "step_multiplier": args.step_multiplier,
             "jepa_loss": float(candidate_loss.detach().item()),
+            "post_jepa_loss": float(post_candidate_loss.detach().item()),
+            "jepa_loss_improvement": float(
+                candidate_loss.detach().item() - post_candidate_loss.detach().item()
+            ),
             "gradient_norm": candidate_gradient_norm,
+            "representation_drift": representation_drift,
+            "representation_cosine_drift": representation_cosine_drift,
             "random_score": float(
                 torch.rand(
                     (),
@@ -994,6 +1043,12 @@ def main() -> None:
             record[f"delta_richness_{slug}"] = (
                 post_richness[functional] - base_richness[functional]
             )
+            if functional in optimizer_alignments and args.virtual_steps == 1:
+                predicted_delta = optimizer_alignments[functional][0]
+                record[f"predicted_delta_richness_{slug}"] = predicted_delta
+                record[f"taylor_remainder_{slug}"] = (
+                    record[f"delta_richness_{slug}"] - predicted_delta
+                )
         with records_path.open("a") as stream:
             stream.write(json.dumps(record) + "\n")
         completed[key] = record
