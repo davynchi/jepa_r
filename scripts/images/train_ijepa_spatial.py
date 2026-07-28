@@ -998,6 +998,11 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
 
     train_paths = list(datasets.train.paths) if args.dataset == "mini-webvision" else None
+    official_barlow_paths = (
+        list(datasets.train.paths)
+        if hasattr(datasets.train, "paths")
+        else None
+    )
     train_labels = datasets.train.entities.detach().cpu().to(torch.long)
     test_labels = datasets.test.entities.detach().cpu().to(torch.long)
     num_classes = int(max(train_labels.max().item(), test_labels.max().item()) + 1)
@@ -1084,7 +1089,7 @@ def main() -> None:
     official_barlow_loader: DataLoader | None = None
     official_barlow_iterator = None
     if args.official_barlow_weight > 0:
-        if train_paths is None:
+        if official_barlow_paths is None:
             raise ValueError(
                 "official-style Barlow regularization requires a file-backed image dataset"
             )
@@ -1094,7 +1099,7 @@ def main() -> None:
             redundancy_weight=args.official_barlow_lambda,
         ).to(device)
         official_barlow_loader = DataLoader(
-            BarlowImageDataset(train_paths, image_size=args.image_size),
+            BarlowImageDataset(official_barlow_paths, image_size=args.image_size),
             batch_size=args.official_barlow_batch_size,
             shuffle=True,
             drop_last=True,
