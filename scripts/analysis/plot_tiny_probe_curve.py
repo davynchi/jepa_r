@@ -17,7 +17,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--uniform-probe-root", type=Path, required=True)
     parser.add_argument("--uniform-metrics", type=Path)
-    parser.add_argument("--ras-metrics", type=Path, required=True)
+    parser.add_argument("--ras-metrics", type=Path)
+    parser.add_argument("--ras-probe-root", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -26,7 +27,9 @@ def load_uniform(root: Path) -> dict[int, tuple[float, float]]:
     points = {}
     for path in sorted(root.glob("epoch_*/results.json")):
         payload = json.loads(path.read_text())
-        metrics = payload["probes"]["context/ridge"]
+        metrics = payload.get("probes", {}).get("context/ridge")
+        if metrics is None:
+            continue
         points[int(payload["checkpoint_epoch"])] = (
             float(metrics["top1"]),
             float(metrics["top5"]),
@@ -50,12 +53,17 @@ def load_ras(path: Path) -> dict[int, tuple[float, float]]:
 
 def main() -> None:
     args = parse_args()
+    if args.ras_metrics is None and args.ras_probe_root is None:
+        raise ValueError("one of --ras-metrics or --ras-probe-root is required")
     uniform = load_uniform(args.uniform_probe_root)
     if args.uniform_metrics is not None:
         uniform.update(load_ras(args.uniform_metrics))
+    ras = load_uniform(args.ras_probe_root) if args.ras_probe_root is not None else {}
+    if args.ras_metrics is not None:
+        ras.update(load_ras(args.ras_metrics))
     series = {
         "Uniform": uniform,
-        "Predictive-Barlow RAS": load_ras(args.ras_metrics),
+        "Predictive-Barlow RAS": ras,
     }
     figure, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharex=True)
     for label, points in series.items():
