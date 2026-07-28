@@ -1,0 +1,34 @@
+schema_version: 1
+manifest_seed: 58031
+training:
+  device: mps
+  batch_size: 128
+  num_train_samples: 16000
+  num_val_samples: 1000
+  num_test_samples: 1000
+  checkpoint_every_epochs: 25
+phases:
+  pilot:
+    replicates: 1
+    epochs: 100
+    seed_namespace: shapes3d-quality-pilot
+    caps:
+      gpu_hours: 8
+      cpu_hours: 16
+      storage_gib: 50
+  discovery:
+    replicates: 5
+    epochs: 1500
+    seed_namespace: shapes3d-quality-discovery
+    caps:
+      gpu_hours: 240
+      cpu_hours: 400
+      storage_gib: 500
+  replication:
+    replicates: 5
+    epochs: 1500
+    seed_namespace: shapes3d-quality-replication
+    caps:
+      gpu_hours: 240
+      cpu_hours: 400
+      storage_gib: 500

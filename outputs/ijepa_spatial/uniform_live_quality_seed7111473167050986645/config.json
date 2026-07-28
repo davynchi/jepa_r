@@ -1,0 +1,121 @@
+{
+  "config": {
+    "data": {
+      "context_step_max": 1,
+      "context_step_probability": 0.7,
+      "counterfactual_seed": 4000,
+      "entity_switch_probability": 0.05,
+      "h5_path": "data/3dshapes.h5",
+      "num_test_samples": 1000,
+      "num_test_trajectories": 60,
+      "num_train_samples": 16000,
+      "num_train_trajectories": 300,
+      "num_val_samples": 1000,
+      "num_val_trajectories": 60,
+      "test_sample_seed": 3000,
+      "train_sample_seed": 1000,
+      "trajectory_length": 16,
+      "validation_sample_seed": 2000
+    },
+    "evaluation": {
+      "autocorrelation_max_lag": 8,
+      "counterfactual_pairs": 100,
+      "covariance_epsilon": 1e-06,
+      "entity_subspace_dims": [
+        1,
+        2,
+        3
+      ],
+      "probe_ridge": 1e-06,
+      "selectivity_alpha": 1.0
+    },
+    "hierarchical": {
+      "epsilon": 1e-06,
+      "lambda_context": 1.0,
+      "lambda_cross": 1.0,
+      "lambda_entity": 1.0,
+      "lambda_var": 1.0,
+      "long_horizon": 8,
+      "short_horizon": 1,
+      "use_cross_cov_reg": true,
+      "use_horizon_split": true,
+      "use_variance_reg": true,
+      "variance_gamma": 1.0
+    },
+    "model": {
+      "architecture": "linear",
+      "context_latent_dim": 4,
+      "entity_latent_dim": 4,
+      "hidden_dim": 64,
+      "hidden_layers": 1,
+      "kind": "standard",
+      "latent_dim": 8
+    },
+    "output": {
+      "overwrite": true,
+      "root": "outputs/images/shapes3d/quick"
+    },
+    "training": {
+      "batch_size": 32,
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "checkpoint_every_epochs": 5,
+      "device": "mps",
+      "ema": {
+        "decay": 0.99,
+        "enabled": true
+      },
+      "epochs": 5,
+      "epsilon": 1e-08,
+      "evaluation_every_epochs": 1,
+      "learning_rate": 0.001,
+      "prediction_horizon": 1,
+      "seed": 0,
+      "stop_gradient": true,
+      "target_pairing": "temporal"
+    }
+  },
+  "spatial": {
+    "architecture": "cnn",
+    "batch_size": 128,
+    "checkpoint_every_epochs": 100,
+    "checkpoint_every_steps": 0,
+    "data_source": "static_shapes3d_images",
+    "dataset": "shapes3d",
+    "ema_decay": 0.99,
+    "epochs": 100,
+    "eval_every_epochs": 100,
+    "learning_rate": 0.001,
+    "log_every_steps": 25,
+    "online_quality": {
+      "enabled": true,
+      "every_epochs": 1,
+      "feature_batch_size": 128,
+      "manifest_seed": 58031,
+      "source_kind": "live_epoch"
+    },
+    "patch_latent_dim": 16,
+    "patch_size": 8,
+    "resident_device_data": false,
+    "seed": 0,
+    "weighting": {
+      "coordinate_delta": 1e-06,
+      "coordinate_ema_beta": 0.1,
+      "coordinate_importance": "covariance",
+      "method": "uniform",
+      "ref_size": 1024,
+      "replay_beta": 1.0,
+      "richness_delta": 0.0001,
+      "richness_functional": "logdet",
+      "richness_trace_beta": 0.01,
+      "richness_trace_target": 1.0,
+      "score_batch_size": 0,
+      "temperature": 1.0,
+      "uniform_mix": 0.05,
+      "update_every_epochs": 1,
+      "warmup_epochs": 0
+    }
+  }
+}

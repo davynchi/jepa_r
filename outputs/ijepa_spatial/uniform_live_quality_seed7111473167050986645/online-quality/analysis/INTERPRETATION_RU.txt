@@ -1,0 +1,68 @@
+ИНТЕРПРЕТАЦИЯ ONLINE Q-МЕТРИК SHAPES3D
+
+Наблюдения: 100 эпох (1–100).
+Sampling: uniform. Каждая точка соответствует одной эпохе одной training trajectory.
+
+Пирсон r измеряет линейную связь. Спирмен rho измеряет монотонную ранговую связь.
+Эпохи не являются независимыми наблюдениями, поэтому коэффициенты описательные:
+обычные iid p-values для этого запуска не интерпретируются.
+
+Сильнейшие связи с accuracy по Пирсону:
+  Q18: r=-0.882, n=85
+  Q1: r=-0.854, n=85
+  Q2: r=-0.854, n=85
+  Q20: r=+0.797, n=85
+  Q10: r=+0.775, n=85
+  Q16: r=+0.629, n=73
+  Q19a: r=+0.559, n=85
+  Q7: r=+0.526, n=85
+
+Сильнейшие связи с accuracy по Спирмену:
+  Q18: rho=-0.899, n=85
+  Q15: rho=+0.866, n=76
+  Q1: rho=-0.862, n=85
+  Q2: rho=-0.862, n=85
+  Q10: rho=+0.849, n=85
+  Q20: rho=+0.840, n=85
+  Q16: rho=+0.662, n=73
+  Q5: rho=+0.658, n=79
+
+Сильнейшие связи с held-out JEPA loss по Пирсону:
+  Q17: r=-0.983, n=85
+  Q19a: r=+0.936, n=85
+  Q14: r=+0.834, n=85
+  Q19b: r=+0.806, n=85
+  Q10: r=+0.795, n=85
+  Q2: r=-0.631, n=85
+  Q1: r=-0.631, n=85
+  Q18: r=-0.554, n=85
+
+Сильнейшие связи с held-out JEPA loss по Спирмену:
+  Q15: rho=+0.750, n=76
+  Q1: rho=-0.663, n=85
+  Q2: rho=-0.663, n=85
+  Q19a: rho=+0.634, n=85
+  Q10: rho=+0.629, n=85
+  Q18: rho=-0.602, n=85
+  Q20: rho=+0.546, n=85
+  Q19b: rho=+0.482, n=85
+
+Пропуски:
+  degenerate_partition: 345
+  no_previous_epoch: 30
+
+Timing исключает эпоху 1 как warm-up. GPU/MPS стадии синхронизируются до и после
+измерения. Общие зависимости не приписываются повторно каждому Q.
+
+Median train epoch: 8.331597125 s
+Median all-Q diagnostics: 33.404572375 s
+Median label-free factorization: 0.001861666 s
+Median supervised factorization: 0.002170875 s
+
+Файлы:
+  correlations.csv/json
+  epoch_quality_values.csv
+  timing_summary.csv/png
+  timing_by_epoch.png
+  quality_vs_accuracy_page_1..3.png
+  quality_vs_loss_page_1..3.png

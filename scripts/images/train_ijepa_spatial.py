@@ -11,20 +11,36 @@ not depend on the frames being related in time.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import torch  # noqa: E402
 
+from jepa.analysis.quality_features import LiveSpatialAdapter  # noqa: E402
+from jepa.analysis.quality_manifests import (  # noqa: E402
+    QualitySplitManifest,
+    build_quality_manifest,
+)
+from jepa.analysis.quality_metrics import METRIC_SPEC_BY_NAME  # noqa: E402
+from jepa.analysis.quality_store import QualityStore  # noqa: E402
+from jepa.analysis.quality_timing import (  # noqa: E402
+    QualityTimingRecorder,
+    isolated_quality_evaluation,
+    synchronize_device,
+)
 from jepa.analysis.subspace import compute_latent_spectrum  # noqa: E402
 from jepa.configs.base import derive_seed  # noqa: E402
 from jepa.configs.images.shapes3d import (  # noqa: E402
     load_shapes3d_config,
+    shapes3d_config_identity_hash,
     shapes3d_config_to_dict,
 )
 from jepa.data.images.shapes3d import (  # noqa: E402
@@ -51,8 +67,8 @@ from jepa.training.images.spatial_curriculum import (  # noqa: E402
     SpatialWeightingState,
     init_spatial_weighting,
     sample_frame_indices,
-    score_frames_by_loss,
     score_frames_by_coordinate_importance,
+    score_frames_by_loss,
     score_frames_by_ras,
     select_reference_indices,
     should_update_weights,
@@ -63,6 +79,15 @@ from jepa.training.images.spatial_curriculum import (  # noqa: E402
 from jepa.training.images.spatial_logging import (  # noqa: E402
     SpatialRunLogger,
     eigenvalue_scalars,
+)
+from scripts.analysis.evaluate_spatial_quality import (  # noqa: E402
+    _evaluate_checkpoint as evaluate_quality_observation,
+)
+from scripts.analysis.evaluate_spatial_quality import (  # noqa: E402
+    _heldout_loss as quality_heldout_loss,
+)
+from scripts.analysis.evaluate_spatial_quality import (  # noqa: E402
+    _write_checkpoint_loss as write_quality_loss,
 )
 
 ARCHITECTURE = "cnn"
@@ -88,7 +113,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
     parser.add_argument("--dataset", choices=("shapes3d", "tiny-imagenet"), default="shapes3d")
     parser.add_argument("--tiny-imagenet-root", default="data/tiny-imagenet-200")
     parser.add_argument("--num-train-samples", type=int, default=16000)
@@ -148,12 +173,44 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--coordinate-ema-beta", type=float, default=0.1)
     parser.add_argument("--coordinate-delta", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--online-quality",
+        action="store_true",
+        help="Evaluate every registered Q metric directly from the live model after each epoch",
+    )
+    parser.add_argument(
+        "--online-quality-every-epochs",
+        type=int,
+        default=1,
+        help="Live quality cadence; the 100-epoch study uses 1",
+    )
+    parser.add_argument(
+        "--online-quality-root",
+        default=None,
+        help="Defaults to RUN_DIR/online-quality",
+    )
+    parser.add_argument("--online-quality-manifest-seed", type=int, default=58_031)
+    parser.add_argument("--online-quality-feature-batch-size", type=int, default=128)
     return parser.parse_args()
 
 
 def _default_run_name(seed: int) -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     return f"spatial_ijepa_cnn_seed{seed}_{stamp}"
+
+
+def _resolve_device(requested: str) -> torch.device:
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable")
+    if requested == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested but is unavailable")
+    return torch.device(requested)
 
 
 def _checkpoint_metadata(args: argparse.Namespace, run_dir: Path) -> dict[str, object]:
@@ -211,7 +268,9 @@ def _restore_weighting_state(
     else:
         coordinate_importance = None
     if isinstance(coordinate_previous_ref_latents, torch.Tensor):
-        coordinate_previous_ref_latents = coordinate_previous_ref_latents.detach().cpu().to(torch.float64)
+        coordinate_previous_ref_latents = (
+            coordinate_previous_ref_latents.detach().cpu().to(torch.float64)
+        )
     else:
         coordinate_previous_ref_latents = None
 
@@ -274,6 +333,15 @@ def _encode_patches_pooled(
 
 def main() -> None:
     args = _parse_args()
+    if args.online_quality:
+        if args.dataset != "shapes3d":
+            raise ValueError("--online-quality currently requires --dataset shapes3d")
+        if args.weighting_method != "uniform":
+            raise ValueError("--online-quality requires --weighting-method uniform")
+        if args.online_quality_every_epochs <= 0:
+            raise ValueError("--online-quality-every-epochs must be positive")
+        if args.online_quality_feature_batch_size <= 0:
+            raise ValueError("--online-quality-feature-batch-size must be positive")
     run_name = args.run_name or _default_run_name(args.seed)
     run_dir = Path(args.output_root).expanduser().resolve() / run_name
     checkpoint_dir = run_dir / "checkpoints"
@@ -350,6 +418,13 @@ def main() -> None:
                 "checkpoint_every_steps": args.checkpoint_every_steps,
                 "log_every_steps": args.log_every_steps,
                 "resident_device_data": args.resident_device_data,
+                "online_quality": {
+                    "enabled": args.online_quality,
+                    "every_epochs": args.online_quality_every_epochs,
+                    "manifest_seed": args.online_quality_manifest_seed,
+                    "feature_batch_size": args.online_quality_feature_batch_size,
+                    "source_kind": "live_epoch",
+                },
                 "weighting": {
                     "method": weighting_config.method,
                     "warmup_epochs": weighting_config.warmup_epochs,
@@ -370,14 +445,17 @@ def main() -> None:
             },
         }
     )
-    device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
+    device = _resolve_device(args.device)
 
     train_frames = datasets.train.images
     test_frames = datasets.test.images
     train_patches = patchify(train_frames, PATCH_SIZE)
     test_patches = patchify(test_frames, PATCH_SIZE)
     transform_pair_patches: tuple[torch.Tensor, torch.Tensor] | None = None
-    if weighting_config.method == "coord" and weighting_config.coordinate_importance == "transformation":
+    if (
+        weighting_config.method == "coord"
+        and weighting_config.coordinate_importance == "transformation"
+    ):
         if args.dataset != "shapes3d":
             raise ValueError("transformation coordinate importance is currently Shapes3D-only")
         pairs = build_shapes3d_counterfactual_pairs(
@@ -423,8 +501,64 @@ def main() -> None:
     mask_config = MaskConfig()
 
     n = train_patches.shape[0]
+    quality_output: Path | None = None
+    quality_manifest: QualitySplitManifest | None = None
+    quality_store: QualityStore | None = None
+    quality_previous = None
+    if args.online_quality:
+        quality_output = (
+            Path(args.online_quality_root).expanduser().resolve()
+            if args.online_quality_root
+            else run_dir / "online-quality"
+        )
+        quality_output.mkdir(parents=True, exist_ok=True)
+        manifest_path = quality_output / "quality_split_manifest.json"
+        data_config_hash = shapes3d_config_identity_hash(config)
+        if manifest_path.exists():
+            quality_manifest = QualitySplitManifest.read(manifest_path)
+            if quality_manifest.data_config_hash != data_config_hash:
+                raise ValueError(
+                    "existing online-quality manifest was created for a different "
+                    "Shapes3D data configuration; choose another --online-quality-root"
+                )
+            if quality_manifest.manifest_seed != args.online_quality_manifest_seed:
+                raise ValueError(
+                    "existing online-quality manifest uses a different seed; choose "
+                    "another --online-quality-root or reuse its "
+                    "--online-quality-manifest-seed"
+                )
+        else:
+            quality_manifest = build_quality_manifest(
+                config.data,
+                data_config_hash=data_config_hash,
+                manifest_seed=args.online_quality_manifest_seed,
+            )
+            quality_manifest.write(manifest_path)
+        quality_store = QualityStore(quality_output / "quality.sqlite")
+        quality_store.recover_interrupted()
+        (quality_output / "metric_dictionary.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "name": spec.name,
+                        "q_number": spec.q_number,
+                        "version": spec.version,
+                        "direction": spec.direction.value,
+                        "role": spec.role.value,
+                        "family": spec.family,
+                        "cost_tier": spec.cost_tier.value,
+                        "primary_eligible": spec.primary_eligible,
+                    }
+                    for spec in METRIC_SPEC_BY_NAME.values()
+                ],
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
     start = time.time()
     global_step = 0
+    online_epoch_wall_times: list[float] = []
     metadata = _checkpoint_metadata(args, run_dir)
     weighting_state = init_spatial_weighting(n)
     weighting_ref_indices = select_reference_indices(
@@ -480,7 +614,8 @@ def main() -> None:
             batch_chunks = order.split(args.batch_size)
             mask_generator = torch.Generator().manual_seed(derive_seed(args.seed, "masks", epoch))
             epoch_loss, batches = 0.0, 0
-            epoch_start = time.time()
+            synchronize_device(device)
+            epoch_started_ns = time.perf_counter_ns()
             for indices in batch_chunks:
                 global_step += 1
                 batch = train_patches[indices].to(device)
@@ -540,6 +675,10 @@ def main() -> None:
                         ),
                     )
 
+            synchronize_device(device)
+            train_epoch_seconds = (
+                time.perf_counter_ns() - epoch_started_ns
+            ) / 1_000_000_000
             epoch_mean_loss = epoch_loss / batches
             logger.log(
                 step=global_step,
@@ -547,7 +686,7 @@ def main() -> None:
                 event="epoch",
                 scalars={
                     "train/epoch_loss": epoch_mean_loss,
-                    "train/epoch_seconds": time.time() - epoch_start,
+                    "train/epoch_seconds": train_epoch_seconds,
                     "train/batches_per_epoch": batches,
                     "train/elapsed_seconds": time.time() - start,
                 },
@@ -622,6 +761,107 @@ def main() -> None:
                     },
                 )
 
+            if (
+                args.online_quality
+                and epoch % args.online_quality_every_epochs == 0
+            ):
+                assert quality_output is not None
+                assert quality_manifest is not None
+                assert quality_store is not None
+                recorder = QualityTimingRecorder(device)
+                observation_id = f"live_epoch_{epoch:04d}"
+                adapter = LiveSpatialAdapter(
+                    run_dir=run_dir,
+                    observation_id=observation_id,
+                    epoch=epoch,
+                    global_step=global_step,
+                    model_seed=args.seed,
+                    curriculum="uniform",
+                    training_uses_shape_metadata=False,
+                    core=core,
+                )
+                with recorder.stage("quality_total"):
+                    with isolated_quality_evaluation(core, device):
+                        with recorder.stage("heldout_jepa_loss"):
+                            heldout_loss = quality_heldout_loss(
+                                adapter,
+                                datasets.train.source,
+                                quality_manifest,
+                                batch_size=args.online_quality_feature_batch_size,
+                            )
+                        write_quality_loss(
+                            quality_output,
+                            adapter=adapter,
+                            loss=heldout_loss,
+                            sample_count=len(
+                                quality_manifest.banks["classifier_test"]
+                            ),
+                        )
+                        quality_previous = evaluate_quality_observation(
+                            adapter,
+                            datasets.train.source,
+                            quality_manifest,
+                            quality_output,
+                            quality_store,
+                            batch_size=args.online_quality_feature_batch_size,
+                            previous=quality_previous,
+                            enabled_metrics=set(METRIC_SPEC_BY_NAME),
+                            run_expensive=True,
+                            retry_failed=True,
+                            cache_features=False,
+                            timing=recorder,
+                            temporal_null_reason="no_previous_epoch",
+                        )
+                    with recorder.stage("storage_export"):
+                        quality_store.export(quality_output)
+                quality_seconds = recorder.stages["quality_total"]
+                epoch_wall_seconds = train_epoch_seconds + quality_seconds
+                recorder.stages["train_epoch"] = train_epoch_seconds
+                recorder.stages["epoch_wall"] = epoch_wall_seconds
+                recorder.upsert_jsonl(
+                    quality_output / "timings.jsonl",
+                    run_id=run_dir.name,
+                    epoch=epoch,
+                    global_step=global_step,
+                )
+                online_epoch_wall_times.append(epoch_wall_seconds)
+                accuracy_row = quality_store.accuracy_rows()[-1]
+                logger.log(
+                    step=global_step,
+                    epoch=epoch,
+                    event="online_quality",
+                    scalars={
+                        "quality/heldout_jepa_loss": heldout_loss,
+                        "quality/classification_accuracy": accuracy_row["accuracy"],
+                        "quality/balanced_accuracy": accuracy_row["balanced_accuracy"],
+                        "quality/total_seconds": quality_seconds,
+                        "quality/factorization_label_free_seconds": recorder.stages.get(
+                            "factorization_label_free", 0.0
+                        ),
+                        "quality/factorization_supervised_seconds": recorder.stages.get(
+                            "factorization_supervised", 0.0
+                        ),
+                        "quality/epoch_wall_seconds": epoch_wall_seconds,
+                        "quality/overhead_ratio": quality_seconds
+                        / max(train_epoch_seconds, 1e-12),
+                    },
+                )
+                print(
+                    f"quality epoch={epoch:4d} loss={heldout_loss:.6f} "
+                    f"accuracy={float(accuracy_row['accuracy']):.4f} "
+                    f"train_s={train_epoch_seconds:.1f} quality_s={quality_seconds:.1f} "
+                    f"overhead={quality_seconds / max(train_epoch_seconds, 1e-12):.2f}x",
+                    flush=True,
+                )
+                if len(online_epoch_wall_times) == 3:
+                    median_seconds = sorted(online_epoch_wall_times)[1]
+                    remaining = max(args.epochs - epoch, 0)
+                    print(
+                        f"online_quality_eta_seconds={median_seconds * remaining:.0f} "
+                        f"based_on_first_3_epochs=true",
+                        flush=True,
+                    )
+
             if epoch % args.eval_every_epochs == 0 or epoch == 1:
                 test_loss = _evaluate_spatial_loss(
                     core,
@@ -687,6 +927,8 @@ def main() -> None:
                     extra_state=_weighting_checkpoint_state(weighting_state, weighting_ref_indices),
                 )
     finally:
+        if quality_store is not None:
+            quality_store.close()
         logger.close()
 
 

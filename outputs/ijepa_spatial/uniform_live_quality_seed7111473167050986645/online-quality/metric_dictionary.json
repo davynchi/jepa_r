@@ -1,0 +1,212 @@
+[
+  {
+    "cost_tier": "cheap",
+    "direction": "lower",
+    "family": "cross-covariance",
+    "name": "q1_cross_covariance",
+    "primary_eligible": true,
+    "q_number": "1",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "lower",
+    "family": "cross-covariance",
+    "name": "q2_projector_interaction",
+    "primary_eligible": false,
+    "q_number": "2",
+    "role": "identity",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "lower",
+    "family": "partition-validity",
+    "name": "q3_projector_overlap",
+    "primary_eligible": false,
+    "q_number": "3",
+    "role": "validity",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "lower",
+    "family": "partition-validity",
+    "name": "q4_partition_incompleteness",
+    "primary_eligible": false,
+    "q_number": "4",
+    "role": "validity",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "higher",
+    "family": "temporal-stability",
+    "name": "q5_subspace_similarity",
+    "primary_eligible": false,
+    "q_number": "5",
+    "role": "identity",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "lower",
+    "family": "temporal-stability",
+    "name": "q6_subspace_distance",
+    "primary_eligible": true,
+    "q_number": "6",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "expensive",
+    "direction": "lower",
+    "family": "jacobian-simplicity",
+    "name": "q7_cross_jacobian_energy",
+    "primary_eligible": true,
+    "q_number": "7",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "expensive",
+    "direction": "lower",
+    "family": "virtual-update",
+    "name": "q8_virtual_sensitivity_magnitude",
+    "primary_eligible": true,
+    "q_number": "8",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "lower",
+    "family": "temporal-stability",
+    "name": "q9_subspace_velocity",
+    "primary_eligible": true,
+    "q_number": "9",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "higher",
+    "family": "entropy",
+    "name": "q10_weighted_shape_entropy",
+    "primary_eligible": true,
+    "q_number": "10",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "lower",
+    "family": "information-coupling",
+    "name": "q11_cross_subspace_gaussian_mi",
+    "primary_eligible": true,
+    "q_number": "11",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "lower",
+    "family": "entropy",
+    "name": "q12_absolute_entropy_change",
+    "primary_eligible": true,
+    "q_number": "12",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "higher",
+    "family": "factorization-locality",
+    "name": "q13_realized_surprise_locality",
+    "primary_eligible": true,
+    "q_number": "13",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "expensive",
+    "direction": "higher",
+    "family": "gradient-locality",
+    "name": "q14_gradient_locality",
+    "primary_eligible": true,
+    "q_number": "14",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "expensive",
+    "direction": "lower",
+    "family": "virtual-update",
+    "name": "q15_virtual_interference",
+    "primary_eligible": true,
+    "q_number": "15",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "lower",
+    "family": "semantic-control",
+    "name": "q16_entity_consistency",
+    "primary_eligible": false,
+    "q_number": "16",
+    "role": "supervised_secondary",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "lower",
+    "family": "transformation",
+    "name": "q17_mask_transformation_residual",
+    "primary_eligible": true,
+    "q_number": "17",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "higher",
+    "family": "transformation",
+    "name": "q18_mask_perturbation_concentration",
+    "primary_eligible": true,
+    "q_number": "18",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "expensive",
+    "direction": "unknown",
+    "family": "jacobian-simplicity",
+    "name": "q19a_jacobian_effective_rank",
+    "primary_eligible": true,
+    "q_number": "19a",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "expensive",
+    "direction": "lower",
+    "family": "jacobian-simplicity",
+    "name": "q19b_jacobian_density_tau_1em3",
+    "primary_eligible": true,
+    "q_number": "19b",
+    "role": "candidate",
+    "version": "1"
+  },
+  {
+    "cost_tier": "cheap",
+    "direction": "lower",
+    "family": "decoder-simplicity",
+    "name": "q20_reconstruction_nmse",
+    "primary_eligible": true,
+    "q_number": "20",
+    "role": "candidate",
+    "version": "1"
+  }
+]

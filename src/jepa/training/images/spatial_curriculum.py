@@ -209,7 +209,11 @@ def _latent_covariance_from_patches(
     core: SpatialIJEPACore,
     patches: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    latents = core.context_encoder(patches).mean(dim=1).to(torch.float64)
+    latents = core.context_encoder(patches).mean(dim=1)
+    # Metal has no float64 tensors. Keep the differentiable RAS statistic on
+    # MPS in float32; CPU/CUDA retain the original float64 calculation.
+    statistic_dtype = torch.float32 if latents.device.type == "mps" else torch.float64
+    latents = latents.to(statistic_dtype)
     centered = latents - latents.mean(dim=0, keepdim=True)
     covariance = centered.T @ centered / max(latents.shape[0] - 1, 1)
     return (covariance + covariance.T) / 2, latents
@@ -238,7 +242,9 @@ def richness_from_patches(
     if torch.any(sign <= 0):
         raise RuntimeError("richness covariance regularization did not produce a positive matrix")
 
-    eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0)
+    # MPS does not implement eigvalsh. Eigenvalues are diagnostic-only here,
+    # so compute them from a detached CPU copy without breaking richness grads.
+    eigenvalues = torch.linalg.eigvalsh(covariance.detach().cpu()).clamp_min(0)
     squared_trace = covariance.square().sum()
     participation_ratio = trace.square() / squared_trace.clamp_min(delta)
     trace_penalty = trace_beta * (trace - trace_target) ** 2
@@ -265,7 +271,7 @@ def richness_from_patches(
 
 
 def _normalize_coordinate_importance(weights: torch.Tensor, *, delta: float) -> torch.Tensor:
-    weights = weights.detach().to(torch.float64).clamp_min(0)
+    weights = weights.detach().cpu().to(torch.float64).clamp_min(0)
     mean = weights.mean().clamp_min(delta)
     weights = weights / mean
     return weights.clamp_min(delta)
@@ -276,13 +282,15 @@ def _coordinate_importance_from_covariance(
     *,
     delta: float,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
-    latents64 = latents.detach().to(torch.float64)
+    latents64 = latents.detach().cpu().to(torch.float64)
     centered = latents64 - latents64.mean(dim=0, keepdim=True)
     covariance = centered.T @ centered / max(latents64.shape[0] - 1, 1)
     covariance = (covariance + covariance.T) / 2
     eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
     eigenvalues = eigenvalues.clamp_min(0)
-    weights = _normalize_coordinate_importance(eigenvalues / eigenvalues.sum().clamp_min(delta), delta=delta)
+    weights = _normalize_coordinate_importance(
+        eigenvalues / eigenvalues.sum().clamp_min(delta), delta=delta
+    )
     metadata = {
         "coord/importance_min": float(weights.min().item()),
         "coord/importance_max": float(weights.max().item()),
@@ -299,8 +307,8 @@ def _coordinate_importance_from_transformation(
     *,
     delta: float,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
-    source64 = source_latents.detach().to(torch.float64)
-    target64 = target_latents.detach().to(torch.float64)
+    source64 = source_latents.detach().cpu().to(torch.float64)
+    target64 = target_latents.detach().cpu().to(torch.float64)
     source_centered = source64 - source64.mean(dim=0, keepdim=True)
     target_centered = target64 - target64.mean(dim=0, keepdim=True)
     dim = source64.shape[1]
@@ -312,20 +320,18 @@ def _coordinate_importance_from_transformation(
     source_eigs, source_basis = torch.linalg.eigh((source_cov + source_cov.T) / 2)
     target_eigs, target_basis = torch.linalg.eigh((target_cov + target_cov.T) / 2)
     source_inv_sqrt = (
-        source_basis
-        @ torch.diag(source_eigs.clamp_min(delta).rsqrt())
-        @ source_basis.T
+        source_basis @ torch.diag(source_eigs.clamp_min(delta).rsqrt()) @ source_basis.T
     )
     target_inv_sqrt = (
-        target_basis
-        @ torch.diag(target_eigs.clamp_min(delta).rsqrt())
-        @ target_basis.T
+        target_basis @ torch.diag(target_eigs.clamp_min(delta).rsqrt()) @ target_basis.T
     )
     operator = target_inv_sqrt @ cross_cov @ source_inv_sqrt
     operator = torch.nan_to_num(operator, nan=0.0, posinf=0.0, neginf=0.0)
     _, singular_values, vh = torch.linalg.svd(operator + delta * eye, full_matrices=False)
     singular_values = singular_values.clamp(max=1.0)
-    weights = _normalize_coordinate_importance((1.0 - singular_values.abs()).clamp_min(0), delta=delta)
+    weights = _normalize_coordinate_importance(
+        (1.0 - singular_values.abs()).clamp_min(0), delta=delta
+    )
     basis = vh.T
     metadata = {
         "coord/importance_min": float(weights.min().item()),
@@ -344,7 +350,7 @@ def _coordinate_importance_from_dynamics(
     ema_beta: float,
     delta: float,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
-    latents64 = latents.detach().to(torch.float64)
+    latents64 = latents.detach().cpu().to(torch.float64)
     dim = latents64.shape[1]
     basis = torch.eye(dim, dtype=latents64.dtype, device=latents64.device)
     previous = state.coordinate_previous_ref_latents
@@ -476,10 +482,7 @@ def score_frames_by_ras(
         richness_gradients_raw = torch.autograd.grad(richness, parameters, retain_graph=False)
         richness_gradients = tuple(gradient.detach() for gradient in richness_gradients_raw)
         grad_norm = torch.sqrt(
-            sum(
-                gradient.detach().to(torch.float64).square().sum()
-                for gradient in richness_gradients
-            )
+            torch.stack([gradient.detach().square().sum() for gradient in richness_gradients]).sum()
         )
 
         for indices in torch.arange(train_patches.shape[0], device=train_patches.device).split(
@@ -584,19 +587,21 @@ def score_frames_by_coordinate_importance(
         else:
             raise ValueError(f"unknown coordinate importance: {coordinate_importance!r}")
 
-        projected_ref_mean = (ref_latents.to(torch.float64) @ basis.to(device)).mean(dim=0)
+        gradient_dtype = ref_latents.dtype
+        basis_on_device = basis.to(device=device, dtype=gradient_dtype)
+        projected_ref_mean = (ref_latents @ basis_on_device).mean(dim=0)
         coordinate_gradients: list[tuple[torch.Tensor | None, ...]] = []
         for coordinate in projected_ref_mean:
             coordinate_gradients.append(
                 torch.autograd.grad(coordinate, parameters, retain_graph=True, allow_unused=True)
             )
-        coord_weights = coord_weights.to(device=device, dtype=torch.float64)
+        coord_weights = coord_weights.to(device=device, dtype=gradient_dtype)
         coord_grad_norm = torch.sqrt(
             sum(
                 sum(
-                    torch.zeros((), dtype=torch.float64, device=device)
+                    torch.zeros((), dtype=gradient_dtype, device=device)
                     if gradient is None
-                    else gradient.detach().to(torch.float64).square().sum()
+                    else gradient.detach().to(gradient_dtype).square().sum()
                     for gradient in gradients
                 )
                 for gradients in coordinate_gradients
@@ -627,7 +632,7 @@ def score_frames_by_coordinate_importance(
                     retain_graph=False,
                     allow_unused=True,
                 )
-                impacts = torch.empty(coord_weights.shape[0], dtype=torch.float64, device=device)
+                impacts = torch.empty(coord_weights.shape[0], dtype=gradient_dtype, device=device)
                 for coordinate_index, gradients in enumerate(coordinate_gradients):
                     impacts[coordinate_index] = -_dot_gradients(
                         loss_gradients,
@@ -635,7 +640,7 @@ def score_frames_by_coordinate_importance(
                             torch.zeros_like(parameter) if gradient is None else gradient.detach()
                             for gradient, parameter in zip(gradients, parameters, strict=True)
                         ),
-                    ).to(torch.float64)
+                    ).to(gradient_dtype)
                 batch_scores[local_index] = float(
                     (coord_weights * impacts.abs()).sum().detach().cpu().item()
                 )

@@ -1,0 +1,39 @@
+flowchart TD
+    T["1. ОБУЧЕНИЕ JEPA"]
+    T --> A["Shapes3D train<br/>16 000 изображений"]
+    A --> B["Uniform mini-batches<br/>batch = 128"]
+    B --> C["Spatial I-JEPA<br/>context / target masks"]
+    C --> D["Backprop + Adam<br/>обновление encoder и predictor"]
+    D --> E["EMA target encoder"]
+    E --> F["Модель после эпохи t<br/>на MPS"]
+
+    F --> Q["2. ONLINE-МЕТРИКИ"]
+    Q --> G["Фиксированный evaluation manifest<br/>не пересекается с train"]
+
+    G --> H["8 000 изображений<br/>mask A и mask B для каждого"]
+    H --> I["Context encoder<br/>текущие веса эпохи t<br/>сейчас — отдельный forward на изображение"]
+    I --> J["Два masked-набора<br/>Zᵃ, Zᵇ ∈ R⁸⁰⁰⁰ˣ¹⁶"]
+    J --> K["Δ = Zᵃ − Zᵇ<br/>m = (Zᵃ + Zᵇ) / 2"]
+    K --> L["Eigenproblem<br/>(S − W)U = UΛ"]
+    L --> M["4 ортогональных подпространства<br/>Uᵢ и Pᵢ = UᵢUᵢᵀ"]
+    M --> N["Q1–Q19<br/>temporal, Jacobian,<br/>gradient и virtual-update метрики"]
+
+    G --> O["Full-image embeddings<br/>без масок, batched"]
+    O --> P["Linear probe accuracy<br/>held-out JEPA loss<br/>Q20 reconstruction"]
+
+    N --> R["SQLite / JSONL<br/>timings, correlations, plots"]
+    P --> R
+    R -. "partition t → temporal Q<br/>на следующей эпохе" .-> N
+    F -. "следующая эпоха" .-> B
+
+    classDef header fill:#202124,stroke:#202124,color:#FFFFFF,stroke-width:2px;
+    classDef train fill:#E8F0FE,stroke:#1A73E8,color:#174EA6,stroke-width:1.5px;
+    classDef quality fill:#E6F4EA,stroke:#188038,color:#0D652D,stroke-width:1.5px;
+    classDef factor fill:#FEF7E0,stroke:#F9AB00,color:#7A4F01,stroke-width:1.5px;
+    classDef output fill:#F3E8FD,stroke:#9334E6,color:#681DA8,stroke-width:1.5px;
+
+    class T,Q header;
+    class A,B,C,D,E,F train;
+    class G,H,I,J,O quality;
+    class K,L,M,N factor;
+    class P,R output;

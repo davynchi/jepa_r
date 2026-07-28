@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from scipy.linalg import eigh
+from scipy.linalg import eigh  # type: ignore[import-untyped]
 
 from jepa.analysis.metrics import MetricValue, RidgeProbe, fit_ridge_probe
 

@@ -6,5 +6,5 @@
 .gstack/
 build/
 dist/
-outputs/
+outputs
 /data/

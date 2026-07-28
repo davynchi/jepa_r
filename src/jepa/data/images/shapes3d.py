@@ -56,6 +56,19 @@ def flat_index_batch(factor_matrix: np.ndarray) -> np.ndarray:
     return (factor_matrix * _STRIDE_VECTOR).sum(axis=-1)
 
 
+def factor_row_from_flat_index(index: int) -> torch.Tensor:
+    """Invert the official row-major index without loading labels or images."""
+    if index < 0 or index >= _base:
+        raise ValueError(f"flat index must be in [0, {_base})")
+    remainder = index
+    values: list[int] = []
+    for name in SHAPES3D_FACTOR_NAMES:
+        stride = _STRIDES[name]
+        value, remainder = divmod(remainder, stride)
+        values.append(value)
+    return torch.tensor(values, dtype=torch.long)
+
+
 def _convert_to_memmap(h5_path: Path, npy_path: Path, *, batch_size: int = 20_000) -> None:
     """One-time sequential conversion of the images array to a local ``.npy``.
 
@@ -136,6 +149,18 @@ def _sample_factor_indices(generator: torch.Generator) -> dict[str, int]:
         name: int(torch.randint(SHAPES3D_FACTOR_SIZES[name], (), generator=generator).item())
         for name in SHAPES3D_FACTOR_NAMES
     }
+
+
+def sample_shapes3d_static_factor_row(
+    split_seed: int, sample_index: int
+) -> tuple[torch.Tensor, int]:
+    """Reproduce one static-dataset factor row without loading an image."""
+    if sample_index < 0:
+        raise ValueError("sample_index must be non-negative")
+    generator = _cpu_generator(derive_seed(split_seed, "sample", sample_index))
+    factors = _sample_factor_indices(generator)
+    row = torch.tensor([factors[name] for name in SHAPES3D_FACTOR_NAMES], dtype=torch.long)
+    return row, flat_index(factors)
 
 
 def _step_context_indices(
@@ -291,25 +316,26 @@ class Shapes3DStaticImageDataset(Dataset):
         entities = torch.empty(size, dtype=torch.long)
         contexts = torch.empty(size, config.context_dim)
         all_factors = torch.empty(size, len(SHAPES3D_FACTOR_NAMES), dtype=torch.long)
+        flat_indices = np.empty(size, dtype=np.int64)
         for index in range(size):
-            generator = _cpu_generator(derive_seed(split_seed, "sample", index))
-            factor_indices = _sample_factor_indices(generator)
-            entities[index] = factor_indices["shape"]
+            factor_row, flat = sample_shapes3d_static_factor_row(split_seed, index)
+            entities[index] = factor_row[_SHAPE_COLUMN]
             contexts[index] = torch.tensor(
                 [
-                    factor_indices[name] / (SHAPES3D_FACTOR_SIZES[name] - 1)
+                    factor_row[SHAPES3D_FACTOR_NAMES.index(name)].item()
+                    / (SHAPES3D_FACTOR_SIZES[name] - 1)
                     for name in SHAPES3D_CONTEXT_FACTORS
                 ]
             )
-            for column, name in enumerate(SHAPES3D_FACTOR_NAMES):
-                all_factors[index, column] = factor_indices[name]
+            all_factors[index] = factor_row
+            flat_indices[index] = flat
 
-        flat_indices = flat_index_batch(all_factors.numpy())
         images = torch.from_numpy(self.source.images_batch(flat_indices))
 
         self.entities = entities
         self.contexts = contexts
         self.images = images
+        self.flat_indices = flat_indices
         self.observations = images.reshape(size, -1)
 
     def __len__(self) -> int:
@@ -350,9 +376,39 @@ class Shapes3DCounterfactualPairs:
     diff_entity_x2: torch.Tensor
 
 
-def build_shapes3d_counterfactual_pairs(
-    config: Shapes3DDataConfig, source: Shapes3DSource, *, num_pairs: int, seed: int
-) -> Shapes3DCounterfactualPairs:
+@dataclass(frozen=True, slots=True)
+class Shapes3DCounterfactualFactorRows:
+    same_entity: torch.Tensor
+    same_factors_1: torch.Tensor
+    same_factors_2: torch.Tensor
+    diff_entities: torch.Tensor
+    diff_factors_1: torch.Tensor
+    diff_factors_2: torch.Tensor
+
+    @property
+    def same_flat_indices_1(self) -> np.ndarray:
+        return flat_index_batch(self.same_factors_1.numpy())
+
+    @property
+    def same_flat_indices_2(self) -> np.ndarray:
+        return flat_index_batch(self.same_factors_2.numpy())
+
+    @property
+    def diff_flat_indices_1(self) -> np.ndarray:
+        return flat_index_batch(self.diff_factors_1.numpy())
+
+    @property
+    def diff_flat_indices_2(self) -> np.ndarray:
+        return flat_index_batch(self.diff_factors_2.numpy())
+
+
+def sample_shapes3d_counterfactual_factor_rows(
+    config: Shapes3DDataConfig, *, num_pairs: int, seed: int
+) -> Shapes3DCounterfactualFactorRows:
+    """Generate the exact counterfactual factor rows without image I/O."""
+    del config  # Reserved for future factor-policy fields; RNG contract is explicit.
+    if num_pairs <= 0:
+        raise ValueError("num_pairs must be positive")
     generator = _cpu_generator(seed)
     num_shapes = SHAPES3D_FACTOR_SIZES["shape"]
 
@@ -366,9 +422,12 @@ def build_shapes3d_counterfactual_pairs(
         factors_1["shape"] = shape_idx
         factors_2["shape"] = shape_idx
         same_entity[i] = shape_idx
-        for column, name in enumerate(SHAPES3D_FACTOR_NAMES):
-            same_factors_1[i, column] = factors_1[name]
-            same_factors_2[i, column] = factors_2[name]
+        same_factors_1[i] = torch.tensor(
+            [factors_1[name] for name in SHAPES3D_FACTOR_NAMES], dtype=torch.long
+        )
+        same_factors_2[i] = torch.tensor(
+            [factors_2[name] for name in SHAPES3D_FACTOR_NAMES], dtype=torch.long
+        )
 
     diff_entities = torch.empty(num_pairs, 2, dtype=torch.long)
     diff_factors_1 = torch.empty_like(same_factors_1)
@@ -381,20 +440,36 @@ def build_shapes3d_counterfactual_pairs(
         factors_1 = dict(shared_factors, shape=shape_1)
         factors_2 = dict(shared_factors, shape=shape_2)
         diff_entities[i] = torch.tensor([shape_1, shape_2])
-        for column, name in enumerate(SHAPES3D_FACTOR_NAMES):
-            diff_factors_1[i, column] = factors_1[name]
-            diff_factors_2[i, column] = factors_2[name]
+        diff_factors_1[i] = torch.tensor(
+            [factors_1[name] for name in SHAPES3D_FACTOR_NAMES], dtype=torch.long
+        )
+        diff_factors_2[i] = torch.tensor(
+            [factors_2[name] for name in SHAPES3D_FACTOR_NAMES], dtype=torch.long
+        )
+    return Shapes3DCounterfactualFactorRows(
+        same_entity=same_entity,
+        same_factors_1=same_factors_1,
+        same_factors_2=same_factors_2,
+        diff_entities=diff_entities,
+        diff_factors_1=diff_factors_1,
+        diff_factors_2=diff_factors_2,
+    )
 
-    same_x1 = torch.from_numpy(source.images_batch(flat_index_batch(same_factors_1.numpy())))
-    same_x2 = torch.from_numpy(source.images_batch(flat_index_batch(same_factors_2.numpy())))
-    diff_x1 = torch.from_numpy(source.images_batch(flat_index_batch(diff_factors_1.numpy())))
-    diff_x2 = torch.from_numpy(source.images_batch(flat_index_batch(diff_factors_2.numpy())))
+
+def build_shapes3d_counterfactual_pairs(
+    config: Shapes3DDataConfig, source: Shapes3DSource, *, num_pairs: int, seed: int
+) -> Shapes3DCounterfactualPairs:
+    rows = sample_shapes3d_counterfactual_factor_rows(config, num_pairs=num_pairs, seed=seed)
+    same_x1 = torch.from_numpy(source.images_batch(rows.same_flat_indices_1))
+    same_x2 = torch.from_numpy(source.images_batch(rows.same_flat_indices_2))
+    diff_x1 = torch.from_numpy(source.images_batch(rows.diff_flat_indices_1))
+    diff_x2 = torch.from_numpy(source.images_batch(rows.diff_flat_indices_2))
 
     return Shapes3DCounterfactualPairs(
-        same_entity=same_entity,
+        same_entity=rows.same_entity,
         same_entity_x1=same_x1,
         same_entity_x2=same_x2,
-        diff_entity_entities=diff_entities,
+        diff_entity_entities=rows.diff_entities,
         diff_entity_x1=diff_x1,
         diff_entity_x2=diff_x2,
     )
@@ -402,6 +477,7 @@ def build_shapes3d_counterfactual_pairs(
 
 __all__ = [
     "Shapes3DCounterfactualPairs",
+    "Shapes3DCounterfactualFactorRows",
     "Shapes3DDatasetSplits",
     "Shapes3DEntityContextTrajectoryDataset",
     "Shapes3DSource",
@@ -412,4 +488,7 @@ __all__ = [
     "build_shapes3d_static_dataset_splits",
     "flat_index",
     "flat_index_batch",
+    "factor_row_from_flat_index",
+    "sample_shapes3d_counterfactual_factor_rows",
+    "sample_shapes3d_static_factor_row",
 ]

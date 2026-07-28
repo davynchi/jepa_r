@@ -28,6 +28,8 @@ source-include = [".github/**", "AGENTS.md", "TODOS.md", "configs/**", "docs/**"
 [dependency-groups]
 dev = [
     "mypy>=1.15",
+    "pytest>=8",
+    "pytest-cov>=6",
     "ruff>=0.6",
     "types-pyyaml>=6.0",
 ]
