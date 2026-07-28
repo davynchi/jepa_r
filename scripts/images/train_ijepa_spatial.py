@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
 
 from jepa.analysis.subspace import (  # noqa: E402
     classifier_accuracy,
@@ -49,6 +50,11 @@ from jepa.training.images.bandit_weighting import (  # noqa: E402
     RichnessGradientSnapshot,
     batch_ras_from_parameter_gradients,
     capture_richness_gradient,
+)
+from jepa.training.images.barlow_twins import (  # noqa: E402
+    BarlowImageDataset,
+    BarlowTwinsProjector,
+    pooled_encoder_representation,
 )
 from jepa.training.images.ijepa_schedulers import (  # noqa: E402
     CosineWDSchedule,
@@ -308,6 +314,21 @@ def _parse_args() -> argparse.Namespace:
         help="Images from each minibatch used by the regularizer; 0 uses the full minibatch",
     )
     parser.add_argument(
+        "--official-barlow-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the official-style augmentation/projector Barlow Twins auxiliary loss",
+    )
+    parser.add_argument("--official-barlow-batch-size", type=int, default=256)
+    parser.add_argument(
+        "--official-barlow-projector",
+        type=int,
+        nargs="+",
+        default=(2048, 2048, 2048),
+    )
+    parser.add_argument("--official-barlow-lambda", type=float, default=0.0051)
+    parser.add_argument("--official-barlow-workers", type=int, default=8)
+    parser.add_argument(
         "--ras-score-granularity",
         choices=("sample", "batch"),
         default="sample",
@@ -408,6 +429,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--richness-regularizer-weight must be non-negative")
     if args.richness_regularizer_batch_size < 0:
         raise ValueError("--richness-regularizer-batch-size must be non-negative")
+    if args.official_barlow_weight < 0:
+        raise ValueError("--official-barlow-weight must be non-negative")
+    if args.official_barlow_batch_size < 2:
+        raise ValueError("--official-barlow-batch-size must be at least two")
+    if not args.official_barlow_projector or any(
+        dimension <= 0 for dimension in args.official_barlow_projector
+    ):
+        raise ValueError("--official-barlow-projector dimensions must be positive")
+    if args.official_barlow_lambda < 0:
+        raise ValueError("--official-barlow-lambda must be non-negative")
+    if args.official_barlow_workers < 0:
+        raise ValueError("--official-barlow-workers must be non-negative")
     if (
         args.richness_regularizer == "none"
         and args.richness_regularizer_weight != 0
@@ -456,7 +489,13 @@ def _init_upstream_optimizer(
     *,
     iterations_per_epoch: int,
     args: argparse.Namespace,
+    auxiliary_modules: tuple[torch.nn.Module, ...] = (),
 ) -> tuple[torch.optim.Optimizer, WarmupCosineSchedule, CosineWDSchedule]:
+    auxiliary_named_parameters = [
+        (name, parameter)
+        for module_index, module in enumerate(auxiliary_modules)
+        for name, parameter in module.named_parameters(prefix=f"auxiliary_{module_index}")
+    ]
     param_groups = [
         {
             "params": [
@@ -490,7 +529,24 @@ def _init_upstream_optimizer(
             "WD_exclude": True,
             "weight_decay": 0,
         },
+        {
+            "params": [
+                parameter
+                for name, parameter in auxiliary_named_parameters
+                if "bias" not in name and len(parameter.shape) != 1
+            ]
+        },
+        {
+            "params": [
+                parameter
+                for name, parameter in auxiliary_named_parameters
+                if "bias" in name or len(parameter.shape) == 1
+            ],
+            "WD_exclude": True,
+            "weight_decay": 0,
+        },
     ]
+    param_groups = [group for group in param_groups if group["params"]]
     optimizer = torch.optim.AdamW(param_groups)
     total_steps = int(args.ipe_scale * args.epochs * iterations_per_epoch)
     lr_scheduler = WarmupCosineSchedule(
@@ -534,6 +590,7 @@ def _weighting_checkpoint_state(
     bandit_cache: LatentContextCache | None = None,
     bandit_reward_normalizer: DiscountedRewardNormalizer | None = None,
     richness_snapshot: RichnessGradientSnapshot | None = None,
+    official_barlow: BarlowTwinsProjector | None = None,
 ) -> dict[str, object]:
     state: dict[str, object] = {
         "weighting_memory": weighting_state.memory,
@@ -558,6 +615,8 @@ def _weighting_checkpoint_state(
             "metadata": richness_snapshot.metadata,
             "step": richness_snapshot.step,
         }
+    if official_barlow is not None:
+        state["official_barlow"] = official_barlow.state_dict()
     return state
 
 
@@ -887,6 +946,13 @@ def main() -> None:
                         args.weighting_predictive_redundancy_weight
                     ),
                 },
+                "official_barlow": {
+                    "weight": args.official_barlow_weight,
+                    "batch_size": args.official_barlow_batch_size,
+                    "projector": list(args.official_barlow_projector),
+                    "redundancy_weight": args.official_barlow_lambda,
+                    "workers": args.official_barlow_workers,
+                },
                 "weighting": {
                     "method": weighting_config.method,
                     "warmup_epochs": weighting_config.warmup_epochs,
@@ -1014,6 +1080,33 @@ def main() -> None:
     core.context_encoder.to(device)
     core.predictor.to(device)
     core.target_encoder.to(device)
+    official_barlow: BarlowTwinsProjector | None = None
+    official_barlow_loader: DataLoader | None = None
+    official_barlow_iterator = None
+    if args.official_barlow_weight > 0:
+        if train_paths is None:
+            raise ValueError(
+                "official-style Barlow regularization requires a file-backed image dataset"
+            )
+        official_barlow = BarlowTwinsProjector(
+            core.embed_dim,
+            args.official_barlow_projector,
+            redundancy_weight=args.official_barlow_lambda,
+        ).to(device)
+        official_barlow_loader = DataLoader(
+            BarlowImageDataset(train_paths, image_size=args.image_size),
+            batch_size=args.official_barlow_batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=args.official_barlow_workers,
+            pin_memory=device.type == "cuda",
+            persistent_workers=args.official_barlow_workers > 0,
+            prefetch_factor=2 if args.official_barlow_workers > 0 else None,
+            generator=torch.Generator().manual_seed(
+                derive_seed(args.seed, "official-barlow-loader")
+            ),
+        )
+        official_barlow_iterator = iter(official_barlow_loader)
     mask_min_keep = args.mask_min_keep or (10 if grid >= 16 else 4)
     mask_config = MaskConfig(min_keep=mask_min_keep)
 
@@ -1053,6 +1146,7 @@ def main() -> None:
         core,
         iterations_per_epoch=iterations_per_epoch,
         args=args,
+        auxiliary_modules=(() if official_barlow is None else (official_barlow,)),
     )
     total_schedule_steps = int(args.ipe_scale * args.epochs * iterations_per_epoch)
     amp_dtype = {
@@ -1112,6 +1206,13 @@ def main() -> None:
         core.context_encoder.load_state_dict(checkpoint["context_encoder"])
         core.predictor.load_state_dict(checkpoint["predictor"])
         core.target_encoder.load_state_dict(checkpoint["target_encoder"])
+        checkpoint_extra = checkpoint.get("extra_state")
+        if official_barlow is not None:
+            if not isinstance(checkpoint_extra, dict) or not isinstance(
+                checkpoint_extra.get("official_barlow"), dict
+            ):
+                raise ValueError("resume checkpoint is missing official Barlow state")
+            official_barlow.load_state_dict(checkpoint_extra["official_barlow"])
         if "optimizer" not in checkpoint:
             raise ValueError("resume checkpoint is missing optimizer state")
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -1120,7 +1221,6 @@ def main() -> None:
         )
         lr_scheduler._step = float(global_step)
         wd_scheduler._step = float(global_step)
-        checkpoint_extra = checkpoint.get("extra_state")
         if isinstance(checkpoint_extra, dict) and isinstance(
             checkpoint_extra.get("amp_scaler"), dict
         ):
@@ -1243,6 +1343,8 @@ def main() -> None:
             core.context_encoder.train()
             core.predictor.train()
             core.target_encoder.train()
+            if official_barlow is not None:
+                official_barlow.train()
             if bandit_sampler is not None and epoch > weighting_config.warmup_epochs:
                 assert bandit_cache is not None
                 policy_generator = torch.Generator().manual_seed(
@@ -1292,6 +1394,7 @@ def main() -> None:
                 seed=derive_seed(args.seed, "masks", epoch),
             )
             epoch_loss, epoch_jepa_loss, epoch_regularizer = 0.0, 0.0, 0.0
+            epoch_official_barlow = 0.0
             batches = 0
             epoch_bandit_rewards: list[float] = []
             epoch_bandit_prediction_errors: list[float] = []
@@ -1323,6 +1426,17 @@ def main() -> None:
                 current_lr = lr_scheduler.step()
                 current_wd = wd_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                official_barlow_views = None
+                if official_barlow_loader is not None:
+                    assert official_barlow_iterator is not None
+                    try:
+                        official_barlow_views = next(official_barlow_iterator)
+                    except StopIteration:
+                        official_barlow_iterator = iter(official_barlow_loader)
+                        official_barlow_views = next(official_barlow_iterator)
+                    official_barlow_views = tuple(
+                        view.to(device, non_blocking=True) for view in official_barlow_views
+                    )
                 if bandit_sampler is not None and (
                     richness_snapshot is None
                     or global_step - richness_snapshot.step >= args.bandit_richness_refresh_steps
@@ -1380,9 +1494,24 @@ def main() -> None:
                             predictive_kappa=args.weighting_predictive_kappa,
                         )
                         regularizer_penalty = -regularizer_richness
+                    official_barlow_loss = jepa_loss.new_zeros(())
+                    official_barlow_metadata: dict[str, float] = {}
+                    if official_barlow is not None:
+                        assert official_barlow_views is not None
+                        first_view, second_view = official_barlow_views
+                        first_representation = pooled_encoder_representation(
+                            core.context_encoder, first_view
+                        )
+                        second_representation = pooled_encoder_representation(
+                            core.context_encoder, second_view
+                        )
+                        official_barlow_loss, official_barlow_metadata = official_barlow(
+                            first_representation, second_representation
+                        )
                     loss = (
                         jepa_loss
                         + args.richness_regularizer_weight * regularizer_penalty
+                        + args.official_barlow_weight * official_barlow_loss
                     )
                 if use_amp:
                     scaler.scale(loss).backward()
@@ -1440,9 +1569,11 @@ def main() -> None:
                 loss_value = loss.item()
                 jepa_loss_value = jepa_loss.item()
                 regularizer_value = regularizer_penalty.item()
+                official_barlow_value = official_barlow_loss.item()
                 epoch_loss += loss_value
                 epoch_jepa_loss += jepa_loss_value
                 epoch_regularizer += regularizer_value
+                epoch_official_barlow += official_barlow_value
                 batches += 1
 
                 if args.log_every_steps > 0 and global_step % args.log_every_steps == 0:
@@ -1457,6 +1588,10 @@ def main() -> None:
                             "train/weighted_richness_regularizer": (
                                 args.richness_regularizer_weight * regularizer_value
                             ),
+                            "train/official_barlow": official_barlow_value,
+                            "train/weighted_official_barlow": (
+                                args.official_barlow_weight * official_barlow_value
+                            ),
                             "train/lr": current_lr,
                             "train/weight_decay": current_wd,
                             "train/ema_momentum": momentum,
@@ -1466,6 +1601,7 @@ def main() -> None:
                                 key.replace("ras/", "regularizer/", 1): value
                                 for key, value in regularizer_metadata.items()
                             },
+                            **official_barlow_metadata,
                             **bandit_scalars,
                         },
                     )
@@ -1488,6 +1624,7 @@ def main() -> None:
                             bandit_cache=bandit_cache,
                             bandit_reward_normalizer=bandit_reward_normalizer,
                             richness_snapshot=richness_snapshot,
+                            official_barlow=official_barlow,
                         ),
                     )
                     save_spatial_checkpoint(
@@ -1505,12 +1642,14 @@ def main() -> None:
                             bandit_cache=bandit_cache,
                             bandit_reward_normalizer=bandit_reward_normalizer,
                             richness_snapshot=richness_snapshot,
+                            official_barlow=official_barlow,
                         ),
                     )
 
             epoch_mean_loss = epoch_loss / batches
             epoch_mean_jepa_loss = epoch_jepa_loss / batches
             epoch_mean_regularizer = epoch_regularizer / batches
+            epoch_mean_official_barlow = epoch_official_barlow / batches
             logger.log(
                 step=global_step,
                 epoch=epoch,
@@ -1519,6 +1658,7 @@ def main() -> None:
                     "train/epoch_loss": epoch_mean_loss,
                     "train/epoch_jepa_loss": epoch_mean_jepa_loss,
                     "train/epoch_richness_regularizer": epoch_mean_regularizer,
+                    "train/epoch_official_barlow": epoch_mean_official_barlow,
                     "train/epoch_seconds": time.time() - epoch_start,
                     "train/batches_per_epoch": batches,
                     "train/elapsed_seconds": time.time() - start,
@@ -1656,6 +1796,7 @@ def main() -> None:
                         bandit_cache=bandit_cache,
                         bandit_reward_normalizer=bandit_reward_normalizer,
                         richness_snapshot=richness_snapshot,
+                        official_barlow=official_barlow,
                     ),
                 )
                 save_spatial_checkpoint(
@@ -1673,6 +1814,7 @@ def main() -> None:
                         bandit_cache=bandit_cache,
                         bandit_reward_normalizer=bandit_reward_normalizer,
                         richness_snapshot=richness_snapshot,
+                        official_barlow=official_barlow,
                     ),
                 )
             if stopping_after_epoch:
