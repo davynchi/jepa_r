@@ -149,12 +149,13 @@ class Attention(nn.Module):
             x = attn @ v
         else:
             dropout_p = self.attn_drop.p if self.training else 0.0
+            default_scale = q.shape[-1] ** -0.5
+            scaled_q = q * (self.scale / default_scale)
             x = F.scaled_dot_product_attention(
-                q,
+                scaled_q,
                 k,
                 v,
                 dropout_p=dropout_p,
-                scale=self.scale,
             )
             attn = None
 
