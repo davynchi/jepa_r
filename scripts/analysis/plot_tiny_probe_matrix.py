@@ -58,7 +58,7 @@ def add_uniform_ridge(
     series: dict[str, dict[int, tuple[float, float]]],
     root: Path,
 ) -> None:
-    points = {}
+    points = series.setdefault("context/ridge", {})
     for path in sorted(root.glob("epoch_*/results.json")):
         payload = json.loads(path.read_text())
         metrics = payload["probes"]["context/ridge"]
@@ -66,14 +66,13 @@ def add_uniform_ridge(
             float(metrics["top1"]),
             float(metrics["top5"]),
         )
-    series["context/ridge"] = points
 
 
 def add_ras_ridge(
     series: dict[str, dict[int, tuple[float, float]]],
     path: Path,
 ) -> None:
-    points = {}
+    points = series.setdefault("context/ridge", {})
     for line in path.read_text().splitlines():
         record = json.loads(line)
         if record.get("event") != "linear_probe":
@@ -83,7 +82,6 @@ def add_ras_ridge(
             float(scalars["diag/class_accuracy"]),
             float(scalars["diag/class_top5_accuracy"]),
         )
-    series["context/ridge"] = points
 
 
 def merge_ridge_metrics(

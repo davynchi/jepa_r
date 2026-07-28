@@ -75,6 +75,7 @@ from jepa.training.images.spatial_curriculum import (  # noqa: E402
     SpatialWeightingConfig,
     SpatialWeightingState,
     init_spatial_weighting,
+    richness_from_images,
     sample_frame_indices,
     score_frames_by_coordinate_importance,
     score_frames_by_loss,
@@ -289,6 +290,24 @@ def _parse_args() -> argparse.Namespace:
         help="Spectral gain used by predictive-spectral richness",
     )
     parser.add_argument(
+        "--richness-regularizer",
+        choices=("none", "predictive-barlow"),
+        default="none",
+        help="Optional richness penalty added directly to the JEPA training objective",
+    )
+    parser.add_argument(
+        "--richness-regularizer-weight",
+        type=float,
+        default=0.0,
+        help="Lambda in L_total = L_JEPA - lambda * R",
+    )
+    parser.add_argument(
+        "--richness-regularizer-batch-size",
+        type=int,
+        default=0,
+        help="Images from each minibatch used by the regularizer; 0 uses the full minibatch",
+    )
+    parser.add_argument(
         "--ras-score-granularity",
         choices=("sample", "batch"),
         default="sample",
@@ -385,6 +404,24 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--weighting-predictive-redundancy-weight must be non-negative")
     if args.weighting_predictive_kappa <= 0:
         raise ValueError("--weighting-predictive-kappa must be positive")
+    if args.richness_regularizer_weight < 0:
+        raise ValueError("--richness-regularizer-weight must be non-negative")
+    if args.richness_regularizer_batch_size < 0:
+        raise ValueError("--richness-regularizer-batch-size must be non-negative")
+    if (
+        args.richness_regularizer == "none"
+        and args.richness_regularizer_weight != 0
+    ):
+        raise ValueError(
+            "--richness-regularizer-weight must be zero when the regularizer is disabled"
+        )
+    if (
+        args.richness_regularizer != "none"
+        and args.richness_regularizer_weight == 0
+    ):
+        raise ValueError(
+            "--richness-regularizer-weight must be positive when the regularizer is enabled"
+        )
     if (
         args.weighting_method == "ras-thompson"
         and args.weighting_richness
@@ -841,6 +878,15 @@ def main() -> None:
                 "checkpoint_every_steps": args.checkpoint_every_steps,
                 "log_every_steps": args.log_every_steps,
                 "resident_device_data": args.resident_device_data,
+                "richness_regularizer": {
+                    "functional": args.richness_regularizer,
+                    "weight": args.richness_regularizer_weight,
+                    "batch_size": args.richness_regularizer_batch_size,
+                    "delta": args.weighting_richness_delta,
+                    "predictive_redundancy_weight": (
+                        args.weighting_predictive_redundancy_weight
+                    ),
+                },
                 "weighting": {
                     "method": weighting_config.method,
                     "warmup_epochs": weighting_config.warmup_epochs,
@@ -1245,7 +1291,8 @@ def main() -> None:
                 order,
                 seed=derive_seed(args.seed, "masks", epoch),
             )
-            epoch_loss, batches = 0.0, 0
+            epoch_loss, epoch_jepa_loss, epoch_regularizer = 0.0, 0.0, 0.0
+            batches = 0
             epoch_bandit_rewards: list[float] = []
             epoch_bandit_prediction_errors: list[float] = []
             epoch_start = time.time()
@@ -1296,11 +1343,47 @@ def main() -> None:
                     enabled=use_amp,
                 ):
                     if bandit_sampler is not None:
-                        loss, batch_contexts = spatial_ijepa_loss_with_context(
+                        jepa_loss, batch_contexts = spatial_ijepa_loss_with_context(
                             core, batch, context_masks, target_masks
                         )
                     else:
-                        loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
+                        jepa_loss = spatial_ijepa_loss(
+                            core, batch, context_masks, target_masks
+                        )
+                    regularizer_penalty = jepa_loss.new_zeros(())
+                    regularizer_metadata: dict[str, float] = {}
+                    if args.richness_regularizer != "none":
+                        regularizer_batch_size = (
+                            batch.shape[0]
+                            if args.richness_regularizer_batch_size == 0
+                            else min(args.richness_regularizer_batch_size, batch.shape[0])
+                        )
+                        if regularizer_batch_size < 2:
+                            raise ValueError(
+                                "richness regularization requires at least two images"
+                            )
+                        regularizer_richness, regularizer_metadata = richness_from_images(
+                            core,
+                            batch[:regularizer_batch_size],
+                            functional=args.richness_regularizer,
+                            delta=args.weighting_richness_delta,
+                            trace_target=args.weighting_richness_trace_target,
+                            trace_beta=args.weighting_richness_trace_beta,
+                            grid=grid,
+                            mask_config=mask_config,
+                            mask_seed=derive_seed(
+                                args.seed, "richness-regularizer", global_step
+                            ),
+                            predictive_redundancy_weight=(
+                                args.weighting_predictive_redundancy_weight
+                            ),
+                            predictive_kappa=args.weighting_predictive_kappa,
+                        )
+                        regularizer_penalty = -regularizer_richness
+                    loss = (
+                        jepa_loss
+                        + args.richness_regularizer_weight * regularizer_penalty
+                    )
                 if use_amp:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -1355,7 +1438,11 @@ def main() -> None:
                 if core.policy.ema_enabled:
                     _ema_update(core.target_encoder, core.context_encoder, momentum)
                 loss_value = loss.item()
+                jepa_loss_value = jepa_loss.item()
+                regularizer_value = regularizer_penalty.item()
                 epoch_loss += loss_value
+                epoch_jepa_loss += jepa_loss_value
+                epoch_regularizer += regularizer_value
                 batches += 1
 
                 if args.log_every_steps > 0 and global_step % args.log_every_steps == 0:
@@ -1365,11 +1452,20 @@ def main() -> None:
                         event="train_step",
                         scalars={
                             "train/loss": loss_value,
+                            "train/jepa_loss": jepa_loss_value,
+                            "train/richness_regularizer": regularizer_value,
+                            "train/weighted_richness_regularizer": (
+                                args.richness_regularizer_weight * regularizer_value
+                            ),
                             "train/lr": current_lr,
                             "train/weight_decay": current_wd,
                             "train/ema_momentum": momentum,
                             "train/epoch_fraction": epoch
                             + batches / max(iterations_per_epoch, 1),
+                            **{
+                                key.replace("ras/", "regularizer/", 1): value
+                                for key, value in regularizer_metadata.items()
+                            },
                             **bandit_scalars,
                         },
                     )
@@ -1413,12 +1509,16 @@ def main() -> None:
                     )
 
             epoch_mean_loss = epoch_loss / batches
+            epoch_mean_jepa_loss = epoch_jepa_loss / batches
+            epoch_mean_regularizer = epoch_regularizer / batches
             logger.log(
                 step=global_step,
                 epoch=epoch,
                 event="epoch",
                 scalars={
                     "train/epoch_loss": epoch_mean_loss,
+                    "train/epoch_jepa_loss": epoch_mean_jepa_loss,
+                    "train/epoch_richness_regularizer": epoch_mean_regularizer,
                     "train/epoch_seconds": time.time() - epoch_start,
                     "train/batches_per_epoch": batches,
                     "train/elapsed_seconds": time.time() - start,
