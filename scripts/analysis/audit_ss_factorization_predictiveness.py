@@ -15,11 +15,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-from correlate_tiny_factorization_v2 import (  # noqa: E402
-    correlation,
-    load_factorization,
-    load_probe_root,
-)
+from correlate_tiny_factorization_v2 import correlation  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +32,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def load_factorization_display_epochs(path: Path) -> dict[str, dict[int, float]]:
+    payload = json.loads(path.read_text())
+    series: dict[str, dict[int, float]] = {}
+    for record in payload:
+        epoch = int(record.get("display_epoch", record["epoch"]))
+        for name, metric in record["metrics"].items():
+            value = metric.get("mean")
+            if value is not None and math.isfinite(float(value)):
+                series.setdefault(name, {})[epoch] = float(value)
+    return series
+
+
+def load_probe_display_epochs(path: Path) -> dict[str, dict[int, float]]:
+    series: dict[str, dict[int, float]] = {}
+    for result_path in sorted(path.glob("epoch_*/results.json")):
+        epoch = int(result_path.parent.name.removeprefix("epoch_"))
+        payload = json.loads(result_path.read_text())
+        for probe, values in payload.get("probes", {}).items():
+            for score in ("top1", "top5", "loss"):
+                if score in values:
+                    series.setdefault(f"{probe}/{score}", {})[epoch] = float(values[score])
+    return series
+
+
 def parse_runs(values: list[str]) -> dict[str, tuple[dict, dict]]:
     runs = {}
     for value in values:
@@ -44,8 +64,10 @@ def parse_runs(values: list[str]) -> dict[str, tuple[dict, dict]]:
             raise ValueError(f"run must be NAME,FACTOR_JSON,PROBE_ROOT: {value}")
         name, factor_path, probe_path = fields
         runs[name] = (
-            load_factorization(Path(factor_path).expanduser().resolve()),
-            load_probe_root(Path(probe_path).expanduser().resolve()),
+            load_factorization_display_epochs(
+                Path(factor_path).expanduser().resolve()
+            ),
+            load_probe_display_epochs(Path(probe_path).expanduser().resolve()),
         )
     return runs
 
