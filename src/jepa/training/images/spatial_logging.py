@@ -160,7 +160,10 @@ class SpatialRunLogger:
         if self.writer is None:
             return
         for name, value in safe_scalars.items():
-            if name not in self.tensorboard_scalars:
+            if (
+                name not in self.tensorboard_scalars
+                and not name.startswith("factorization/")
+            ):
                 continue
             if value is None or isinstance(value, bool):
                 continue

@@ -25,6 +25,7 @@ from jepa.analysis.subspace import (  # noqa: E402
     compute_latent_spectrum,
     fit_entity_classifier,
 )
+from jepa.analysis.factorization_v2 import lda_spectrum_metrics  # noqa: E402
 from jepa.configs.base import derive_seed  # noqa: E402
 from jepa.configs.images.shapes3d import (  # noqa: E402
     load_shapes3d_config,
@@ -71,6 +72,7 @@ from jepa.training.images.ijepa_spatial import (  # noqa: E402
     save_spatial_checkpoint,
     spatial_ijepa_loss,
     spatial_ijepa_loss_with_context,
+    spatial_ijepa_loss_with_online_embeddings,
 )
 from jepa.training.images.mask_loader import (  # noqa: E402
     FileImageMaskLoader,
@@ -193,6 +195,30 @@ def _parse_args() -> argparse.Namespace:
         help="Number of test samples used by the linear probe; 0 uses the full test split",
     )
     parser.add_argument("--probe-ridge", type=float, default=PROBE_RIDGE)
+    parser.add_argument(
+        "--online-factorization-size",
+        type=int,
+        default=0,
+        help="Keep target embeddings from the final training batches; 0 disables.",
+    )
+    parser.add_argument(
+        "--online-factorization-every-epochs",
+        type=int,
+        default=1,
+        help="Cadence for the nearly free final-batch LDA diagnostics.",
+    )
+    parser.add_argument(
+        "--exact-factorization-every-epochs",
+        type=int,
+        default=0,
+        help="Re-encode a fixed test subset with the EMA target encoder; 0 disables.",
+    )
+    parser.add_argument(
+        "--exact-factorization-size",
+        type=int,
+        default=2000,
+        help="Fixed test subset size for exact LDA diagnostics; 0 uses the full split.",
+    )
     parser.add_argument("--checkpoint-every-epochs", type=int, default=CHECKPOINT_EVERY_EPOCHS)
     parser.add_argument(
         "--checkpoint-every-steps",
@@ -482,6 +508,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("probe split sizes must be non-negative")
     if args.probe_ridge <= 0:
         raise ValueError("--probe-ridge must be positive")
+    if args.online_factorization_size < 0 or args.exact_factorization_size < 0:
+        raise ValueError("factorization subset sizes must be non-negative")
+    if args.online_factorization_every_epochs <= 0:
+        raise ValueError("--online-factorization-every-epochs must be positive")
+    if args.exact_factorization_every_epochs < 0:
+        raise ValueError("--exact-factorization-every-epochs must be non-negative")
 
 
 def _init_upstream_optimizer(
@@ -750,6 +782,25 @@ def _encode_images_pooled(
     return torch.cat(encoded, dim=0)
 
 
+@torch.no_grad()
+def _encode_target_images_pooled(
+    core,
+    samples: torch.Tensor,
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    was_training = core.target_encoder.training
+    core.target_encoder.eval()
+    encoded = []
+    for batch in samples.split(batch_size):
+        tokens = core.target_encoder(batch.to(device, non_blocking=True))
+        tokens = F.layer_norm(tokens, (tokens.shape[-1],))
+        encoded.append(tokens.mean(dim=1).float().cpu())
+    core.target_encoder.train(was_training)
+    return torch.cat(encoded, dim=0)
+
+
 def _select_probe_subset(
     images: torch.Tensor,
     labels: torch.Tensor,
@@ -953,6 +1004,13 @@ def main() -> None:
                     "redundancy_weight": args.official_barlow_lambda,
                     "workers": args.official_barlow_workers,
                 },
+                "factorization": {
+                    "online_size": args.online_factorization_size,
+                    "online_every_epochs": args.online_factorization_every_epochs,
+                    "exact_size": args.exact_factorization_size,
+                    "exact_every_epochs": args.exact_factorization_every_epochs,
+                    "encoder": "ema_target",
+                },
                 "weighting": {
                     "method": weighting_config.method,
                     "warmup_epochs": weighting_config.warmup_epochs,
@@ -1071,6 +1129,21 @@ def main() -> None:
             test_labels,
             size=args.probe_test_size,
             seed=derive_seed(args.seed, "linear-probe-test"),
+        )
+    exact_factorization_enabled = (
+        args.exact_factorization_every_epochs > 0 and train_paths is None
+    )
+    if args.exact_factorization_every_epochs > 0 and not exact_factorization_enabled:
+        print(
+            "exact factorization is disabled for file-backed Mini-WebVision",
+            flush=True,
+        )
+    if exact_factorization_enabled:
+        factorization_test_images, factorization_test_labels = _select_probe_subset(
+            test_images,
+            test_labels,
+            size=args.exact_factorization_size,
+            seed=derive_seed(args.seed, "exact-factorization-test"),
         )
     print(
         f"run_dir={run_dir}\n"
@@ -1355,6 +1428,13 @@ def main() -> None:
             core.target_encoder.train()
             if official_barlow is not None:
                 official_barlow.train()
+            collect_online_factorization = (
+                args.online_factorization_size > 0
+                and epoch % args.online_factorization_every_epochs == 0
+            )
+            online_factorization_features: list[torch.Tensor] = []
+            online_factorization_labels: list[torch.Tensor] = []
+            online_factorization_count = 0
             if bandit_sampler is not None and epoch > weighting_config.warmup_epochs:
                 assert bandit_cache is not None
                 policy_generator = torch.Generator().manual_seed(
@@ -1466,7 +1546,18 @@ def main() -> None:
                     dtype=amp_dtype or torch.bfloat16,
                     enabled=use_amp,
                 ):
-                    if bandit_sampler is not None:
+                    batch_target_embeddings = None
+                    if collect_online_factorization:
+                        jepa_loss, batch_contexts, batch_target_embeddings = (
+                            spatial_ijepa_loss_with_online_embeddings(
+                                core,
+                                batch,
+                                context_masks,
+                                target_masks,
+                                return_context=bandit_sampler is not None,
+                            )
+                        )
+                    elif bandit_sampler is not None:
                         jepa_loss, batch_contexts = spatial_ijepa_loss_with_context(
                             core, batch, context_masks, target_masks
                         )
@@ -1585,6 +1676,34 @@ def main() -> None:
                 epoch_regularizer += regularizer_value
                 epoch_official_barlow += official_barlow_value
                 batches += 1
+                if batch_target_embeddings is not None:
+                    retained_features = batch_target_embeddings.detach().float().cpu()
+                    retained_labels = train_labels[indices.detach().cpu()]
+                    if retained_features.shape[0] > args.online_factorization_size:
+                        retained_features = retained_features[-args.online_factorization_size :]
+                        retained_labels = retained_labels[-args.online_factorization_size :]
+                    online_factorization_features.append(retained_features)
+                    online_factorization_labels.append(retained_labels)
+                    online_factorization_count += retained_features.shape[0]
+                    while (
+                        online_factorization_count > args.online_factorization_size
+                        and online_factorization_features
+                    ):
+                        excess = (
+                            online_factorization_count - args.online_factorization_size
+                        )
+                        if online_factorization_features[0].shape[0] <= excess:
+                            online_factorization_count -= online_factorization_features[0].shape[0]
+                            online_factorization_features.pop(0)
+                            online_factorization_labels.pop(0)
+                        else:
+                            online_factorization_features[0] = (
+                                online_factorization_features[0][excess:]
+                            )
+                            online_factorization_labels[0] = (
+                                online_factorization_labels[0][excess:]
+                            )
+                            online_factorization_count -= excess
 
                 if args.log_every_steps > 0 and global_step % args.log_every_steps == 0:
                     logger.log(
@@ -1697,6 +1816,20 @@ def main() -> None:
                     ),
                 },
             )
+            if online_factorization_features:
+                online_metrics = lda_spectrum_metrics(
+                    torch.cat(online_factorization_features),
+                    torch.cat(online_factorization_labels),
+                )
+                logger.log(
+                    step=global_step,
+                    epoch=epoch,
+                    event="online_factorization",
+                    scalars={
+                        f"factorization/online/{name}": value
+                        for name, value in online_metrics.items()
+                    },
+                )
             if should_update_weights(epoch, weighting_config):
                 refresh_periodic_weighting(epoch)
 
@@ -1749,6 +1882,34 @@ def main() -> None:
                     f"trace_cov={spectrum.trace_covariance:9.4f} "
                     f"elapsed={time.time() - start:.0f}s",
                     flush=True,
+                )
+            if (
+                exact_factorization_enabled
+                and epoch % args.exact_factorization_every_epochs == 0
+            ):
+                factorization_started = time.time()
+                exact_features = _encode_target_images_pooled(
+                    core,
+                    factorization_test_images,
+                    batch_size=args.batch_size,
+                    device=device,
+                )
+                exact_metrics = lda_spectrum_metrics(
+                    exact_features,
+                    factorization_test_labels,
+                )
+                logger.log(
+                    step=global_step,
+                    epoch=epoch,
+                    event="exact_factorization",
+                    scalars={
+                        **{
+                            f"factorization/exact/{name}": value
+                            for name, value in exact_metrics.items()
+                        },
+                        "factorization/exact/seconds": time.time()
+                        - factorization_started,
+                    },
                 )
             if (
                 probe_enabled

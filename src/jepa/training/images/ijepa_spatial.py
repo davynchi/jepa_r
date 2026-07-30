@@ -296,6 +296,21 @@ def spatial_ijepa_prediction_targets(
     target_masks: list[torch.Tensor] | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     """Return aligned predictor/EMA-target tokens and the encoded context."""
+    prediction, target, context, num_context_masks, num_target_masks, _ = (
+        spatial_ijepa_prediction_targets_with_full_target(
+            core, images, context_masks, target_masks
+        )
+    )
+    return prediction, target, context, num_context_masks, num_target_masks
+
+
+def spatial_ijepa_prediction_targets_with_full_target(
+    core: SpatialIJEPACore,
+    images: torch.Tensor,
+    context_masks: list[torch.Tensor] | torch.Tensor,
+    target_masks: list[torch.Tensor] | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, torch.Tensor]:
+    """Also return normalized full-image EMA-target tokens before masking."""
     if isinstance(context_masks, torch.Tensor):
         context_masks = [context_masks]
     if isinstance(target_masks, torch.Tensor):
@@ -306,12 +321,13 @@ def spatial_ijepa_prediction_targets(
     batch_size = images.shape[0]
 
     with torch.no_grad() if not core.policy.optimize_target else torch.enable_grad():
-        target = core.target_encoder(images)
-        target = F.layer_norm(target, (target.size(-1),))
-        target = apply_masks(target, target_masks)
+        full_target = core.target_encoder(images)
+        full_target = F.layer_norm(full_target, (full_target.size(-1),))
+        target = apply_masks(full_target, target_masks)
         target = repeat_interleave_batch(target, batch_size, repeat=len(context_masks))
     if core.policy.stop_gradient:
         target = target.detach()
+        full_target = full_target.detach()
 
     context = core.context_encoder(images, context_masks)
     prediction = core.predictor(context, context_masks, target_masks)
@@ -321,6 +337,7 @@ def spatial_ijepa_prediction_targets(
         context,
         len(context_masks),
         len(target_masks),
+        full_target,
     )
 
 
@@ -343,6 +360,32 @@ def spatial_ijepa_loss_with_context(
         core, images, context_masks, target_masks
     )
     return losses.mean(), contexts
+
+
+def spatial_ijepa_loss_with_online_embeddings(
+    core: SpatialIJEPACore,
+    images: torch.Tensor,
+    context_masks: list[torch.Tensor] | torch.Tensor,
+    target_masks: list[torch.Tensor] | torch.Tensor,
+    *,
+    return_context: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Compute the normal JEPA loss while exposing already-computed target embeddings."""
+    prediction, target, context, num_context_masks, num_target_masks, full_target = (
+        spatial_ijepa_prediction_targets_with_full_target(
+            core, images, context_masks, target_masks
+        )
+    )
+    batch_size = images.shape[0]
+    losses = F.smooth_l1_loss(prediction, target, reduction="none").reshape(
+        num_target_masks, num_context_masks, batch_size, -1
+    ).mean(dim=(0, 1, 3))
+    pooled_context = None
+    if return_context:
+        pooled_context = context.reshape(
+            num_context_masks, batch_size, context.shape[-2], context.shape[-1]
+        ).mean(dim=(0, 2))
+    return losses.mean(), pooled_context, full_target.mean(dim=1)
 
 
 def encode_samples_pooled(core: SpatialIJEPACore, images: torch.Tensor) -> torch.Tensor:
