@@ -20,6 +20,7 @@ from jepa.analysis.joint_transform_factorization import (  # noqa: E402
     fit_joint_block_diagonalization,
     fit_linear_operator,
     fit_whitening_projection,
+    remove_isotropic_component,
 )
 from jepa.configs.base import derive_seed  # noqa: E402
 from jepa.data.images.tiny_imagenet import (  # noqa: E402
@@ -75,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jbd-restarts", type=int, default=4)
     parser.add_argument("--jbd-steps", type=int, default=600)
     parser.add_argument("--jbd-learning-rate", type=float, default=0.05)
+    parser.add_argument("--center-operators", action="store_true")
     parser.add_argument("--seed", type=int, default=4701)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
@@ -311,6 +313,17 @@ def _operator_family(
             "validation_operator_test_r2": validation_fit.r_squared,
             "validation_operator_test_nmse": validation_fit.normalized_mse,
             "validation_operator_energy": validation_fit.energy_per_dimension,
+            "train_operator_isotropic_energy_fraction": (
+                float(train_fit.operator.trace().square() / train_fit.operator.shape[0])
+                / max(float(train_fit.operator.square().sum()), 1e-12)
+            ),
+            "validation_operator_isotropic_energy_fraction": (
+                float(
+                    validation_fit.operator.trace().square()
+                    / validation_fit.operator.shape[0]
+                )
+                / max(float(validation_fit.operator.square().sum()), 1e-12)
+            ),
         }
     return (
         torch.stack(train_operators),
@@ -334,6 +347,7 @@ def evaluate_embeddings(
     jbd_learning_rate: float,
     optimization_device: torch.device,
     seed: int,
+    center_operators: bool,
 ) -> dict[str, object]:
     whitening = fit_whitening_projection(
         source[train_indices],
@@ -364,6 +378,9 @@ def evaluate_embeddings(
             device=optimization_device,
             dtype=torch.float32,
         )
+        if center_operators:
+            train_operators = remove_isotropic_component(train_operators)
+            validation_operators = remove_isotropic_component(validation_operators)
         block_results = {}
         for block_count in num_blocks:
             fit = fit_joint_block_diagonalization(
@@ -384,6 +401,11 @@ def evaluate_embeddings(
                 "restart_validation_factorizations": list(
                     fit.restart_validation_factorizations
                 ),
+                "gain_over_random": (
+                    fit.validation_factorization
+                    - fit.random_validation_factorization
+                )
+                / max(1.0 - fit.random_validation_factorization, 1e-12),
             }
         families[key] = {
             "operator_diagnostics": diagnostics,
@@ -450,12 +472,26 @@ def plot_records(records: list[dict[str, object]], output: Path) -> None:
             for row in records
         ]
         axes[0].plot(epochs, paired, marker="o", label=f"K={block_count}")
+        random_basis = [
+            row["result"]["families"]["paired"]["blocks"][str(block_count)][  # type: ignore[index]
+                "random_validation_factorization"
+            ]
+            for row in records
+        ]
+        axes[0].plot(epochs, random_basis, linestyle="--", alpha=0.65)
         axes[0].plot(epochs, shuffled, linestyle=":", alpha=0.65)
     axes[0].set_title("Joint transform factorization")
     axes[0].set_xlabel("Epoch (0 = untrained)")
     axes[0].set_ylabel("$F_K$ on held-out operators")
     axes[0].grid(alpha=0.25)
     axes[0].legend()
+    axes[0].text(
+        0.02,
+        0.02,
+        "solid: paired   dashed: random basis   dotted: shuffled pairs",
+        transform=axes[0].transAxes,
+        fontsize=8,
+    )
 
     transforms = list(
         records[0]["result"]["families"]["paired"]["operator_diagnostics"]  # type: ignore[index]
@@ -579,6 +615,7 @@ def main() -> None:
             jbd_learning_rate=args.jbd_learning_rate,
             optimization_device=device,
             seed=derive_seed(args.seed, checkpoint_name),
+            center_operators=args.center_operators,
         )
         record = {
             "checkpoint": checkpoint_name,
@@ -626,6 +663,7 @@ def main() -> None:
         "jbd_restarts": args.jbd_restarts,
         "jbd_steps": args.jbd_steps,
         "jbd_learning_rate": args.jbd_learning_rate,
+        "center_operators": args.center_operators,
         "seed": args.seed,
         "batch_size": args.batch_size,
         "amp_dtype": args.amp_dtype,

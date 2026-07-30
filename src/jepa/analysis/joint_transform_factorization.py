@@ -154,6 +154,20 @@ def block_defect(
     return numerator / denominator
 
 
+def remove_isotropic_component(operators: torch.Tensor) -> torch.Tensor:
+    """Remove the scalar-identity part that is block diagonal in every basis."""
+    if operators.ndim != 3 or operators.shape[1] != operators.shape[2]:
+        raise ValueError("operators must have shape [A, D, D]")
+    dimension = operators.shape[-1]
+    identity = torch.eye(
+        dimension,
+        device=operators.device,
+        dtype=operators.dtype,
+    )
+    scales = torch.diagonal(operators, dim1=-2, dim2=-1).sum(dim=-1) / dimension
+    return operators - scales[:, None, None] * identity
+
+
 def _random_orthogonal(
     dimension: int,
     *,
@@ -257,4 +271,5 @@ __all__ = [
     "fit_joint_block_diagonalization",
     "fit_linear_operator",
     "fit_whitening_projection",
+    "remove_isotropic_component",
 ]

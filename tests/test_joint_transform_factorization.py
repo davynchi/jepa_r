@@ -7,6 +7,7 @@ from jepa.analysis.joint_transform_factorization import (
     fit_joint_block_diagonalization,
     fit_linear_operator,
     fit_whitening_projection,
+    remove_isotropic_component,
 )
 
 
@@ -80,3 +81,11 @@ def test_joint_block_diagonalization_does_not_invent_perfect_structure() -> None
     )
 
     assert fit.validation_factorization < 0.8
+
+
+def test_isotropic_component_is_removed_exactly() -> None:
+    operators = torch.stack((2 * torch.eye(6), -3 * torch.eye(6)))
+
+    residuals = remove_isotropic_component(operators)
+
+    assert torch.allclose(residuals, torch.zeros_like(residuals), atol=1e-7)
