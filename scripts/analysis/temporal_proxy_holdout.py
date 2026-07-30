@@ -63,6 +63,7 @@ def parse_runs(values: list[str]) -> dict[str, dict[str, Any]]:
             "features": {
                 "lda_trace": lda["lda_discriminative_trace"],
                 "lda_between_total": lda["between_total_trace_ratio"],
+                "lda_latent_erank": lda["latent_effective_rank"],
                 "ss_invariance": ss["ss_crop_invariance_mean"],
                 "ss_latent_erank": ss["ss_crop_latent_effective_rank"],
                 "train_loss": load_train_loss(Path(metrics_path).resolve()),
@@ -155,11 +156,18 @@ def main() -> None:
         "train_loss": ("train_loss",),
         "lda_trace": ("lda_trace",),
         "lda_between_total": ("lda_between_total",),
+        "lda_latent_erank": ("lda_latent_erank",),
         "ss_invariance": ("ss_invariance",),
         "ss_latent_erank": ("ss_latent_erank",),
+        "lda_composite": (
+            "lda_trace",
+            "lda_between_total",
+            "lda_latent_erank",
+        ),
         "composite": (
             "lda_trace",
             "lda_between_total",
+            "lda_latent_erank",
             "ss_invariance",
             "ss_latent_erank",
         ),
@@ -250,6 +258,7 @@ def main() -> None:
                 ("train_loss", "-."),
                 ("ss_invariance", "-"),
                 ("lda_trace", "-"),
+                ("lda_composite", "-"),
                 ("composite", "-"),
             ):
                 values = curve[predictor_name][1]
