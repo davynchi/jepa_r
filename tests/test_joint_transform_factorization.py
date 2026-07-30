@@ -17,7 +17,7 @@ def test_whitening_and_linear_operator_generalize() -> None:
     whitening = fit_whitening_projection(features[:350], dimension=8)
     source = apply_whitening(features, whitening)
     operator = torch.randn(8, 8, generator=generator, dtype=source.dtype) / 4
-    target = source @ operator
+    target = source @ operator + 2.5
 
     fit = fit_linear_operator(
         source[:350],
@@ -29,6 +29,11 @@ def test_whitening_and_linear_operator_generalize() -> None:
 
     assert whitening.retained_variance_fraction > 0.6
     assert fit.r_squared > 0.999
+    assert torch.allclose(
+        fit.intercept,
+        torch.full_like(fit.intercept, 2.5),
+        atol=1e-4,
+    )
 
 
 def test_joint_block_diagonalization_recovers_shared_blocks() -> None:

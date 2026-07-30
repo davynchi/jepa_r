@@ -25,6 +25,7 @@ class WhiteningProjection:
 @dataclass(frozen=True)
 class LinearOperatorFit:
     operator: torch.Tensor
+    intercept: torch.Tensor
     normalized_mse: float
     r_squared: float
     energy_per_dimension: float
@@ -98,19 +99,25 @@ def fit_linear_operator(
     if ridge < 0:
         raise ValueError("ridge must be non-negative")
 
+    source_mean = source.mean(dim=0)
+    target_mean = target.mean(dim=0)
+    centered_source = source - source_mean
+    centered_target = target - target_mean
     identity = torch.eye(source.shape[1], device=source.device, dtype=source.dtype)
-    gram = source.T @ source
+    gram = centered_source.T @ centered_source
     operator = torch.linalg.solve(
         gram + ridge * source.shape[0] * identity,
-        source.T @ target,
+        centered_source.T @ centered_target,
     )
-    prediction = validation_source @ operator
+    intercept = target_mean - source_mean @ operator
+    prediction = validation_source @ operator + intercept
     squared_error = (prediction - validation_target).square().sum()
     centered_target = validation_target - validation_target.mean(dim=0)
     denominator = centered_target.square().sum().clamp_min(1e-12)
     normalized_mse = float(squared_error / denominator)
     return LinearOperatorFit(
         operator=operator,
+        intercept=intercept,
         normalized_mse=normalized_mse,
         r_squared=1.0 - normalized_mse,
         energy_per_dimension=float(operator.square().sum() / operator.shape[0]),
