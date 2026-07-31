@@ -46,6 +46,7 @@ DEFAULT_TRANSFORMS = (
     "grayscale",
     "flip",
 )
+SUPPORTED_TRANSFORMS = DEFAULT_TRANSFORMS + ("color_fixed",)
 CROP_SCALES = {
     "crop_small": (0.30, 0.50),
     "crop_medium": (0.50, 0.70),
@@ -156,6 +157,19 @@ def _color_transform(
     return ((result - grayscale) * saturation + grayscale).clamp(0, 1)
 
 
+def _fixed_color_transform(images: torch.Tensor, strength: float = 0.2) -> torch.Tensor:
+    factor = 1.0 + strength
+    result = images * factor
+    spatial_mean = result.mean(dim=(1, 2, 3), keepdim=True)
+    result = (result - spatial_mean) * factor + spatial_mean
+    grayscale = (
+        0.2989 * result[:, 0:1]
+        + 0.5870 * result[:, 1:2]
+        + 0.1140 * result[:, 2:3]
+    )
+    return ((result - grayscale) * factor + grayscale).clamp(0, 1)
+
+
 def apply_transform(
     images: torch.Tensor,
     name: str,
@@ -179,6 +193,8 @@ def apply_transform(
         )
     if name == "color":
         return _color_transform(images, generator=generator)
+    if name == "color_fixed":
+        return _fixed_color_transform(images)
     if name == "blur":
         return _gaussian_blur(images)
     if name == "grayscale":
@@ -519,7 +535,7 @@ def plot_records(records: list[dict[str, object]], output: Path) -> None:
 def main() -> None:
     args = parse_args()
     transforms = tuple(args.transforms)
-    unknown = sorted(set(transforms) - set(DEFAULT_TRANSFORMS))
+    unknown = sorted(set(transforms) - set(SUPPORTED_TRANSFORMS))
     if unknown:
         raise ValueError(f"unknown transforms: {unknown}")
     if len(set(transforms)) != len(transforms):
