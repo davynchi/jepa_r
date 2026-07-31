@@ -21,6 +21,15 @@ class SpectralNullResult:
     delta: float
     z_score: float
     null_factorizations: tuple[float, ...]
+    real_basis: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ProjectorAgreement:
+    mean_overlap: float
+    minimum_overlap: float
+    matched_overlaps: tuple[float, ...]
+    assignment: tuple[int, ...]
 
 
 def fit_variance_whitening_projection(
@@ -231,6 +240,61 @@ def optimized_factorizations_batched(
     return all_scores
 
 
+def block_projectors(basis: torch.Tensor, *, num_blocks: int) -> torch.Tensor:
+    """Convert an orthogonal basis into its unordered block projectors."""
+    if basis.ndim != 2 or basis.shape[0] != basis.shape[1]:
+        raise ValueError("basis must be a square matrix")
+    if num_blocks <= 1 or basis.shape[0] % num_blocks:
+        raise ValueError("num_blocks must exceed one and divide the dimension")
+    block_size = basis.shape[0] // num_blocks
+    blocks = basis.T.reshape(num_blocks, block_size, basis.shape[0])
+    return blocks.transpose(-1, -2) @ blocks
+
+
+def _optimal_assignment(overlaps: torch.Tensor) -> tuple[int, ...]:
+    """Maximize a small square assignment problem with bit-mask dynamic programming."""
+    size = overlaps.shape[0]
+    scores: dict[int, tuple[float, tuple[int, ...]]] = {0: (0.0, ())}
+    for row in range(size):
+        updated: dict[int, tuple[float, tuple[int, ...]]] = {}
+        for mask, (score, assignment) in scores.items():
+            for column in range(size):
+                if mask & (1 << column):
+                    continue
+                new_mask = mask | (1 << column)
+                candidate = (score + float(overlaps[row, column]), assignment + (column,))
+                if new_mask not in updated or candidate[0] > updated[new_mask][0]:
+                    updated[new_mask] = candidate
+        scores = updated
+    return scores[(1 << size) - 1][1]
+
+
+def optimal_projector_agreement(
+    first_basis: torch.Tensor,
+    second_basis: torch.Tensor,
+    *,
+    num_blocks: int,
+) -> ProjectorAgreement:
+    """Compare unordered block subspaces, ignoring within-block rotations."""
+    if first_basis.shape != second_basis.shape:
+        raise ValueError("bases must have equal shape")
+    first = block_projectors(first_basis, num_blocks=num_blocks)
+    second = block_projectors(second_basis, num_blocks=num_blocks).to(
+        device=first.device,
+        dtype=first.dtype,
+    )
+    block_size = first_basis.shape[0] // num_blocks
+    overlaps = torch.einsum("aij,bji->ab", first, second) / block_size
+    assignment = _optimal_assignment(overlaps)
+    matched = tuple(float(overlaps[row, column]) for row, column in enumerate(assignment))
+    return ProjectorAgreement(
+        mean_overlap=sum(matched) / len(matched),
+        minimum_overlap=min(matched),
+        matched_overlaps=matched,
+        assignment=assignment,
+    )
+
+
 def spectral_null_test(
     operators: torch.Tensor,
     *,
@@ -245,7 +309,7 @@ def spectral_null_test(
     """Compare optimized real block structure with independent Haar rotations."""
     if null_samples < 2:
         raise ValueError("null_samples must be at least two")
-    real, _ = optimized_factorization(
+    real, real_fit = optimized_factorization(
         operators,
         num_blocks=num_blocks,
         restarts=restarts,
@@ -282,15 +346,19 @@ def spectral_null_test(
         delta=delta,
         z_score=z_score,
         null_factorizations=tuple(null_values),
+        real_basis=real_fit.basis,
     )
 
 
 __all__ = [
     "SpectralNullResult",
+    "ProjectorAgreement",
+    "block_projectors",
     "fit_variance_whitening_projection",
     "haar_orthogonal",
     "independently_rotate_operators",
     "optimized_factorization",
     "optimized_factorizations_batched",
+    "optimal_projector_agreement",
     "spectral_null_test",
 ]

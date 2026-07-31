@@ -6,6 +6,7 @@ from jepa.analysis.spectral_block_null import (
     fit_variance_whitening_projection,
     haar_orthogonal,
     independently_rotate_operators,
+    optimal_projector_agreement,
     optimized_factorizations_batched,
     spectral_null_test,
 )
@@ -113,3 +114,21 @@ def test_batched_optimizer_matches_independent_optimizer_quality() -> None:
     )
 
     assert torch.allclose(torch.tensor(together), torch.tensor(separately), atol=1e-6)
+
+
+def test_projector_agreement_ignores_block_permutations_and_internal_rotations() -> None:
+    first = torch.eye(8, dtype=torch.float64)
+    generator = torch.Generator().manual_seed(41)
+    rotations = []
+    for _ in range(4):
+        block, _ = torch.linalg.qr(torch.randn(2, 2, generator=generator, dtype=torch.float64))
+        rotations.append(block)
+    internal = torch.block_diag(*rotations)
+    permutation = torch.tensor([4, 5, 0, 1, 6, 7, 2, 3])
+    second = (first @ internal)[:, permutation]
+
+    agreement = optimal_projector_agreement(first, second, num_blocks=4)
+
+    assert abs(agreement.mean_overlap - 1.0) < 1e-10
+    assert abs(agreement.minimum_overlap - 1.0) < 1e-10
+    assert sorted(agreement.assignment) == [0, 1, 2, 3]
