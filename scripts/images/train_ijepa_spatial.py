@@ -20,12 +20,12 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
+from jepa.analysis.factorization_v2 import lda_spectrum_metrics  # noqa: E402
 from jepa.analysis.subspace import (  # noqa: E402
     classifier_accuracy,
     compute_latent_spectrum,
     fit_entity_classifier,
 )
-from jepa.analysis.factorization_v2 import lda_spectrum_metrics  # noqa: E402
 from jepa.configs.base import derive_seed  # noqa: E402
 from jepa.configs.images.shapes3d import (  # noqa: E402
     load_shapes3d_config,
@@ -78,6 +78,10 @@ from jepa.training.images.mask_loader import (  # noqa: E402
     FileImageMaskLoader,
     IndexMaskLoader,
     apply_prepared_crop,
+)
+from jepa.training.images.residual_q17 import (  # noqa: E402
+    ResidualQ17Regularizer,
+    gradient_alignment_and_weight,
 )
 from jepa.training.images.spatial_curriculum import (  # noqa: E402
     SpatialWeightingConfig,
@@ -355,6 +359,39 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--official-barlow-lambda", type=float, default=0.0051)
     parser.add_argument("--official-barlow-workers", type=int, default=8)
     parser.add_argument(
+        "--residual-q17-gradient-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Target norm ratio ||grad L_Q17|| / ||grad L_JEPA|| on the online "
+            "encoder; 0 disables residual-Q17"
+        ),
+    )
+    parser.add_argument(
+        "--residual-q17-mode",
+        choices=("matched", "shuffled"),
+        default="matched",
+        help="Use matched residual targets or the distribution-preserving shuffled control",
+    )
+    parser.add_argument(
+        "--residual-q17-transforms",
+        nargs="+",
+        choices=("flip", "blur", "color"),
+        default=("flip", "blur", "color"),
+    )
+    parser.add_argument(
+        "--residual-q17-batch-size",
+        type=int,
+        default=0,
+        help="Images per JEPA batch used by residual-Q17; 0 uses the full batch",
+    )
+    parser.add_argument("--residual-q17-statistics-decay", type=float, default=0.99)
+    parser.add_argument("--residual-q17-epsilon", type=float, default=1.0e-6)
+    parser.add_argument("--residual-q17-operator-lr", type=float, default=1.0e-3)
+    parser.add_argument("--residual-q17-operator-weight-decay", type=float, default=1.0e-4)
+    parser.add_argument("--residual-q17-blur-sigma", type=float, default=1.0)
+    parser.add_argument("--residual-q17-color-strength", type=float, default=0.2)
+    parser.add_argument(
         "--ras-score-granularity",
         choices=("sample", "batch"),
         default="sample",
@@ -467,32 +504,40 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--official-barlow-lambda must be non-negative")
     if args.official_barlow_workers < 0:
         raise ValueError("--official-barlow-workers must be non-negative")
-    if (
-        args.richness_regularizer == "none"
-        and args.richness_regularizer_weight != 0
-    ):
+    if not 0 <= args.residual_q17_gradient_ratio <= 1:
+        raise ValueError("--residual-q17-gradient-ratio must be in [0, 1]")
+    if args.residual_q17_batch_size != 0 and args.residual_q17_batch_size < 4:
+        raise ValueError("--residual-q17-batch-size must be 0 or at least four")
+    if len(set(args.residual_q17_transforms)) != len(args.residual_q17_transforms):
+        raise ValueError("--residual-q17-transforms must be unique")
+    if not 0 <= args.residual_q17_statistics_decay < 1:
+        raise ValueError("--residual-q17-statistics-decay must be in [0, 1)")
+    if args.residual_q17_epsilon <= 0:
+        raise ValueError("--residual-q17-epsilon must be positive")
+    if args.residual_q17_operator_lr <= 0:
+        raise ValueError("--residual-q17-operator-lr must be positive")
+    if args.residual_q17_operator_weight_decay < 0:
+        raise ValueError("--residual-q17-operator-weight-decay must be non-negative")
+    if args.residual_q17_blur_sigma <= 0:
+        raise ValueError("--residual-q17-blur-sigma must be positive")
+    if args.residual_q17_color_strength < 0:
+        raise ValueError("--residual-q17-color-strength must be non-negative")
+    if args.richness_regularizer == "none" and args.richness_regularizer_weight != 0:
         raise ValueError(
             "--richness-regularizer-weight must be zero when the regularizer is disabled"
         )
-    if (
-        args.richness_regularizer != "none"
-        and args.richness_regularizer_weight == 0
-    ):
+    if args.richness_regularizer != "none" and args.richness_regularizer_weight == 0:
         raise ValueError(
             "--richness-regularizer-weight must be positive when the regularizer is enabled"
         )
-    if (
-        args.weighting_method == "ras-thompson"
-        and args.weighting_richness
-        in {
-            "predictive-barlow",
-            "predictive-spectral",
-            "predictive-covariance",
-            "predictive-energy",
-            "predictive-dimension",
-            "predictive-combined",
-        }
-    ):
+    if args.weighting_method == "ras-thompson" and args.weighting_richness in {
+        "predictive-barlow",
+        "predictive-spectral",
+        "predictive-covariance",
+        "predictive-energy",
+        "predictive-dimension",
+        "predictive-combined",
+    }:
         raise ValueError(
             "predictive richness currently supports periodic --weighting-method ras only"
         )
@@ -623,6 +668,8 @@ def _weighting_checkpoint_state(
     bandit_reward_normalizer: DiscountedRewardNormalizer | None = None,
     richness_snapshot: RichnessGradientSnapshot | None = None,
     official_barlow: BarlowTwinsProjector | None = None,
+    residual_q17: ResidualQ17Regularizer | None = None,
+    residual_q17_optimizer: torch.optim.Optimizer | None = None,
 ) -> dict[str, object]:
     state: dict[str, object] = {
         "weighting_memory": weighting_state.memory,
@@ -649,6 +696,11 @@ def _weighting_checkpoint_state(
         }
     if official_barlow is not None:
         state["official_barlow"] = official_barlow.state_dict()
+    if residual_q17 is not None:
+        if residual_q17_optimizer is None:
+            raise ValueError("residual-Q17 optimizer is required for checkpointing")
+        state["residual_q17"] = residual_q17.state_dict()
+        state["residual_q17_optimizer"] = residual_q17_optimizer.state_dict()
     return state
 
 
@@ -867,7 +919,22 @@ def main() -> None:
     run_dir = Path(args.output_root).expanduser().resolve() / run_name
     checkpoint_dir = run_dir / "network"
     checkpoint_dir.mkdir(parents=True, exist_ok=args.resume_from is not None)
-    logger = SpatialRunLogger(run_dir, enable_tensorboard=not args.no_tensorboard)
+    logger = SpatialRunLogger(
+        run_dir,
+        enable_tensorboard=not args.no_tensorboard,
+        extra_tensorboard_scalars=(
+            "train/residual_q17",
+            "train/residual_q17_operator",
+            "train/epoch_residual_q17",
+            "train/epoch_residual_q17_operator",
+            "residual_q17/gradient_cosine",
+            "residual_q17/jepa_gradient_norm",
+            "residual_q17/auxiliary_gradient_norm",
+            "residual_q17/loss_weight",
+            "residual_q17/actual_gradient_ratio",
+            "residual_q17/loss",
+        ),
+    )
     weighting_config = SpatialWeightingConfig(
         method=args.weighting_method,
         warmup_epochs=args.weighting_warmup_epochs,
@@ -993,9 +1060,7 @@ def main() -> None:
                     "weight": args.richness_regularizer_weight,
                     "batch_size": args.richness_regularizer_batch_size,
                     "delta": args.weighting_richness_delta,
-                    "predictive_redundancy_weight": (
-                        args.weighting_predictive_redundancy_weight
-                    ),
+                    "predictive_redundancy_weight": (args.weighting_predictive_redundancy_weight),
                 },
                 "official_barlow": {
                     "weight": args.official_barlow_weight,
@@ -1003,6 +1068,21 @@ def main() -> None:
                     "projector": list(args.official_barlow_projector),
                     "redundancy_weight": args.official_barlow_lambda,
                     "workers": args.official_barlow_workers,
+                },
+                "residual_q17": {
+                    "enabled": args.residual_q17_gradient_ratio > 0,
+                    "gradient_ratio": args.residual_q17_gradient_ratio,
+                    "mode": args.residual_q17_mode,
+                    "transforms": list(args.residual_q17_transforms),
+                    "batch_size": args.residual_q17_batch_size,
+                    "statistics_decay": args.residual_q17_statistics_decay,
+                    "epsilon": args.residual_q17_epsilon,
+                    "operator": "full_linear_centered_no_bias",
+                    "operator_learning_rate": args.residual_q17_operator_lr,
+                    "operator_weight_decay": args.residual_q17_operator_weight_decay,
+                    "cross_fit": "even_fit_odd_encoder",
+                    "blur_sigma": args.residual_q17_blur_sigma,
+                    "color_strength": args.residual_q17_color_strength,
                 },
                 "factorization": {
                     "online_size": args.online_factorization_size,
@@ -1028,9 +1108,7 @@ def main() -> None:
                     "richness_delta": weighting_config.richness_delta,
                     "richness_trace_target": weighting_config.richness_trace_target,
                     "richness_trace_beta": weighting_config.richness_trace_beta,
-                    "predictive_redundancy_weight": (
-                        weighting_config.predictive_redundancy_weight
-                    ),
+                    "predictive_redundancy_weight": (weighting_config.predictive_redundancy_weight),
                     "predictive_kappa": weighting_config.predictive_kappa,
                     "ras_score_granularity": weighting_config.ras_score_granularity,
                     "ras_alignment": weighting_config.ras_alignment,
@@ -1061,11 +1139,7 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
 
     train_paths = list(datasets.train.paths) if args.dataset == "mini-webvision" else None
-    official_barlow_paths = (
-        list(datasets.train.paths)
-        if hasattr(datasets.train, "paths")
-        else None
-    )
+    official_barlow_paths = list(datasets.train.paths) if hasattr(datasets.train, "paths") else None
     train_labels = datasets.train.entities.detach().cpu().to(torch.long)
     test_labels = datasets.test.entities.detach().cpu().to(torch.long)
     num_classes = int(max(train_labels.max().item(), test_labels.max().item()) + 1)
@@ -1130,9 +1204,7 @@ def main() -> None:
             size=args.probe_test_size,
             seed=derive_seed(args.seed, "linear-probe-test"),
         )
-    exact_factorization_enabled = (
-        args.exact_factorization_every_epochs > 0 and train_paths is None
-    )
+    exact_factorization_enabled = args.exact_factorization_every_epochs > 0 and train_paths is None
     if args.exact_factorization_every_epochs > 0 and not exact_factorization_enabled:
         print(
             "exact factorization is disabled for file-backed Mini-WebVision",
@@ -1190,14 +1262,28 @@ def main() -> None:
             ),
         )
         official_barlow_iterator = iter(official_barlow_loader)
+    residual_q17: ResidualQ17Regularizer | None = None
+    residual_q17_optimizer: torch.optim.Optimizer | None = None
+    if args.residual_q17_gradient_ratio > 0:
+        residual_q17 = ResidualQ17Regularizer(
+            core.embed_dim,
+            tuple(args.residual_q17_transforms),
+            statistics_decay=args.residual_q17_statistics_decay,
+            epsilon=args.residual_q17_epsilon,
+            blur_sigma=args.residual_q17_blur_sigma,
+            color_strength=args.residual_q17_color_strength,
+        ).to(device)
+        residual_q17_optimizer = torch.optim.AdamW(
+            residual_q17.operators.parameters(),
+            lr=args.residual_q17_operator_lr,
+            weight_decay=args.residual_q17_operator_weight_decay,
+        )
     mask_min_keep = args.mask_min_keep or (10 if grid >= 16 else 4)
     mask_config = MaskConfig(min_keep=mask_min_keep)
 
     n = train_images.shape[0]
     iterations_per_epoch = max(n // args.batch_size, 1)
-    num_draws_per_epoch = (
-        n if n < args.batch_size else iterations_per_epoch * args.batch_size
-    )
+    num_draws_per_epoch = n if n < args.batch_size else iterations_per_epoch * args.batch_size
     if train_paths is None:
         mask_loader = IndexMaskLoader(
             num_draws=num_draws_per_epoch,
@@ -1296,6 +1382,17 @@ def main() -> None:
             ):
                 raise ValueError("resume checkpoint is missing official Barlow state")
             official_barlow.load_state_dict(checkpoint_extra["official_barlow"])
+        if residual_q17 is not None:
+            if residual_q17_optimizer is None:
+                raise RuntimeError("residual-Q17 optimizer was not initialized")
+            if not isinstance(checkpoint_extra, dict) or not isinstance(
+                checkpoint_extra.get("residual_q17"), dict
+            ):
+                raise ValueError("resume checkpoint is missing residual-Q17 state")
+            if not isinstance(checkpoint_extra.get("residual_q17_optimizer"), dict):
+                raise ValueError("resume checkpoint is missing residual-Q17 optimizer state")
+            residual_q17.load_state_dict(checkpoint_extra["residual_q17"])
+            residual_q17_optimizer.load_state_dict(checkpoint_extra["residual_q17_optimizer"])
         if "optimizer" not in checkpoint:
             raise ValueError("resume checkpoint is missing optimizer state")
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -1357,9 +1454,7 @@ def main() -> None:
                 richness_delta=weighting_config.richness_delta,
                 richness_trace_target=weighting_config.richness_trace_target,
                 richness_trace_beta=weighting_config.richness_trace_beta,
-                predictive_redundancy_weight=(
-                    weighting_config.predictive_redundancy_weight
-                ),
+                predictive_redundancy_weight=(weighting_config.predictive_redundancy_weight),
                 predictive_kappa=weighting_config.predictive_kappa,
                 score_granularity=weighting_config.ras_score_granularity,
                 alignment=weighting_config.ras_alignment,
@@ -1428,6 +1523,8 @@ def main() -> None:
             core.target_encoder.train()
             if official_barlow is not None:
                 official_barlow.train()
+            if residual_q17 is not None:
+                residual_q17.train()
             collect_online_factorization = (
                 args.online_factorization_size > 0
                 and epoch % args.online_factorization_every_epochs == 0
@@ -1485,6 +1582,8 @@ def main() -> None:
             )
             epoch_loss, epoch_jepa_loss, epoch_regularizer = 0.0, 0.0, 0.0
             epoch_official_barlow = 0.0
+            epoch_residual_q17 = 0.0
+            epoch_residual_q17_operator = 0.0
             batches = 0
             epoch_bandit_rewards: list[float] = []
             epoch_bandit_prediction_errors: list[float] = []
@@ -1541,6 +1640,8 @@ def main() -> None:
                         trace_beta=weighting_config.richness_trace_beta,
                         step=global_step,
                     )
+                residual_q17_source = None
+                residual_q17_targets = None
                 with torch.autocast(
                     device_type=device.type,
                     dtype=amp_dtype or torch.bfloat16,
@@ -1562,9 +1663,7 @@ def main() -> None:
                             core, batch, context_masks, target_masks
                         )
                     else:
-                        jepa_loss = spatial_ijepa_loss(
-                            core, batch, context_masks, target_masks
-                        )
+                        jepa_loss = spatial_ijepa_loss(core, batch, context_masks, target_masks)
                     regularizer_penalty = jepa_loss.new_zeros(())
                     regularizer_metadata: dict[str, float] = {}
                     if args.richness_regularizer != "none":
@@ -1574,9 +1673,7 @@ def main() -> None:
                             else min(args.richness_regularizer_batch_size, batch.shape[0])
                         )
                         if regularizer_batch_size < 2:
-                            raise ValueError(
-                                "richness regularization requires at least two images"
-                            )
+                            raise ValueError("richness regularization requires at least two images")
                         regularizer_richness, regularizer_metadata = richness_from_images(
                             core,
                             batch[:regularizer_batch_size],
@@ -1586,9 +1683,7 @@ def main() -> None:
                             trace_beta=args.weighting_richness_trace_beta,
                             grid=grid,
                             mask_config=mask_config,
-                            mask_seed=derive_seed(
-                                args.seed, "richness-regularizer", global_step
-                            ),
+                            mask_seed=derive_seed(args.seed, "richness-regularizer", global_step),
                             predictive_redundancy_weight=(
                                 args.weighting_predictive_redundancy_weight
                             ),
@@ -1609,11 +1704,78 @@ def main() -> None:
                         official_barlow_loss, official_barlow_metadata = official_barlow(
                             first_representation, second_representation
                         )
-                    loss = (
+                    if residual_q17 is not None:
+                        residual_batch_size = (
+                            batch.shape[0]
+                            if args.residual_q17_batch_size == 0
+                            else min(args.residual_q17_batch_size, batch.shape[0])
+                        )
+                        if residual_batch_size < 4:
+                            raise ValueError(
+                                "residual-Q17 requires at least four images in every batch"
+                            )
+                        residual_q17_source, residual_q17_targets = residual_q17.encode_batch(
+                            core.context_encoder,
+                            core.target_encoder,
+                            batch[:residual_batch_size],
+                        )
+                    base_loss = (
                         jepa_loss
                         + args.richness_regularizer_weight * regularizer_penalty
                         + args.official_barlow_weight * official_barlow_loss
                     )
+                residual_q17_loss = jepa_loss.new_zeros(())
+                residual_q17_operator_loss = jepa_loss.new_zeros(())
+                residual_q17_metadata: dict[str, float] = {}
+                if residual_q17 is not None:
+                    assert residual_q17_optimizer is not None
+                    assert residual_q17_source is not None
+                    assert residual_q17_targets is not None
+                    residual_q17.update_statistics(
+                        residual_q17_source,
+                        residual_q17_targets,
+                    )
+                    centered_residual_batch = residual_q17.center_batch(
+                        residual_q17_source,
+                        residual_q17_targets,
+                    )
+                    residual_q17_optimizer.zero_grad(set_to_none=True)
+                    residual_q17_operator_loss = residual_q17.operator_loss(
+                        centered_residual_batch,
+                        mode=args.residual_q17_mode,
+                    )
+                    residual_q17_operator_loss.backward()
+                    residual_q17_optimizer.step()
+                    residual_q17_loss, residual_q17_metadata = residual_q17.encoder_loss(
+                        centered_residual_batch,
+                        mode=args.residual_q17_mode,
+                    )
+                    encoder_parameters = tuple(
+                        parameter
+                        for parameter in core.context_encoder.parameters()
+                        if parameter.requires_grad
+                    )
+                    alignment = gradient_alignment_and_weight(
+                        jepa_loss,
+                        residual_q17_loss,
+                        encoder_parameters,
+                        target_ratio=args.residual_q17_gradient_ratio,
+                    )
+                    residual_q17_metadata.update(
+                        {
+                            "residual_q17/operator_loss": float(
+                                residual_q17_operator_loss.detach().item()
+                            ),
+                            "residual_q17/gradient_cosine": alignment.cosine,
+                            "residual_q17/jepa_gradient_norm": alignment.jepa_norm,
+                            "residual_q17/auxiliary_gradient_norm": (alignment.auxiliary_norm),
+                            "residual_q17/loss_weight": alignment.loss_weight,
+                            "residual_q17/actual_gradient_ratio": alignment.actual_ratio,
+                        }
+                    )
+                    loss = base_loss + alignment.loss_weight * residual_q17_loss
+                else:
+                    loss = base_loss
                 if use_amp:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -1671,10 +1833,14 @@ def main() -> None:
                 jepa_loss_value = jepa_loss.item()
                 regularizer_value = regularizer_penalty.item()
                 official_barlow_value = official_barlow_loss.item()
+                residual_q17_value = residual_q17_loss.item()
+                residual_q17_operator_value = residual_q17_operator_loss.item()
                 epoch_loss += loss_value
                 epoch_jepa_loss += jepa_loss_value
                 epoch_regularizer += regularizer_value
                 epoch_official_barlow += official_barlow_value
+                epoch_residual_q17 += residual_q17_value
+                epoch_residual_q17_operator += residual_q17_operator_value
                 batches += 1
                 if batch_target_embeddings is not None:
                     retained_features = batch_target_embeddings.detach().float().cpu()
@@ -1689,20 +1855,16 @@ def main() -> None:
                         online_factorization_count > args.online_factorization_size
                         and online_factorization_features
                     ):
-                        excess = (
-                            online_factorization_count - args.online_factorization_size
-                        )
+                        excess = online_factorization_count - args.online_factorization_size
                         if online_factorization_features[0].shape[0] <= excess:
                             online_factorization_count -= online_factorization_features[0].shape[0]
                             online_factorization_features.pop(0)
                             online_factorization_labels.pop(0)
                         else:
-                            online_factorization_features[0] = (
-                                online_factorization_features[0][excess:]
-                            )
-                            online_factorization_labels[0] = (
-                                online_factorization_labels[0][excess:]
-                            )
+                            online_factorization_features[0] = online_factorization_features[0][
+                                excess:
+                            ]
+                            online_factorization_labels[0] = online_factorization_labels[0][excess:]
                             online_factorization_count -= excess
 
                 if args.log_every_steps > 0 and global_step % args.log_every_steps == 0:
@@ -1721,16 +1883,18 @@ def main() -> None:
                             "train/weighted_official_barlow": (
                                 args.official_barlow_weight * official_barlow_value
                             ),
+                            "train/residual_q17": residual_q17_value,
+                            "train/residual_q17_operator": residual_q17_operator_value,
                             "train/lr": current_lr,
                             "train/weight_decay": current_wd,
                             "train/ema_momentum": momentum,
-                            "train/epoch_fraction": epoch
-                            + batches / max(iterations_per_epoch, 1),
+                            "train/epoch_fraction": epoch + batches / max(iterations_per_epoch, 1),
                             **{
                                 key.replace("ras/", "regularizer/", 1): value
                                 for key, value in regularizer_metadata.items()
                             },
                             **official_barlow_metadata,
+                            **residual_q17_metadata,
                             **bandit_scalars,
                         },
                     )
@@ -1754,6 +1918,8 @@ def main() -> None:
                             bandit_reward_normalizer=bandit_reward_normalizer,
                             richness_snapshot=richness_snapshot,
                             official_barlow=official_barlow,
+                            residual_q17=residual_q17,
+                            residual_q17_optimizer=residual_q17_optimizer,
                         ),
                     )
                     save_spatial_checkpoint(
@@ -1772,6 +1938,8 @@ def main() -> None:
                             bandit_reward_normalizer=bandit_reward_normalizer,
                             richness_snapshot=richness_snapshot,
                             official_barlow=official_barlow,
+                            residual_q17=residual_q17,
+                            residual_q17_optimizer=residual_q17_optimizer,
                         ),
                     )
 
@@ -1779,6 +1947,8 @@ def main() -> None:
             epoch_mean_jepa_loss = epoch_jepa_loss / batches
             epoch_mean_regularizer = epoch_regularizer / batches
             epoch_mean_official_barlow = epoch_official_barlow / batches
+            epoch_mean_residual_q17 = epoch_residual_q17 / batches
+            epoch_mean_residual_q17_operator = epoch_residual_q17_operator / batches
             logger.log(
                 step=global_step,
                 epoch=epoch,
@@ -1788,6 +1958,8 @@ def main() -> None:
                     "train/epoch_jepa_loss": epoch_mean_jepa_loss,
                     "train/epoch_richness_regularizer": epoch_mean_regularizer,
                     "train/epoch_official_barlow": epoch_mean_official_barlow,
+                    "train/epoch_residual_q17": epoch_mean_residual_q17,
+                    "train/epoch_residual_q17_operator": (epoch_mean_residual_q17_operator),
                     "train/epoch_seconds": time.time() - epoch_start,
                     "train/batches_per_epoch": batches,
                     "train/elapsed_seconds": time.time() - start,
@@ -1883,10 +2055,7 @@ def main() -> None:
                     f"elapsed={time.time() - start:.0f}s",
                     flush=True,
                 )
-            if (
-                exact_factorization_enabled
-                and epoch % args.exact_factorization_every_epochs == 0
-            ):
+            if exact_factorization_enabled and epoch % args.exact_factorization_every_epochs == 0:
                 factorization_started = time.time()
                 exact_features = _encode_target_images_pooled(
                     core,
@@ -1907,8 +2076,7 @@ def main() -> None:
                             f"factorization/exact/{name}": value
                             for name, value in exact_metrics.items()
                         },
-                        "factorization/exact/seconds": time.time()
-                        - factorization_started,
+                        "factorization/exact/seconds": time.time() - factorization_started,
                     },
                 )
             if (
@@ -1946,12 +2114,12 @@ def main() -> None:
                     f"top5={class_top5_accuracy:.4f} seconds={probe_seconds:.1f}",
                     flush=True,
                 )
-            stopping_after_epoch = (
-                args.stop_after_epoch > 0 and epoch == args.stop_after_epoch
-            )
+            stopping_after_epoch = args.stop_after_epoch > 0 and epoch == args.stop_after_epoch
             if (
-                args.checkpoint_every_epochs > 0 and epoch % args.checkpoint_every_epochs == 0
-            ) or epoch == args.epochs or stopping_after_epoch:
+                (args.checkpoint_every_epochs > 0 and epoch % args.checkpoint_every_epochs == 0)
+                or epoch == args.epochs
+                or stopping_after_epoch
+            ):
                 save_spatial_checkpoint(
                     checkpoint_dir / f"epoch_{epoch:04d}.pt",
                     core,
@@ -1968,6 +2136,8 @@ def main() -> None:
                         bandit_reward_normalizer=bandit_reward_normalizer,
                         richness_snapshot=richness_snapshot,
                         official_barlow=official_barlow,
+                        residual_q17=residual_q17,
+                        residual_q17_optimizer=residual_q17_optimizer,
                     ),
                 )
                 save_spatial_checkpoint(
@@ -1986,12 +2156,13 @@ def main() -> None:
                         bandit_reward_normalizer=bandit_reward_normalizer,
                         richness_snapshot=richness_snapshot,
                         official_barlow=official_barlow,
+                        residual_q17=residual_q17,
+                        residual_q17_optimizer=residual_q17_optimizer,
                     ),
                 )
             if stopping_after_epoch:
                 print(
-                    f"stopped cleanly after epoch={epoch} "
-                    f"with schedule_epochs={args.epochs}",
+                    f"stopped cleanly after epoch={epoch} with schedule_epochs={args.epochs}",
                     flush=True,
                 )
                 break
