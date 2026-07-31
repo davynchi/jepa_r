@@ -384,3 +384,33 @@ Tiny ImageNet, ViT-S/4, predictor dim 192 depth 6, batch 1024, 300 эпох,
 uniform sampling, BF16, seed 0, probe/eval/checkpoint каждые 25 эпох. Модуль,
 EMA-статистики и отдельный optimizer оператора сохраняются и восстанавливаются
 вместе с checkpoint. Серверный эксперимент не запускался.
+
+### Residual-Q17 в официальном I-JEPA
+
+Residual-Q17 перенесён в чистый официальный репозиторий I-JEPA. Стандартный
+режим при `residual_q17.enabled: false` сохраняет исходный DDP train loop.
+Включённый режим поддерживает single-GPU обучение, отдельный optimizer полного
+линейного оператора, centered EMA-статистики, matched/shuffled control,
+динамическое отношение норм градиентов и полное checkpoint/resume.
+
+Проверка выполнена 31 июля 2026 года на `192.168.18.134`, GPU0 V100 32 ГБ:
+
+- модульные тесты: `6 passed`;
+- official ViT-S/4, Tiny ImageNet images, два train step: успешно;
+- resume `epoch 1 -> 2`: успешно, `statistics_updates 2 -> 4`;
+- checkpoint содержит encoder, predictor, target encoder, основной optimizer,
+  Q17, Q17 optimizer и EMA-статистики;
+- исходный uniform DDP-путь с выключенным Q17: успешно;
+- целевой memory smoke: JEPA batch 256, Q17 batch 64, FP32, peak GPU memory
+  `22.6 ГБ`, step time `2.86 с`, фактическое отношение градиентов `0.05000`.
+
+Код находится локально в `/home/kostya/ijepa_upstream` и на сервере в
+`/disk/10tb/home/kostikov/ijepa_upstream_q17`. Полный 700-эпоховый эксперимент
+не запускался.
+
+Для запуска на DataSphere официальный код с Q17 добавлен в
+`third_party/ijepa_q17/`. Конфигурация
+`tiny_vits4_q17_matched_g5_ep300_b256_q64_datasphere.yaml` задаёт 300 эпох,
+batch 256, Q17 batch 64, BF16 и matched Q17 5% на полном Tiny ImageNet.
+Launcher `run_datasphere_q17.sh` работает в foreground и пишет checkpoint'ы
+каждые 50 эпох. Облачный эксперимент ещё не запускался.
